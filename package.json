@@ -20,6 +20,8 @@
 		"key:generate": "./scripts/generate_key.sh",
 		"key:generate:force": "./scripts/generate_key.sh --force",
 		"setup:hooks": "cp scripts/hooks/pre-push .git/hooks/ && chmod +x .git/hooks/pre-push",
+		"test": "DATABASE_URL=postgres://postgres:password@localhost:5432/keycast_test cargo nextest run",
+		"test:ci": "cargo nextest run",
 		"check": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets --all-features -- -D warnings -A deprecated && cargo test --workspace"
 	},
 	"devDependencies": {
