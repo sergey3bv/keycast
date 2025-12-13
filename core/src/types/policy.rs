@@ -48,43 +48,13 @@ pub struct PolicyInfo {
 }
 
 impl Policy {
-    /// Find a policy by its slug
-    pub async fn find_by_slug(pool: &PgPool, slug: &str) -> Result<Policy, PolicyError> {
-        sqlx::query_as::<_, Policy>("SELECT * FROM policies WHERE slug = $1")
-            .bind(slug)
-            .fetch_optional(pool)
-            .await?
-            .ok_or(PolicyError::NotFound)
-    }
-
-    /// Find a policy by its ID
-    pub async fn find_by_id(pool: &PgPool, id: i32) -> Result<Policy, PolicyError> {
-        sqlx::query_as::<_, Policy>("SELECT * FROM policies WHERE id = $1")
-            .bind(id)
-            .fetch_optional(pool)
-            .await?
-            .ok_or(PolicyError::NotFound)
-    }
-
-    /// Get all global policies with slugs (for discovery endpoint)
-    pub async fn list_public(pool: &PgPool) -> Result<Vec<Policy>, PolicyError> {
-        let policies = sqlx::query_as::<_, Policy>(
-            "SELECT * FROM policies WHERE slug IS NOT NULL AND team_id IS NULL ORDER BY name",
-        )
-        .fetch_all(pool)
-        .await?;
-        Ok(policies)
-    }
-
     /// Get the permissions for this policy
     pub async fn permissions(&self, pool: &PgPool) -> Result<Vec<Permission>, PolicyError> {
         let permissions = sqlx::query_as::<_, Permission>(
-            r#"
-            SELECT p.*
-            FROM permissions p
-            JOIN policy_permissions pp ON pp.permission_id = p.id
-            WHERE pp.policy_id = $1
-            "#,
+            "SELECT p.id, p.identifier, p.config, p.created_at, p.updated_at
+             FROM permissions p
+             JOIN policy_permissions pp ON pp.permission_id = p.id
+             WHERE pp.policy_id = $1",
         )
         .bind(self.id)
         .fetch_all(pool)
@@ -223,7 +193,7 @@ pub async fn is_more_restrictive(
 }
 
 /// A policy with its permissions, this is a join table between a policy and its permissions
-#[derive(Debug, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct PolicyWithPermissions {
     #[sqlx(flatten)]
     pub policy: Policy,

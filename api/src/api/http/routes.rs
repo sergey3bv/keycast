@@ -203,22 +203,21 @@ pub async fn nostr_discovery_public(
     use axum::body::Body;
     use axum::http::{header, StatusCode};
     use axum::response::Response;
+    use keycast_core::repositories::UserRepository;
 
     let tenant_id = tenant.0.id;
 
     // Check if "name" query parameter is provided
     if let Some(name) = params.get("name") {
         // Look up user by username in this tenant
-        let result: Option<(String,)> =
-            sqlx::query_as("SELECT pubkey FROM users WHERE username = $1 AND tenant_id = $2")
-                .bind(name)
-                .bind(tenant_id)
-                .fetch_optional(&pool)
-                .await
-                .ok()
-                .flatten();
+        let user_repo = UserRepository::new(pool.clone());
+        let result = user_repo
+            .find_pubkey_by_username(name, tenant_id)
+            .await
+            .ok()
+            .flatten();
 
-        if let Some((pubkey,)) = result {
+        if let Some(pubkey) = result {
             // Return NIP-05 response with user's pubkey
             let response = serde_json::json!({
                 "names": {

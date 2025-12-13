@@ -9,9 +9,11 @@ use axum::{
     Json,
 };
 use keycast_core::metrics::METRICS;
+use keycast_core::repositories::{
+    OAuthAuthorizationRepository, PersonalKeysRepository, PolicyRepository,
+};
 use keycast_core::signing_session::{parse_cache_key, CacheKey, SigningSession};
 use keycast_core::traits::CustomPermission;
-use keycast_core::types::permission::Permission;
 use nostr_sdk::{Keys, PublicKey, UnsignedEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -227,39 +229,22 @@ async fn load_handler_on_demand(
 
     // Query oauth_authorization for this bunker_pubkey
     // Includes: expires_at, revoked_at (for validity), policy_id (for permissions)
-    #[allow(clippy::type_complexity)]
-    let auth_data: Option<(
-        i32,
-        String,
-        Option<String>,
-        Option<chrono::DateTime<chrono::Utc>>,
-        Option<chrono::DateTime<chrono::Utc>>,
-        Option<i32>,
-    )> = sqlx::query_as(
-        "SELECT id, user_pubkey, authorization_handle, expires_at, revoked_at, policy_id
-         FROM oauth_authorizations
-         WHERE bunker_public_key = $1",
-    )
-    .bind(bunker_pubkey_hex)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?;
+    let oauth_auth_repo = OAuthAuthorizationRepository::new(pool.clone());
+    let auth_data = oauth_auth_repo
+        .find_by_bunker_pubkey(bunker_pubkey_hex)
+        .await
+        .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?;
 
     let (auth_id, user_pubkey, auth_handle_opt, expires_at, revoked_at, policy_id) =
         auth_data.ok_or(RpcError::Auth(AuthError::InvalidToken))?;
 
     // Load permissions for this authorization's policy (if any)
     let permissions: Vec<Box<dyn CustomPermission>> = if let Some(pid) = policy_id {
-        let db_permissions: Vec<Permission> = sqlx::query_as(
-            "SELECT p.*
-             FROM permissions p
-             JOIN policy_permissions pp ON pp.permission_id = p.id
-             WHERE pp.policy_id = $1",
-        )
-        .bind(pid)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| RpcError::Internal(format!("Database error loading permissions: {}", e)))?;
+        let policy_repo = PolicyRepository::new(pool.clone());
+        let db_permissions = policy_repo
+            .get_permissions(pid)
+            .await
+            .map_err(|e| RpcError::Internal(format!("Database error loading permissions: {}", e)))?;
 
         // Convert to CustomPermission trait objects
         db_permissions
@@ -272,12 +257,12 @@ async fn load_handler_on_demand(
     };
 
     // Get user's encrypted secret key
-    let encrypted_secret: Vec<u8> =
-        sqlx::query_scalar("SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1")
-            .bind(&user_pubkey)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?;
+    let personal_keys_repo = PersonalKeysRepository::new(pool.clone());
+    let encrypted_secret: Vec<u8> = personal_keys_repo
+        .find_encrypted_key(&user_pubkey)
+        .await
+        .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?
+        .ok_or_else(|| RpcError::Internal("Personal keys not found".to_string()))?;
 
     // Decrypt the secret key
     let decrypted_secret = key_manager

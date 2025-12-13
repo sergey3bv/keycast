@@ -78,7 +78,7 @@ pub struct Authorization {
     /// The id of the policy the authorization belongs to
     pub policy_id: i32,
     /// The maximum number of uses for this authorization, None means unlimited
-    pub max_uses: Option<i16>,
+    pub max_uses: Option<i32>,
     /// The date and time at which this authorization expires, None means it never expires
     pub expires_at: Option<DateTime<chrono::Utc>>,
     /// The date and time the authorization was created
@@ -108,9 +108,9 @@ pub struct UserAuthorization {
 impl Authorization {
     pub async fn find(pool: &PgPool, tenant_id: i64, id: i32) -> Result<Self, AuthorizationError> {
         let authorization = sqlx::query_as::<_, Authorization>(
-            r#"
-            SELECT * FROM authorizations WHERE tenant_id = $1 AND id = $2
-            "#,
+            "SELECT id, tenant_id, stored_key_id, secret, bunker_public_key, bunker_secret,
+                    relays, policy_id, max_uses, expires_at, created_at, updated_at
+             FROM authorizations WHERE tenant_id = $1 AND id = $2",
         )
         .bind(tenant_id)
         .bind(id)
@@ -151,9 +151,8 @@ impl Authorization {
         tenant_id: i64,
     ) -> Result<StoredKey, AuthorizationError> {
         let stored_key = sqlx::query_as::<_, StoredKey>(
-            r#"
-            SELECT * FROM stored_keys WHERE tenant_id = $1 AND id = $2
-            "#,
+            "SELECT id, team_id, name, pubkey, secret_key, created_at, updated_at
+             FROM stored_keys WHERE tenant_id = $1 AND id = $2",
         )
         .bind(tenant_id)
         .bind(self.stored_key_id)
@@ -170,13 +169,11 @@ impl Authorization {
         _tenant_id: i64,
     ) -> Result<Vec<Permission>, AuthorizationError> {
         let permissions = sqlx::query_as::<_, Permission>(
-            r#"
-            SELECT p.*
-            FROM permissions p
-            JOIN policy_permissions pp ON pp.permission_id = p.id
-            JOIN policies pol ON pol.id = pp.policy_id
-            WHERE pol.id = $1
-            "#,
+            "SELECT p.id, p.identifier, p.config, p.created_at, p.updated_at
+             FROM permissions p
+             JOIN policy_permissions pp ON pp.permission_id = p.id
+             JOIN policies pol ON pol.id = pp.policy_id
+             WHERE pol.id = $1",
         )
         .bind(self.policy_id)
         .fetch_all(pool)

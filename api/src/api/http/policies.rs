@@ -1,7 +1,7 @@
 use axum::{extract::State, response::Json};
 use keycast_core::{
     custom_permissions::PermissionDisplay,
-    types::policy::{Policy, PolicyError},
+    repositories::{PolicyRepository, RepositoryError},
 };
 use serde::Serialize;
 use sqlx::PgPool;
@@ -34,8 +34,10 @@ pub struct ErrorResponse {
 pub async fn list_policies(
     State(pool): State<PgPool>,
 ) -> Result<Json<PoliciesListResponse>, (axum::http::StatusCode, Json<ErrorResponse>)> {
+    let repo = PolicyRepository::new(pool.clone());
+
     // Get all global policies with slugs
-    let policies = Policy::list_public(&pool).await.map_err(|e| {
+    let policies = repo.list_public().await.map_err(|e| {
         (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -48,7 +50,13 @@ pub async fn list_policies(
     // Build response with permission displays
     let mut policy_responses = Vec::new();
     for policy in policies {
-        let permissions = policy.permission_displays(&pool).await.unwrap_or_default();
+        let permissions = match policy.permission_displays(&pool).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("Failed to load permissions for policy {}: {}", policy.id, e);
+                vec![]
+            }
+        };
 
         policy_responses.push(PolicyResponse {
             slug: policy.slug.clone().unwrap_or_else(|| policy.id.to_string()),
@@ -72,11 +80,14 @@ pub async fn get_policy(
     State(pool): State<PgPool>,
     axum::extract::Path(slug): axum::extract::Path<String>,
 ) -> Result<Json<PolicyResponse>, (axum::http::StatusCode, Json<ErrorResponse>)> {
+    let repo = PolicyRepository::new(pool.clone());
+
     // Find policy by slug
-    let policy = Policy::find_by_slug(&pool, &slug)
+    let policy = repo
+        .find_by_slug(&slug)
         .await
         .map_err(|e| match e {
-            PolicyError::NotFound => (
+            RepositoryError::NotFound(_) => (
                 axum::http::StatusCode::NOT_FOUND,
                 Json(ErrorResponse {
                     error: "not_found".to_string(),
@@ -95,7 +106,13 @@ pub async fn get_policy(
             ),
         })?;
 
-    let permissions = policy.permission_displays(&pool).await.unwrap_or_default();
+    let permissions = match policy.permission_displays(&pool).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("Failed to load permissions for policy {}: {}", policy.id, e);
+            vec![]
+        }
+    };
 
     Ok(Json(PolicyResponse {
         slug: policy.slug.clone().unwrap_or_else(|| policy.id.to_string()),

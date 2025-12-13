@@ -6,6 +6,7 @@ pub mod encryption;
 pub mod instance;
 pub mod metrics;
 pub mod oauth_scopes;
+pub mod repositories;
 pub mod signing_handler;
 pub mod signing_session;
 pub mod tenant_query;

@@ -12,6 +12,11 @@ use bcrypt::verify;
 use chrono::{Duration, Utc};
 use dashmap::DashMap;
 use keycast_core::metrics::METRICS;
+use keycast_core::repositories::{
+    CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, OAuthCodeRepository,
+    PersonalKeysRepository, PolicyRepository, RepositoryError, StoreOAuthCodeParams,
+    StoreOAuthCodeWithRegistrationParams, UserRepository,
+};
 use nostr_sdk::{Keys, ToBech32};
 use once_cell::sync::Lazy;
 use rand::Rng;
@@ -130,22 +135,19 @@ async fn store_oauth_code(
     expires_at: chrono::DateTime<Utc>,
     previous_auth_id: Option<i32>,
 ) -> Result<(), OAuthError> {
-    sqlx::query(
-        "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, previous_auth_id, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)"
-    )
-    .bind(tenant_id)
-    .bind(code)
-    .bind(user_pubkey)
-    .bind(client_id)
-    .bind(redirect_uri)
-    .bind(scope)
-    .bind(code_challenge)
-    .bind(code_challenge_method)
-    .bind(expires_at)
-    .bind(previous_auth_id)
-    .bind(Utc::now())
-    .execute(pool)
+    let repo = OAuthCodeRepository::new(pool.clone());
+    repo.store(StoreOAuthCodeParams {
+        tenant_id,
+        code,
+        user_pubkey,
+        client_id,
+        redirect_uri,
+        scope,
+        code_challenge,
+        code_challenge_method,
+        expires_at,
+        previous_auth_id,
+    })
     .await?;
     Ok(())
 }
@@ -169,26 +171,22 @@ async fn store_oauth_code_with_pending_registration(
     pending_email_verification_token: &str,
     pending_encrypted_secret: Option<&[u8]>,
 ) -> Result<(), OAuthError> {
-    sqlx::query(
-        "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at,
-         pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"
-    )
-    .bind(tenant_id)
-    .bind(code)
-    .bind(user_pubkey)
-    .bind(client_id)
-    .bind(redirect_uri)
-    .bind(scope)
-    .bind(code_challenge)
-    .bind(code_challenge_method)
-    .bind(expires_at)
-    .bind(Utc::now())
-    .bind(pending_email)
-    .bind(pending_password_hash)
-    .bind(pending_email_verification_token)
-    .bind(pending_encrypted_secret)
-    .execute(pool)
+    let repo = OAuthCodeRepository::new(pool.clone());
+    repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
+        tenant_id,
+        code,
+        user_pubkey,
+        client_id,
+        redirect_uri,
+        scope,
+        code_challenge,
+        code_challenge_method,
+        expires_at,
+        pending_email,
+        pending_password_hash,
+        pending_email_verification_token,
+        pending_encrypted_secret,
+    })
     .await?;
     Ok(())
 }
@@ -341,6 +339,12 @@ impl From<sqlx::Error> for OAuthError {
     }
 }
 
+impl From<keycast_core::repositories::RepositoryError> for OAuthError {
+    fn from(e: keycast_core::repositories::RepositoryError) -> Self {
+        OAuthError::InvalidRequest(e.to_string())
+    }
+}
+
 /// Validate PKCE code_verifier against stored code_challenge
 /// Implements RFC 7636 validation for both S256 and plain methods
 fn validate_pkce(
@@ -392,16 +396,16 @@ fn validate_pkce(
 /// Parses "policy:slug" format and validates against app's default policy.
 /// Resolve policy ID from scope string (e.g., "policy:social" -> policy.id)
 async fn resolve_policy_from_scope(pool: &sqlx::PgPool, scope: &str) -> Result<i32, OAuthError> {
-    use keycast_core::types::policy::Policy;
-
     // Parse scope for policy slug
     let policy_slug = parse_policy_scope(scope)?;
 
     // Look up the requested policy (policies are now global)
-    let requested_policy = Policy::find_by_slug(pool, &policy_slug)
+    let policy_repo = PolicyRepository::new(pool.clone());
+    let requested_policy = policy_repo
+        .find_by_slug(&policy_slug)
         .await
         .map_err(|e| match e {
-            keycast_core::types::policy::PolicyError::NotFound => {
+            RepositoryError::NotFound(_) => {
                 OAuthError::InvalidRequest(format!(
                     "Unknown policy '{}'. See GET /api/policies for available options.",
                     policy_slug
@@ -446,15 +450,12 @@ pub async fn auth_status(
 
     if let Some(user_pubkey) = user_pubkey {
         // Query user from database - user must exist for session to be valid
-        let user_info: Option<(Option<String>, Option<bool>)> = sqlx::query_as(
-            "SELECT email, email_verified FROM users WHERE tenant_id = $1 AND pubkey = $2",
-        )
-        .bind(tenant_id)
-        .bind(&user_pubkey)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
+        let user_repo = UserRepository::new(pool.clone());
+        let user_info = user_repo
+            .get_account_status(&user_pubkey, tenant_id)
+            .await
+            .ok()
+            .flatten();
 
         // If user doesn't exist in DB, the session is invalid (stale cookie)
         if let Some((email, email_verified)) = user_info {
@@ -544,14 +545,10 @@ pub async fn authorize_get(
             (None, true)
         } else {
             // Check if user exists
-            let exists: Option<(String,)> =
-                sqlx::query_as("SELECT pubkey FROM users WHERE pubkey = $1 AND tenant_id = $2")
-                    .bind(pubkey)
-                    .bind(tenant_id)
-                    .fetch_optional(pool)
-                    .await?;
+            let user_repo = UserRepository::new(pool.clone());
+            let user_exists = user_repo.exists(pubkey, tenant_id).await?;
 
-            if exists.is_none() {
+            if !user_exists {
                 tracing::warn!("UCAN cookie has pubkey {} but user doesn't exist in tenant {}, clearing stale cookie", pubkey, tenant_id);
                 (None, true) // User was deleted, clear the cookie
             } else {
@@ -571,17 +568,9 @@ pub async fn authorize_get(
                 pubkey
             );
 
-            // Look up by handle (must be active, not expired, and handle not past absolute expiration)
-            sqlx::query_scalar(
-                "SELECT id FROM oauth_authorizations
-                 WHERE authorization_handle = $1
-                   AND revoked_at IS NULL
-                   AND (expires_at IS NULL OR expires_at > NOW())
-                   AND handle_expires_at > NOW()",
-            )
-            .bind(handle)
-            .fetch_optional(pool)
-            .await?
+            // Look up by handle, scoped to this user
+            let repo = OAuthAuthorizationRepository::new(pool.clone());
+            repo.find_id_by_handle(handle, pubkey).await?
         } else {
             None
         };
@@ -636,8 +625,6 @@ pub async fn authorize_get(
     // Default to "policy:social" if no scope provided
     let scope_str = params.scope.as_deref().unwrap_or("policy:social");
     let policy_info_json = {
-        use keycast_core::types::policy::Policy;
-
         // Parse policy slug from scope
         let policy_slug = match parse_policy_scope(scope_str) {
             Ok(slug) => slug,
@@ -652,7 +639,8 @@ pub async fn authorize_get(
         };
 
         // Load policy and its permissions (policies are now global)
-        match Policy::find_by_slug(pool, &policy_slug).await {
+        let policy_repo = PolicyRepository::new(pool.clone());
+        match policy_repo.find_by_slug(&policy_slug).await {
             Ok(policy) => {
                 let permissions = policy.permission_displays(pool).await.unwrap_or_default();
                 serde_json::json!({
@@ -933,7 +921,7 @@ pub async fn authorize_get(
                 diVine Login
             </div>
             <h1>Authorize App</h1>
-            <p>Grant access to your account</p>
+            <p>Grant access to <span id="display_name">your account</span></p>
         </div>
 
         <div class="card">
@@ -1802,45 +1790,23 @@ async fn handle_authorization_code_grant(
     let key_manager = auth_state.state.key_manager.as_ref();
 
     // Fetch and validate authorization code with PKCE fields AND pending registration data
-    type AuthCodeRow = (
-        String,          // user_pubkey
-        String,          // client_id
-        String,          // redirect_uri
-        String,          // scope
-        Option<String>,  // code_challenge
-        Option<String>,  // code_challenge_method
-        Option<String>,  // pending_email
-        Option<String>,  // pending_password_hash
-        Option<String>,  // pending_email_verification_token
-        Option<Vec<u8>>, // pending_encrypted_secret
-        Option<i32>,     // previous_auth_id (for cleanup on re-auth)
-    );
-    let auth_code: Option<AuthCodeRow> = sqlx::query_as(
-        "SELECT user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method,
-                pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret,
-                previous_auth_id
-         FROM oauth_codes
-         WHERE tenant_id = $1 AND code = $2 AND expires_at > $3",
-    )
-    .bind(tenant_id)
-    .bind(&req.code)
-    .bind(Utc::now())
-    .fetch_optional(pool)
-    .await?;
+    let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
+    let auth_code = oauth_code_repo
+        .find_valid(tenant_id, &req.code)
+        .await?
+        .ok_or(OAuthError::Unauthorized)?;
 
-    let (
-        user_pubkey,
-        client_id,
-        stored_redirect_uri,
-        scope,
-        code_challenge,
-        code_challenge_method,
-        pending_email,
-        pending_password_hash,
-        pending_email_verification_token,
-        pending_encrypted_secret,
-        previous_auth_id,
-    ) = auth_code.ok_or(OAuthError::Unauthorized)?;
+    let user_pubkey = auth_code.user_pubkey;
+    let client_id = auth_code.client_id;
+    let stored_redirect_uri = auth_code.redirect_uri;
+    let scope = auth_code.scope;
+    let code_challenge = auth_code.code_challenge;
+    let code_challenge_method = auth_code.code_challenge_method;
+    let pending_email = auth_code.pending_email;
+    let pending_password_hash = auth_code.pending_password_hash;
+    let pending_email_verification_token = auth_code.pending_email_verification_token;
+    let pending_encrypted_secret = auth_code.pending_encrypted_secret;
+    let previous_auth_id = auth_code.previous_auth_id;
 
     // Validate redirect_uri matches
     if stored_redirect_uri != req.redirect_uri {
@@ -1875,30 +1841,15 @@ async fn handle_authorization_code_grant(
         );
 
         // Re-check email uniqueness (handle race condition)
-        let existing_email: Option<(String,)> =
-            sqlx::query_as("SELECT pubkey FROM users WHERE email = $1 AND tenant_id = $2")
-                .bind(pending_email_val)
-                .bind(tenant_id)
-                .fetch_optional(pool)
-                .await
-                .map_err(OAuthError::Database)?;
-
-        if existing_email.is_some() {
+        let user_repo = UserRepository::new(pool.clone());
+        if user_repo.find_pubkey_by_email(pending_email_val, tenant_id).await?.is_some() {
             return Err(OAuthError::InvalidRequest(
                 "This email is already registered. Please sign in instead.".to_string(),
             ));
         }
 
         // Re-check pubkey uniqueness (handle race condition)
-        let existing_pubkey: Option<(String,)> =
-            sqlx::query_as("SELECT email FROM users WHERE pubkey = $1 AND tenant_id = $2")
-                .bind(&user_pubkey)
-                .bind(tenant_id)
-                .fetch_optional(pool)
-                .await
-                .map_err(OAuthError::Database)?;
-
-        if existing_pubkey.is_some() {
+        if user_repo.exists(&user_pubkey, tenant_id).await? {
             return Err(OAuthError::InvalidRequest(
                 "This Nostr key is already registered.".to_string(),
             ));
@@ -1943,51 +1894,22 @@ async fn handle_authorization_code_grant(
             )
         })?;
 
-        // Start transaction for atomic user + keys creation
-        let mut tx = pool.begin().await.map_err(OAuthError::Database)?;
-
-        // Create users row
+        // Finalize pending registration atomically (user + personal_keys + delete code)
         let verification_expires = Utc::now() + Duration::hours(EMAIL_VERIFICATION_EXPIRY_HOURS);
-        sqlx::query(
-            "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, email_verification_expires_at, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-        )
-        .bind(&user_pubkey)
-        .bind(tenant_id)
-        .bind(pending_email_val)
-        .bind(&pending_password_hash_val)
-        .bind(false)
-        .bind(&verification_token)
-        .bind(verification_expires)
-        .bind(Utc::now())
-        .bind(Utc::now())
-        .execute(&mut *tx)
-        .await
-        .map_err(OAuthError::Database)?;
-
-        // Create personal_keys row (copy encrypted bytes directly - no re-encryption!)
-        sqlx::query(
-            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5)",
-        )
-        .bind(&user_pubkey)
-        .bind(&encrypted_secret)
-        .bind(tenant_id)
-        .bind(Utc::now())
-        .bind(Utc::now())
-        .execute(&mut *tx)
-        .await
-        .map_err(OAuthError::Database)?;
-
-        // Delete the authorization code (one-time use) within transaction
-        sqlx::query("DELETE FROM oauth_codes WHERE tenant_id = $1 AND code = $2")
-            .bind(tenant_id)
-            .bind(&req.code)
-            .execute(&mut *tx)
+        let user_repo = UserRepository::new(pool.clone());
+        user_repo
+            .finalize_oauth_registration(
+                &user_pubkey,
+                tenant_id,
+                pending_email_val,
+                &pending_password_hash_val,
+                &verification_token,
+                verification_expires,
+                &encrypted_secret,
+                &req.code,
+            )
             .await
-            .map_err(OAuthError::Database)?;
-
-        tx.commit().await.map_err(OAuthError::Database)?;
+            .map_err(|e| OAuthError::Database(sqlx::Error::Protocol(e.to_string())))?;
 
         tracing::info!(
             "Created user + personal_keys atomically for: {} (email: {})",
@@ -2023,18 +1945,11 @@ async fn handle_authorization_code_grant(
     } else {
         // Normal token exchange (existing user, not registration)
         // Delete the authorization code (one-time use)
-        sqlx::query("DELETE FROM oauth_codes WHERE tenant_id = $1 AND code = $2")
-            .bind(tenant_id)
-            .bind(&req.code)
-            .execute(pool)
-            .await?;
+        oauth_code_repo.delete(tenant_id, &req.code).await?;
 
         // Get user's email for UCAN
-        sqlx::query_scalar("SELECT email FROM users WHERE pubkey = $1 AND tenant_id = $2")
-            .bind(&user_pubkey)
-            .bind(tenant_id)
-            .fetch_one(pool)
-            .await?
+        let user_repo = UserRepository::new(pool.clone());
+        user_repo.get_email(&user_pubkey, tenant_id).await?
     };
 
     tracing::info!(
@@ -2096,12 +2011,10 @@ async fn create_oauth_authorization_and_token(
     let key_manager = auth_state.state.key_manager.as_ref();
 
     // Check if personal_keys exist
-    let encrypted_user_key: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1")
-            .bind(user_pubkey)
-            .fetch_optional(pool)
-            .await
-            .map_err(OAuthError::Database)?;
+    let personal_keys_repo = PersonalKeysRepository::new(pool.clone());
+    let encrypted_user_key: Option<Vec<u8>> = personal_keys_repo
+        .find_encrypted_key(user_pubkey)
+        .await?;
 
     let (encrypted_user_key, _keys_just_created) = if let Some(existing_key) = encrypted_user_key {
         // Keys already exist
@@ -2157,18 +2070,9 @@ async fn create_oauth_authorization_and_token(
             .map_err(|e| OAuthError::Encryption(e.to_string()))?;
 
         // Insert personal_keys (must include tenant_id for multi-tenant isolation)
-        sqlx::query(
-            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5)"
-        )
-        .bind(user_pubkey)
-        .bind(&encrypted_secret)
-        .bind(tenant_id)
-        .bind(Utc::now())
-        .bind(Utc::now())
-        .execute(pool)
-        .await
-        .map_err(OAuthError::Database)?;
+        personal_keys_repo
+            .create(user_pubkey, &encrypted_secret, tenant_id)
+            .await?;
 
         (encrypted_secret, true)
     };
@@ -2227,25 +2131,22 @@ async fn create_oauth_authorization_and_token(
     // Each authorization is a separate "ticket" for one client/device
     // Old authorizations remain valid until explicitly revoked
     // Note: bunker key is derived via HKDF from user secret, not stored
-    let auth_id: i32 = sqlx::query_scalar(
-        "INSERT INTO oauth_authorizations (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, policy_id, authorization_handle, handle_expires_at, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-         RETURNING id"
-    )
-    .bind(tenant_id)
-    .bind(user_pubkey)
-    .bind(&redirect_origin)
-    .bind(client_id)
-    .bind(bunker_public_key.to_hex())
-    .bind(&connection_secret)
-    .bind(&relays_json)
-    .bind(policy_id)
-    .bind(&authorization_handle)
-    .bind(handle_expires_at)
-    .bind(Utc::now())
-    .bind(Utc::now())
-    .fetch_one(pool)
-    .await?;
+    let oauth_auth_repo = OAuthAuthorizationRepository::new(pool.clone());
+    let auth_id = oauth_auth_repo
+        .create(CreateOAuthAuthorizationParams {
+            tenant_id,
+            user_pubkey: user_pubkey.to_string(),
+            redirect_origin: redirect_origin.clone(),
+            client_id: client_id.to_string(),
+            bunker_public_key: bunker_public_key.to_hex(),
+            secret: connection_secret.clone(),
+            relays: relays_json.clone(),
+            policy_id: Some(policy_id),
+            client_pubkey: None,
+            authorization_handle: Some(authorization_handle.clone()),
+            handle_expires_at,
+        })
+        .await?;
 
     tracing::info!(
         "Created OAuth authorization {} for user {} app {}",
@@ -2259,10 +2160,7 @@ async fn create_oauth_authorization_and_token(
 
     // Revoke old authorization if this was a re-auth (cleanup)
     if let Some(old_auth_id) = previous_auth_id {
-        sqlx::query("UPDATE oauth_authorizations SET revoked_at = NOW() WHERE id = $1")
-            .bind(old_auth_id)
-            .execute(pool)
-            .await?;
+        oauth_auth_repo.revoke(old_auth_id).await?;
         METRICS.inc_oauth_revoked();
         tracing::info!(
             "Revoked old authorization {} after re-auth (signer will detect on next poll)",
@@ -2304,12 +2202,11 @@ async fn create_oauth_authorization_and_token(
 
     // Load policy info from scope for response (policies are now global)
     let policy_info = {
-        use keycast_core::types::policy::Policy;
-
         // Parse policy slug from scope (e.g., "policy:social" -> "social")
         let policy_slug = parse_policy_scope(scope).unwrap_or_else(|_| "social".to_string());
 
-        match Policy::find_by_slug(pool, &policy_slug).await {
+        let policy_repo = PolicyRepository::new(pool.clone());
+        match policy_repo.find_by_slug(&policy_slug).await {
             Ok(policy) => {
                 let permissions = policy.permission_displays(pool).await.unwrap_or_default();
                 Some(TokenPolicyInfo {
@@ -2377,15 +2274,11 @@ pub async fn oauth_login(
     );
 
     // Validate credentials
-    let user: Option<(String, String)> = sqlx::query_as(
-        "SELECT pubkey, password_hash FROM users WHERE email = $1 AND tenant_id = $2 AND password_hash IS NOT NULL"
-    )
-    .bind(&req.email)
-    .bind(tenant_id)
-    .fetch_optional(pool)
-    .await?;
-
-    let (public_key, password_hash) = user.ok_or(OAuthError::Unauthorized)?;
+    let user_repo = UserRepository::new(pool.clone());
+    let (public_key, password_hash) = user_repo
+        .find_with_password(&req.email, tenant_id)
+        .await?
+        .ok_or(OAuthError::Unauthorized)?;
 
     // Verify password (spawn_blocking to avoid blocking async runtime)
     let password = req.password.clone();
@@ -2400,17 +2293,14 @@ pub async fn oauth_login(
     }
 
     // Get user's keys for UCAN generation
-    let encrypted_secret: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT encrypted_secret_key FROM personal_keys WHERE user_pubkey = $1")
-            .bind(&public_key)
-            .fetch_optional(pool)
-            .await
-            .map_err(OAuthError::Database)?;
-
-    let encrypted_secret = encrypted_secret.ok_or_else(|| {
-        tracing::warn!("User {} has no personal_keys - they registered via OAuth but haven't completed token exchange yet", public_key);
-        OAuthError::InvalidRequest("Account setup incomplete. Please complete the OAuth flow to finalize your account.".to_string())
-    })?;
+    let personal_keys_repo = PersonalKeysRepository::new(pool.clone());
+    let encrypted_secret = personal_keys_repo
+        .find_encrypted_key(&public_key)
+        .await?
+        .ok_or_else(|| {
+            tracing::warn!("User {} has no personal_keys - they registered via OAuth but haven't completed token exchange yet", public_key);
+            OAuthError::InvalidRequest("Account setup incomplete. Please complete the OAuth flow to finalize your account.".to_string())
+        })?;
 
     let decrypted_secret = key_manager
         .decrypt(&encrypted_secret)
@@ -2485,15 +2375,8 @@ pub async fn oauth_register(
     );
 
     // Check if email already exists
-    let existing: Option<(String,)> =
-        sqlx::query_as("SELECT pubkey FROM users WHERE email = $1 AND tenant_id = $2")
-            .bind(&req.email)
-            .bind(tenant_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(OAuthError::Database)?;
-
-    if existing.is_some() {
+    let user_repo = UserRepository::new(pool.clone());
+    if user_repo.find_pubkey_by_email(&req.email, tenant_id).await?.is_some() {
         return Err(OAuthError::InvalidRequest(
             "Email already registered".to_string(),
         ));
@@ -2539,30 +2422,14 @@ pub async fn oauth_register(
     };
 
     // Check if user with this pubkey already exists
-    let existing_user: Option<(String,)> =
-        sqlx::query_as("SELECT email FROM users WHERE pubkey = $1 AND tenant_id = $2")
-            .bind(public_key.to_hex())
-            .bind(tenant_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(OAuthError::Database)?;
-
-    if existing_user.is_some() {
+    if user_repo.exists(&public_key.to_hex(), tenant_id).await? {
         return Err(OAuthError::InvalidRequest(
             "This Nostr key is already registered. Please sign in instead.".to_string(),
         ));
     }
 
     // Check if email is already taken
-    let existing_email: Option<(String,)> =
-        sqlx::query_as("SELECT pubkey FROM users WHERE email = $1 AND tenant_id = $2")
-            .bind(&req.email)
-            .bind(tenant_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(OAuthError::Database)?;
-
-    if existing_email.is_some() {
+    if user_repo.find_pubkey_by_email(&req.email, tenant_id).await?.is_some() {
         return Err(OAuthError::InvalidRequest(
             "This email is already registered. Please sign in instead.".to_string(),
         ));
@@ -3225,13 +3092,11 @@ pub async fn connect_post(
         .map_err(|_| OAuthError::Unauthorized)?;
 
     // Get user's encrypted key
-    let encrypted_user_key: Vec<u8> = sqlx::query_scalar(
-        "SELECT encrypted_secret_key FROM personal_keys WHERE tenant_id = $1 AND user_pubkey = $2",
-    )
-    .bind(tenant_id)
-    .bind(&user_pubkey)
-    .fetch_one(&auth_state.state.db)
-    .await?;
+    let personal_keys_repo = PersonalKeysRepository::new(auth_state.state.db.clone());
+    let encrypted_user_key: Vec<u8> = personal_keys_repo
+        .find_encrypted_key_by_tenant(tenant_id, &user_pubkey)
+        .await?
+        .ok_or(OAuthError::Unauthorized)?;
 
     // For nostr-login, redirect_origin is "nostrconnect://{client_pubkey}" (the secure identifier)
     let redirect_origin = format!("nostrconnect://{}", &form.client_pubkey);
@@ -3264,26 +3129,22 @@ pub async fn connect_post(
 
     // Create new OAuth authorization - always INSERT (multi-device support)
     // Each nostr-login creates a NEW authorization for that client
-    let auth_id: i32 = sqlx::query_scalar(
-        "INSERT INTO oauth_authorizations
-         (tenant_id, user_pubkey, redirect_origin, client_id, bunker_public_key, secret, relays, client_pubkey, authorization_handle, handle_expires_at, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-         RETURNING id"
-    )
-    .bind(tenant_id)
-    .bind(&user_pubkey)
-    .bind(&redirect_origin)
-    .bind(&client_id)
-    .bind(bunker_public_key.to_hex())
-    .bind(&form.secret)
-    .bind(&relays_json)
-    .bind(&form.client_pubkey)
-    .bind(&authorization_handle)
-    .bind(handle_expires_at)
-    .bind(Utc::now())
-    .bind(Utc::now())
-    .fetch_one(&auth_state.state.db)
-    .await?;
+    let oauth_auth_repo = OAuthAuthorizationRepository::new(auth_state.state.db.clone());
+    let auth_id = oauth_auth_repo
+        .create(CreateOAuthAuthorizationParams {
+            tenant_id,
+            user_pubkey: user_pubkey.clone(),
+            redirect_origin: redirect_origin.clone(),
+            client_id: client_id.clone(),
+            bunker_public_key: bunker_public_key.to_hex(),
+            secret: form.secret.clone(),
+            relays: relays_json.clone(),
+            policy_id: None,
+            client_pubkey: Some(form.client_pubkey.clone()),
+            authorization_handle: Some(authorization_handle.clone()),
+            handle_expires_at,
+        })
+        .await?;
 
     tracing::info!(
         "Created nostr-login authorization {} for user {} app {}",

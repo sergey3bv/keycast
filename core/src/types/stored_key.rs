@@ -27,7 +27,7 @@ pub enum KeyError {
 }
 
 /// A stored key is a key that has been stored in the database for a team
-#[derive(Debug, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct StoredKey {
     /// The id of the stored key
     pub id: i32,

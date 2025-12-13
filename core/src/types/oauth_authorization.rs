@@ -68,12 +68,10 @@ impl OAuthAuthorization {
         // Load permissions from database
         // Tenant isolation is enforced at authorization lookup level
         let permissions = sqlx::query_as::<_, crate::types::permission::Permission>(
-            r#"
-            SELECT p.*
-            FROM permissions p
-            JOIN policy_permissions pp ON pp.permission_id = p.id
-            WHERE pp.policy_id = $1
-            "#,
+            "SELECT p.id, p.identifier, p.config, p.created_at, p.updated_at
+             FROM permissions p
+             JOIN policy_permissions pp ON pp.permission_id = p.id
+             WHERE pp.policy_id = $1",
         )
         .bind(policy_id)
         .fetch_all(pool)
@@ -85,10 +83,11 @@ impl OAuthAuthorization {
 
     pub async fn find(pool: &PgPool, tenant_id: i64, id: i32) -> Result<Self, AuthorizationError> {
         let authorization = sqlx::query_as::<_, OAuthAuthorization>(
-            r#"
-            SELECT * FROM oauth_authorizations
-            WHERE tenant_id = $1 AND id = $2
-            "#,
+            "SELECT id, user_pubkey, redirect_origin, client_id, bunker_public_key, secret,
+                    relays, policy_id, tenant_id, client_pubkey, connected_client_pubkey,
+                    connected_at, created_at, updated_at, revoked_at, expires_at,
+                    handle_expires_at, authorization_handle
+             FROM oauth_authorizations WHERE tenant_id = $1 AND id = $2",
         )
         .bind(tenant_id)
         .bind(id)

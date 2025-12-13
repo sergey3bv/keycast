@@ -22,8 +22,6 @@ pub enum DatabaseError {
     FsError(#[from] std::io::Error),
     #[error("SQLx error: {0}")]
     SqlxError(#[from] sqlx::Error),
-    #[error("Migrate error: {0}")]
-    MigrateError(#[from] sqlx::migrate::MigrateError),
 }
 
 #[derive(Clone)]

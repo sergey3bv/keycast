@@ -15,6 +15,8 @@ import type {
 const STORAGE_KEY_SESSION = 'keycast_session';
 /** Storage key for authorization handle (for silent re-auth when session expires) */
 const STORAGE_KEY_HANDLE = 'keycast_auth_handle';
+/** Storage key for PKCE verifier (survives page reload during OAuth redirect) */
+const STORAGE_KEY_PKCE = 'keycast_pkce';
 
 /**
  * In-memory storage fallback when no storage is provided
@@ -97,12 +99,14 @@ export class KeycastOAuth {
   }
 
   /**
-   * Clear all session data including authorization handle
+   * Clear all session data including authorization handle and PKCE
    * Use this when user explicitly logs out - clears everything for security
    */
   logout(): void {
     this.storage.removeItem(STORAGE_KEY_SESSION);
     this.storage.removeItem(STORAGE_KEY_HANDLE);
+    this.storage.removeItem(STORAGE_KEY_PKCE);
+    this.pendingPkce = null;
   }
 
   private saveSession(credentials: StoredCredentials): void {
@@ -127,6 +131,8 @@ export class KeycastOAuth {
   } = {}): Promise<{ url: string; pkce: PkceChallenge }> {
     const pkce = await generatePkce(options.nsec);
     this.pendingPkce = pkce;
+    // Persist PKCE to storage (survives page reload during OAuth redirect)
+    this.storage.setItem(STORAGE_KEY_PKCE, JSON.stringify(pkce));
 
     const url = new URL(`${this.config.serverUrl}/api/oauth/authorize`);
     url.searchParams.set('client_id', this.config.clientId);
@@ -163,7 +169,19 @@ export class KeycastOAuth {
    * @returns Token response with bunker_url and optional access_token
    */
   async exchangeCode(code: string, verifier?: string): Promise<TokenResponse> {
-    const codeVerifier = verifier ?? this.pendingPkce?.verifier;
+    // Try: explicit verifier > in-memory PKCE > stored PKCE
+    let codeVerifier = verifier ?? this.pendingPkce?.verifier;
+    if (!codeVerifier) {
+      const storedPkce = this.storage.getItem(STORAGE_KEY_PKCE);
+      if (storedPkce) {
+        try {
+          const parsed = JSON.parse(storedPkce) as PkceChallenge;
+          codeVerifier = parsed.verifier;
+        } catch {
+          // Invalid stored PKCE, ignore
+        }
+      }
+    }
 
     if (!codeVerifier) {
       throw new Error('No PKCE verifier available. Call getAuthorizationUrl first or provide verifier.');
@@ -188,8 +206,9 @@ export class KeycastOAuth {
       throw new Error(error.error_description ?? error.error ?? 'Token exchange failed');
     }
 
-    // Clear pending PKCE after successful exchange
+    // Clear PKCE after successful exchange (both memory and storage)
     this.pendingPkce = null;
+    this.storage.removeItem(STORAGE_KEY_PKCE);
 
     const tokenResponse = data as TokenResponse;
 

@@ -3,6 +3,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use keycast_core::repositories::RepositoryError;
 use keycast_core::types::team::TeamError;
 use keycast_core::types::user::UserError;
 use serde_json::json;
@@ -33,6 +34,17 @@ pub enum ApiError {
 
     #[error("Team error: {0}")]
     Team(#[from] TeamError),
+}
+
+impl From<RepositoryError> for ApiError {
+    fn from(err: RepositoryError) -> Self {
+        match err {
+            RepositoryError::NotFound(msg) => ApiError::NotFound(msg),
+            RepositoryError::Duplicate => ApiError::BadRequest("Already exists".to_string()),
+            RepositoryError::Integrity(msg) => ApiError::BadRequest(msg),
+            RepositoryError::Database(msg) => ApiError::Internal(msg),
+        }
+    }
 }
 
 impl ApiError {

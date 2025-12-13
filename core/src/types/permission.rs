@@ -30,7 +30,7 @@ impl TryFrom<String> for JsonConfig {
 }
 
 /// A permission is database representation of a CustomPermission trait
-#[derive(Debug, FromRow, Serialize, Deserialize)]
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct Permission {
     /// The id of the permission
     pub id: i32,

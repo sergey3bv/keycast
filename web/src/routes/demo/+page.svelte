@@ -122,7 +122,7 @@
       });
 
       console.log("OAuth URL:", url); // Debug
-      sessionStorage.setItem("pkce_verifier", pkce.verifier);
+      // Library stores PKCE in localStorage automatically
       sessionStorage.setItem("byok_used", "false");
 
       window.location.href = url;
@@ -153,7 +153,7 @@
         nsec: identity.nsec,
       });
 
-      sessionStorage.setItem("pkce_verifier", pkce.verifier);
+      // Library stores PKCE in localStorage automatically
       sessionStorage.setItem("byok_used", "true");
       sessionStorage.setItem("byok_pubkey", identity.pubkey);
 
@@ -172,11 +172,8 @@
     oauthStatus = "loading";
 
     try {
-      const verifier = sessionStorage.getItem("pkce_verifier");
-      if (!verifier) throw new Error("Missing PKCE verifier");
-
-      // Library auto-saves session and authorization handle to storage
-      const tokens = await client.oauth.exchangeCode(code, verifier);
+      // Library auto-loads PKCE from storage and saves session after exchange
+      const tokens = await client.oauth.exchangeCode(code);
 
       credentials = {
         bunkerUrl: tokens.bunker_url,
@@ -349,9 +346,13 @@
       client.oauth.logout();
     }
 
-    // Clear demo-specific sessionStorage
-    sessionStorage.removeItem("pkce_verifier");
+    // Clear demo-specific sessionStorage (library clears its own PKCE/session)
     sessionStorage.removeItem("byok_used");
+
+    // Clear in-memory state
+    credentials = null;
+    rpc = null;
+    oauthStatus = "idle";
     sessionStorage.removeItem("byok_pubkey");
     sessionStorage.removeItem("demo_identity");
 
@@ -659,11 +660,10 @@ const client = createKeycastClient({"{"}
   redirectUri: window.location.origin + '/callback',
 {"}"});
 
-// Start OAuth flow
-const {"{"} url, pkce {"}"} = await client.oauth.getAuthorizationUrl({"{"}
+// Start OAuth flow (PKCE auto-stored in localStorage)
+const {"{"} url {"}"} = await client.oauth.getAuthorizationUrl({"{"}
   scopes: ['policy:social'],
 {"}"});
-sessionStorage.setItem('pkce_verifier', pkce.verifier);
 window.location.href = url;</code
           ></pre>
       </div>
@@ -674,11 +674,9 @@ window.location.href = url;</code
           <span>2. Exchange Code for Tokens</span>
         </div>
         <pre><code
-            >// On callback page
+            >// On callback page (PKCE auto-loaded from localStorage)
 const code = new URLSearchParams(location.search).get('code');
-const verifier = sessionStorage.getItem('pkce_verifier');
-
-const tokens = await client.oauth.exchangeCode(code, verifier);
+const tokens = await client.oauth.exchangeCode(code);
 // tokens.bunker_url  - NIP-46 bunker URL
 // tokens.access_token - UCAN for REST RPC</code
           ></pre>

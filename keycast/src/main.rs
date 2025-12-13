@@ -185,6 +185,14 @@ async fn wait_for_shutdown_signal() {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Ensure panics in any thread (including spawned tasks) kill the process
+    // This prevents the server from running in a broken state
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        std::process::exit(1);
+    }));
+
     dotenv().ok();
 
     // Use tokio default: 1 worker thread per CPU core
