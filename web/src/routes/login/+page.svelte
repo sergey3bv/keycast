@@ -10,12 +10,18 @@
 	let email = $state('');
 	let password = $state('');
 	let isLoading = $state(false);
+	let showVerificationNotice = $state(false);
+	let unverifiedEmail = $state('');
+	let isResending = $state(false);
 
 	async function handleLogin() {
 		if (!email || !password) {
 			toast.error('Please enter both email and password');
 			return;
 		}
+
+		// Reset verification notice
+		showVerificationNotice = false;
 
 		try {
 			isLoading = true;
@@ -39,9 +45,35 @@
 			goto('/');
 		} catch (err: any) {
 			console.error('Login error:', err);
-			toast.error(err.message || 'Login failed. Please check your credentials.');
+
+			// Check if this is an email not verified error
+			if (err.code === 'EMAIL_NOT_VERIFIED' || err.verification_required) {
+				showVerificationNotice = true;
+				unverifiedEmail = err.email || email;
+				toast.error('Please verify your email before logging in');
+			} else {
+				toast.error(err.message || 'Login failed. Please check your credentials.');
+			}
 		} finally {
 			isLoading = false;
+		}
+	}
+
+	async function handleResendVerification() {
+		if (!unverifiedEmail) {
+			toast.error('No email address available');
+			return;
+		}
+
+		try {
+			isResending = true;
+			await api.post('/auth/resend-verification', { email: unverifiedEmail });
+			toast.success('Verification email sent! Check your inbox.');
+		} catch (err: any) {
+			console.error('Resend error:', err);
+			toast.error(err.message || 'Failed to resend verification email');
+		} finally {
+			isResending = false;
 		}
 	}
 </script>
@@ -62,6 +94,28 @@
 
 		<h1>Sign in</h1>
 		<p class="subtitle">{BRAND.tagline}</p>
+
+		{#if showVerificationNotice}
+			<div class="verification-notice">
+				<div class="notice-icon">
+					<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 256 256">
+						<path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm-8,56a8,8,0,0,1,16,0v56a8,8,0,0,1-16,0Zm8,104a12,12,0,1,1,12-12A12,12,0,0,1,128,184Z"></path>
+					</svg>
+				</div>
+				<div class="notice-content">
+					<p><strong>Email verification required</strong></p>
+					<p>Please check your inbox for a verification link.</p>
+					<button
+						type="button"
+						class="btn-resend"
+						onclick={handleResendVerification}
+						disabled={isResending}
+					>
+						{isResending ? 'Sending...' : 'Resend verification email'}
+					</button>
+				</div>
+			</div>
+		{/if}
 
 		<form onsubmit={(e) => { e.preventDefault(); handleLogin(); }}>
 			<div class="form-group">
@@ -259,5 +313,56 @@
 
 	.auth-note a:hover {
 		text-decoration: underline;
+	}
+
+	.verification-notice {
+		display: flex;
+		gap: 0.75rem;
+		padding: 1rem;
+		background: rgba(255, 193, 7, 0.1);
+		border: 1px solid rgba(255, 193, 7, 0.3);
+		border-radius: 0.5rem;
+		margin-bottom: 1.5rem;
+	}
+
+	.notice-icon {
+		color: #f59e0b;
+		flex-shrink: 0;
+		padding-top: 0.125rem;
+	}
+
+	.notice-content {
+		flex: 1;
+	}
+
+	.notice-content p {
+		margin: 0;
+		font-size: 0.875rem;
+		color: var(--color-divine-text);
+	}
+
+	.notice-content p:first-child {
+		margin-bottom: 0.25rem;
+	}
+
+	.btn-resend {
+		background: none;
+		border: none;
+		color: var(--color-divine-green);
+		font-size: 0.875rem;
+		font-weight: 500;
+		cursor: pointer;
+		padding: 0;
+		margin-top: 0.5rem;
+		text-decoration: underline;
+	}
+
+	.btn-resend:hover:not(:disabled) {
+		color: var(--color-divine-green-dark);
+	}
+
+	.btn-resend:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 </style>

@@ -42,8 +42,12 @@ pub fn api_routes(
         .layer(auth_cors.clone())
         .with_state(auth_state.clone());
 
-    let email_routes = Router::new()
+    // verify_email needs auth_state for key_manager (to decrypt keys and issue UCAN)
+    let verify_email_route = Router::new()
         .route("/auth/verify-email", post(auth::verify_email))
+        .with_state(auth_state.clone());
+
+    let email_routes = Router::new()
         .route("/auth/forgot-password", post(auth::forgot_password))
         .route("/auth/reset-password", post(auth::reset_password))
         .with_state(pool.clone());
@@ -171,6 +175,7 @@ pub fn api_routes(
         .merge(bunker_routes) // Has auth_cors (bunker creation)
         .merge(key_export_routes) // Has auth_cors (authenticated, needs cookies)
         .merge(change_key_route) // Has auth_cors (authenticated, needs cookies)
+        .merge(verify_email_route.layer(auth_cors.clone())) // Email verification (sets session cookie, needs credentials)
         .merge(email_routes.layer(public_cors.clone()))
         .merge(oauth_routes) // Has public_cors (third-party safe)
         .merge(connect_routes.layer(public_cors.clone()))

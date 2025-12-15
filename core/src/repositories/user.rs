@@ -169,14 +169,15 @@ impl UserRepository {
         Ok(result.map(|r| r.0))
     }
 
-    /// Find user with password hash for login verification.
+    /// Find user with password hash and email verification status for login verification.
+    /// Returns (pubkey, password_hash, email_verified).
     pub async fn find_with_password(
         &self,
         email: &str,
         tenant_id: i64,
-    ) -> Result<Option<(String, String)>, RepositoryError> {
+    ) -> Result<Option<(String, String, bool)>, RepositoryError> {
         sqlx::query_as(
-            "SELECT pubkey, password_hash FROM users WHERE email = $1 AND tenant_id = $2 AND password_hash IS NOT NULL",
+            "SELECT pubkey, password_hash, email_verified FROM users WHERE email = $1 AND tenant_id = $2 AND password_hash IS NOT NULL",
         )
         .bind(email)
         .bind(tenant_id)

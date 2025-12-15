@@ -134,6 +134,7 @@ async fn store_oauth_code(
     code_challenge_method: Option<&str>,
     expires_at: chrono::DateTime<Utc>,
     previous_auth_id: Option<i32>,
+    state: Option<&str>,
 ) -> Result<(), OAuthError> {
     let repo = OAuthCodeRepository::new(pool.clone());
     repo.store(StoreOAuthCodeParams {
@@ -147,6 +148,7 @@ async fn store_oauth_code(
         code_challenge_method,
         expires_at,
         previous_auth_id,
+        state,
     })
     .await?;
     Ok(())
@@ -170,6 +172,7 @@ async fn store_oauth_code_with_pending_registration(
     pending_password_hash: &str,
     pending_email_verification_token: &str,
     pending_encrypted_secret: Option<&[u8]>,
+    state: Option<&str>,
 ) -> Result<(), OAuthError> {
     let repo = OAuthCodeRepository::new(pool.clone());
     repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
@@ -186,6 +189,7 @@ async fn store_oauth_code_with_pending_registration(
         pending_password_hash,
         pending_email_verification_token,
         pending_encrypted_secret,
+        state,
     })
     .await?;
     Ok(())
@@ -196,6 +200,7 @@ pub struct AuthorizeRequest {
     pub client_id: String,
     pub redirect_uri: String,
     pub scope: Option<String>,
+    pub state: Option<String>, // OAuth 2.0 state parameter for CSRF protection
     pub code_challenge: Option<String>,
     pub code_challenge_method: Option<String>,
     pub prompt: Option<String>, // OAuth 2.0 prompt parameter: "login", "consent", "none"
@@ -209,6 +214,7 @@ pub struct ApproveRequest {
     pub client_id: String,
     pub redirect_uri: String,
     pub scope: String,
+    pub state: Option<String>, // OAuth 2.0 state parameter
     pub approved: bool,
     pub code_challenge: Option<String>,
     pub code_challenge_method: Option<String>,
@@ -607,13 +613,18 @@ pub async fn authorize_get(
                 params.code_challenge_method.as_deref(),
                 expires_at,
                 previous_auth_id,
+                params.state.as_deref(),
             )
             .await?;
 
             // Auto-approve: redirect to redirect_uri with code (standard OAuth pattern)
-            return Ok(
-                Redirect::to(&format!("{}?code={}", params.redirect_uri, code)).into_response(),
-            );
+            // Include state in redirect if provided
+            let redirect_url = if let Some(ref state) = params.state {
+                format!("{}?code={}&state={}", params.redirect_uri, code, state)
+            } else {
+                format!("{}?code={}", params.redirect_uri, code)
+            };
+            return Ok(Redirect::to(&redirect_url).into_response());
         } else if previous_auth_id.is_some() && force_consent {
             tracing::info!("prompt=consent: skipping auto-approve, showing approval screen");
         }
@@ -1346,6 +1357,33 @@ pub async fn authorize_get(
             font-size: 0.875rem;
             text-align: center;
         }}
+        .verification_notice {{
+            text-align: center;
+            padding: 2rem 1rem;
+        }}
+        .verification_icon {{
+            color: var(--divine-green);
+            margin-bottom: 1rem;
+        }}
+        .verification_notice h2 {{
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: var(--text);
+            margin-bottom: 0.5rem;
+        }}
+        .verification_notice p {{
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            line-height: 1.5;
+            margin-bottom: 0.5rem;
+        }}
+        .verification_notice strong {{
+            color: var(--text);
+        }}
+        .verification_subtext {{
+            font-size: 0.8rem !important;
+            color: var(--text-secondary);
+        }}
         .advanced_section {{
             margin: 1rem 0;
         }}
@@ -1438,6 +1476,17 @@ pub async fn authorize_get(
             </div>
 
             <div id="error" class="error"></div>
+
+            <div id="verification_notice" class="verification_notice" style="display: none;">
+                <div class="verification_icon">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" fill="currentColor" viewBox="0 0 256 256">
+                        <path d="M224,48H32a8,8,0,0,0-8,8V192a16,16,0,0,0,16,16H216a16,16,0,0,0,16-16V56A8,8,0,0,0,224,48ZM203.43,64,128,133.15,52.57,64ZM216,192H40V74.19l82.59,75.71a8,8,0,0,0,10.82,0L216,74.19V192Z"></path>
+                    </svg>
+                </div>
+                <h2>Check your email</h2>
+                <p>We've sent a verification link to <strong id="verification_email"></strong></p>
+                <p class="verification_subtext">Click the link in the email to verify your account and complete sign up. After verification, you'll be redirected back to the app.</p>
+            </div>
 
             <div id="login_view" class="form_view">
                 <form onsubmit="handleLogin(event)">
@@ -1559,6 +1608,18 @@ pub async fn authorize_get(
             document.getElementById('error').style.display = 'none';
         }}
 
+        function showVerificationNotice(email) {{
+            // Hide forms and show verification notice
+            document.getElementById('login_view').classList.remove('active');
+            document.getElementById('register_view').classList.remove('active');
+            hideError();
+
+            const notice = document.getElementById('verification_notice');
+            const emailSpan = document.getElementById('verification_email');
+            if (emailSpan) emailSpan.textContent = email;
+            notice.style.display = 'block';
+        }}
+
         function toggleAdvanced() {{
             const content = document.getElementById('advanced_content');
             const icon = document.getElementById('advanced_icon');
@@ -1591,6 +1652,11 @@ pub async fn authorize_get(
 
                 if (!response.ok) {{
                     const data = await response.json().catch(() => ({{}}));
+                    // Check if email not verified
+                    if (data.code === 'EMAIL_NOT_VERIFIED' || data.verification_required) {{
+                        showVerificationNotice(data.email || email);
+                        return;
+                    }}
                     showError(data.error || 'Login failed');
                     return;
                 }}
@@ -1648,8 +1714,20 @@ pub async fn authorize_get(
                     return;
                 }}
 
+                // Check if email verification is required
+                if (data.verification_required) {{
+                    showVerificationNotice(data.email || email);
+                    return;
+                }}
+
                 if (data.code) {{
-                    window.location.href = `${{redirectUri}}?code=${{data.code}}`;
+                    // Include state in redirect if available
+                    const state = new URLSearchParams(window.location.search).get('state');
+                    if (state) {{
+                        window.location.href = `${{redirectUri}}?code=${{data.code}}&state=${{encodeURIComponent(state)}}`;
+                    }} else {{
+                        window.location.href = `${{redirectUri}}?code=${{data.code}}`;
+                    }}
                 }} else {{
                     showError('Registration succeeded but no authorization code received');
                 }}
@@ -1742,6 +1820,7 @@ pub async fn authorize_post(
         req.code_challenge_method.as_deref(),
         expires_at,
         None,
+        req.state.as_deref(),
     )
     .await?;
 
@@ -1750,7 +1829,8 @@ pub async fn authorize_post(
     // For now, just return JSON with the code - client can handle it
     Ok(Json(serde_json::json!({
         "code": code,
-        "redirect_uri": req.redirect_uri
+        "redirect_uri": req.redirect_uri,
+        "state": req.state
     }))
     .into_response())
 }
@@ -2276,7 +2356,7 @@ pub async fn oauth_login(
 
     // Validate credentials
     let user_repo = UserRepository::new(pool.clone());
-    let (public_key, password_hash) = user_repo
+    let (public_key, password_hash, email_verified) = user_repo
         .find_with_password(&req.email, tenant_id)
         .await?
         .ok_or(OAuthError::Unauthorized)?;
@@ -2291,6 +2371,17 @@ pub async fn oauth_login(
 
     if !valid {
         return Err(OAuthError::Unauthorized);
+    }
+
+    // Check if email is verified
+    if !email_verified {
+        tracing::warn!(
+            "OAuth login failed: email not verified for {}",
+            req.email
+        );
+        return Err(OAuthError::InvalidRequest(
+            "Please verify your email address before signing in. Check your inbox for the verification link.".to_string(),
+        ));
     }
 
     // Get user's keys for UCAN generation
@@ -2475,21 +2566,18 @@ pub async fn oauth_register(
     // DO NOT create personal_keys row here - defer to token exchange
     // DO NOT send verification email here - defer to token exchange
 
-    // Auto-approve: first-time registration implies consent
-    // Generate authorization code immediately
+    // Generate authorization code (will be used after email verification)
     let code: String = rand::thread_rng()
         .sample_iter(&rand::distributions::Alphanumeric)
         .take(32)
         .map(char::from)
         .collect();
 
-    let expires_at = Utc::now() + Duration::minutes(10);
+    // Use 24-hour expiry for pending registrations (matches email verification expiry)
+    let expires_at = Utc::now() + Duration::hours(24);
 
-    // Extract redirect_origin - the ONLY secure app identifier
-    let redirect_origin = extract_origin(&req.redirect_uri)?;
-
-    // Store authorization code with pending registration data
-    // User + personal_keys will be created atomically at token exchange
+    // Store authorization code with pending registration data (including state for redirect after verification)
+    // User + personal_keys will be created atomically when email is verified
     let scope = req.scope.as_deref().unwrap_or("sign_event");
     store_oauth_code_with_pending_registration(
         pool,
@@ -2506,74 +2594,45 @@ pub async fn oauth_register(
         &password_hash,
         &verification_token,
         pending_encrypted_secret.as_deref(),
+        req.state.as_deref(),
     )
     .await?;
 
     tracing::info!(
-        "OAuth registration deferred to token exchange: user {}, email {}",
+        "OAuth registration pending email verification: user {}, email {}",
         public_key.to_hex(),
         req.email
     );
 
-    tracing::info!(
-        "OAuth auto-approve for new registration: user {}, origin {}",
-        public_key.to_hex(),
-        redirect_origin
-    );
-
-    // Generate UCAN for SSO (includes redirect_origin for authorization lookup)
-    let ucan_token = if let Some(ref keys) = generated_keys {
-        // Auto-generate flow: user-signed UCAN (user has keys)
-        super::auth::generate_ucan_token(
-            keys,
-            tenant_id,
-            &req.email,
-            &redirect_origin,
-            req.relays.as_deref(),
-        )
-        .await
-        .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?
-    } else {
-        // BYOK flow: server-signed UCAN (user doesn't have keys yet)
-        super::auth::generate_server_signed_ucan(
-            &public_key,
-            tenant_id,
-            &req.email,
-            &redirect_origin,
-            None,
-            &auth_state.state.server_keys,
-        )
-        .await
-        .map_err(|e| OAuthError::InvalidRequest(format!("UCAN generation failed: {:?}", e)))?
-    };
-
-    // Set UCAN cookie for SSO across OAuth apps
-    let cookie = format!(
-        "keycast_session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400",
-        ucan_token
-    );
-
-    tracing::info!(
-        "Set server-signed UCAN cookie for user {} (SSO enabled)",
-        public_key.to_hex()
-    );
-
-    // If state provided (iOS PWA polling flow), store code in polling cache
-    if let Some(ref state) = req.state {
-        let expiry = Instant::now(); // Will be checked with elapsed()
-        POLLING_CACHE.insert(state.clone(), (code.clone(), expiry));
-        tracing::info!("Stored code in polling cache for state: {}", state);
+    // Send verification email (required - user must verify before OAuth flow completes)
+    match crate::email_service::EmailService::new() {
+        Ok(email_service) => {
+            if let Err(e) = email_service
+                .send_verification_email(&req.email, &verification_token)
+                .await
+            {
+                tracing::error!("Failed to send verification email to {}: {}", req.email, e);
+                // Continue even if email fails - user can resend later
+            } else {
+                tracing::info!("Sent verification email to {}", req.email);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Email service unavailable, skipping verification email: {}",
+                e
+            );
+        }
     }
 
-    // Return code with cookie (auto-approve)
-    Ok((
-        [(axum::http::header::SET_COOKIE, cookie)],
-        Json(serde_json::json!({
-            "code": code,
-            "redirect_uri": req.redirect_uri
-        })),
-    )
-        .into_response())
+    // DO NOT issue UCAN or set session cookie - user must verify email first
+    // Return verification_required response so frontend shows "check your email" message
+    Ok(Json(serde_json::json!({
+        "verification_required": true,
+        "email": req.email,
+        "pubkey": public_key.to_hex()
+    }))
+    .into_response())
 }
 
 // generate_auto_approve_html_with_cookie() and generate_approval_page_html() removed

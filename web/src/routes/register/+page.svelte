@@ -11,6 +11,8 @@
 	let password = $state('');
 	let confirmPassword = $state('');
 	let isLoading = $state(false);
+	let showVerificationNotice = $state(false);
+	let registeredEmail = $state('');
 
 	async function handleRegister() {
 		if (!email || !password) {
@@ -31,18 +33,28 @@
 		try {
 			isLoading = true;
 
-			const response = await api.post<{ token: string; pubkey: string; email: string }>(
-				'/auth/register',
-				{ email, password }
-			);
+			const response = await api.post<{
+				success?: boolean;
+				verification_required?: boolean;
+				token?: string;
+				pubkey?: string;
+				email?: string;
+			}>('/auth/register', { email, password });
 
-			toast.success(`Account created! Welcome ${email}`);
+			// Check if email verification is required
+			if (response.verification_required) {
+				showVerificationNotice = true;
+				registeredEmail = response.email || email;
+				toast.success('Account created! Please verify your email.');
+				return;
+			}
 
-			// Set current user for UI state (Header, navigation, etc.)
-			setCurrentUser(response.pubkey, 'cookie');
-
-			// Cookie is set, redirect to dashboard
-			goto('/');
+			// Legacy flow: immediate login
+			if (response.pubkey) {
+				toast.success(`Account created! Welcome ${email}`);
+				setCurrentUser(response.pubkey, 'cookie');
+				goto('/');
+			}
 		} catch (err: any) {
 			console.error('Registration error:', err);
 			toast.error(err.message || 'Registration failed. Please try again.');
@@ -69,7 +81,20 @@
 		<h1>Create your {BRAND.name}</h1>
 		<p class="subtitle">{BRAND.tagline}</p>
 
-		<form onsubmit={(e) => { e.preventDefault(); handleRegister(); }}>
+		{#if showVerificationNotice}
+			<div class="verification-notice">
+				<div class="notice-icon success">
+					<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" fill="currentColor" viewBox="0 0 256 256">
+						<path d="M224,48H32a8,8,0,0,0-8,8V192a16,16,0,0,0,16,16H216a16,16,0,0,0,16-16V56A8,8,0,0,0,224,48ZM203.43,64,128,133.15,52.57,64ZM216,192H40V74.19l82.59,75.71a8,8,0,0,0,10.82,0L216,74.19V192Z"></path>
+					</svg>
+				</div>
+				<h2>Check your email</h2>
+				<p>We've sent a verification link to <strong>{registeredEmail}</strong></p>
+				<p class="subtext">Click the link in the email to verify your account and sign in.</p>
+				<a href="/login" class="btn-secondary">Go to Login</a>
+			</div>
+		{:else}
+			<form onsubmit={(e) => { e.preventDefault(); handleRegister(); }}>
 			<div class="form-group">
 				<label for="email">Email</label>
 				<input
@@ -113,13 +138,14 @@
 			</button>
 		</form>
 
-		<p class="auth-link">
-			Already have an account? <a href="/login">Sign in</a>
-		</p>
+			<p class="auth-link">
+				Already have an account? <a href="/login">Sign in</a>
+			</p>
 
-		<p class="auth-note">
-			Team admins: Use <a href="/">NIP-07 browser extension</a> instead
-		</p>
+			<p class="auth-note">
+				Team admins: Use <a href="/">NIP-07 browser extension</a> instead
+			</p>
+		{/if}
 	</div>
 </div>
 
@@ -275,5 +301,60 @@
 
 	.auth-note a:hover {
 		text-decoration: underline;
+	}
+
+	.verification-notice {
+		text-align: center;
+		padding: 1rem 0;
+	}
+
+	.verification-notice .notice-icon {
+		margin-bottom: 1rem;
+	}
+
+	.verification-notice .notice-icon.success {
+		color: var(--color-divine-green);
+	}
+
+	.verification-notice h2 {
+		font-size: 1.25rem;
+		font-weight: 600;
+		color: var(--color-divine-text);
+		margin-bottom: 0.5rem;
+	}
+
+	.verification-notice p {
+		color: var(--color-divine-text-secondary);
+		font-size: 0.9rem;
+		line-height: 1.5;
+		margin-bottom: 0.5rem;
+	}
+
+	.verification-notice strong {
+		color: var(--color-divine-text);
+	}
+
+	.verification-notice .subtext {
+		font-size: 0.8rem;
+		margin-bottom: 1.5rem;
+	}
+
+	.btn-secondary {
+		display: inline-block;
+		padding: 0.75rem 1.5rem;
+		background: transparent;
+		color: var(--color-divine-text-secondary);
+		border: 1px solid var(--color-divine-border);
+		border-radius: 9999px;
+		font-size: 1rem;
+		font-weight: 600;
+		cursor: pointer;
+		text-decoration: none;
+		transition: all 0.2s;
+	}
+
+	.btn-secondary:hover {
+		background: var(--color-divine-muted);
+		color: var(--color-divine-text);
 	}
 </style>

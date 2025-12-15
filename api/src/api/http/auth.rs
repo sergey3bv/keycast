@@ -11,8 +11,8 @@ use bcrypt::{hash, verify, DEFAULT_COST};
 use chrono::{Duration, Utc};
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
-    CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, PersonalKeysRepository,
-    PolicyRepository, SigningActivityRepository, UserRepository,
+    CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, OAuthCodeRepository,
+    PersonalKeysRepository, PolicyRepository, SigningActivityRepository, UserRepository,
 };
 use keycast_core::traits::CustomPermission;
 use nostr_sdk::{Keys, PublicKey, ToBech32, UnsignedEvent};
@@ -136,6 +136,10 @@ pub struct RegisterRequest {
 pub struct AuthResponse {
     pub success: bool,
     pub pubkey: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_required: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,6 +162,12 @@ pub struct VerifyEmailRequest {
 pub struct VerifyEmailResponse {
     pub success: bool,
     pub message: String,
+    /// For OAuth flows: URL to redirect to after verification
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect_to: Option<String>,
+    /// For normal flows: indicates user is now authenticated (UCAN cookie set)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authenticated: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -407,19 +417,17 @@ pub(crate) fn extract_origin_from_headers(headers: &HeaderMap) -> Result<String,
         .ok_or(AuthError::BadRequest("Origin header required".to_string()))
 }
 
-/// Register a new user with email and password, sets session cookie
+/// Register a new user with email and password
+/// Note: Does NOT issue UCAN - user must verify email first
 pub async fn register(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Result<impl axum::response::IntoResponse, AuthError> {
     let pool = &auth_state.state.db;
     let key_manager = auth_state.state.key_manager.as_ref();
     let tenant_id = tenant.0.id;
-
-    // Extract redirect_origin from HTTP Origin header (required for UCAN)
-    let redirect_origin = extract_origin_from_headers(&headers)?;
 
     let instance_id = keycast_core::instance::instance_id();
 
@@ -493,7 +501,7 @@ pub async fn register(
     // Track successful registration
     METRICS.inc_registration();
 
-    // Send verification email (optional - don't fail if email service unavailable)
+    // Send verification email (required - user must verify before login)
     match crate::email_service::EmailService::new() {
         Ok(email_service) => {
             if let Err(e) = email_service
@@ -501,6 +509,7 @@ pub async fn register(
                 .await
             {
                 tracing::error!("Failed to send verification email to {}: {}", req.email, e);
+                // Continue even if email fails - user can resend later
             } else {
                 tracing::info!("Sent verification email to {}", req.email);
             }
@@ -513,35 +522,22 @@ pub async fn register(
         }
     }
 
-    // Generate UCAN token for session cookie with redirect_origin and optional relays
-    let ucan_token = generate_ucan_token(
-        &keys,
-        tenant_id,
-        &req.email,
-        &redirect_origin,
-        req.relays.as_deref(),
-    )
-    .await?;
-
     tracing::info!(
         event = "registration_success",
         instance_id = %instance_id,
         tenant_id = tenant_id,
-        "User registered successfully"
+        "User registered successfully, awaiting email verification"
     );
 
-    // Create response with UCAN session cookie (bunker_url NOT included - fetch via /user/bunker)
-    let cookie = format!(
-        "keycast_session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400",
-        ucan_token
-    );
-
+    // DO NOT issue UCAN or set session cookie - user must verify email first
+    // Return verification_required response so frontend shows "check your email" message
     let response = (
         axum::http::StatusCode::OK,
-        [(axum::http::header::SET_COOKIE, cookie)],
         axum::Json(AuthResponse {
             success: true,
             pubkey: public_key.to_hex(),
+            verification_required: Some(true),
+            email: Some(req.email.clone()),
         }),
     );
 
@@ -570,11 +566,11 @@ pub async fn login(
         "Login attempt"
     );
 
-    // Fetch user with password hash from this tenant
+    // Fetch user with password hash and email_verified status from this tenant
     let user_repo = UserRepository::new(pool.clone());
     let user = user_repo.find_with_password(&req.email, tenant_id).await?;
 
-    let (public_key, password_hash) = match user {
+    let (public_key, password_hash, email_verified) = match user {
         Some(u) => u,
         None => {
             tracing::warn!(
@@ -604,6 +600,18 @@ pub async fn login(
         );
         METRICS.inc_login_failure();
         return Err(AuthError::InvalidCredentials);
+    }
+
+    // Check if email is verified
+    if !email_verified {
+        tracing::warn!(
+            event = "login",
+            tenant_id = tenant_id,
+            success = false,
+            reason = "email_not_verified",
+            "Login failed: email not verified"
+        );
+        return Err(AuthError::EmailNotVerified);
     }
 
     // Get user's Nostr keys from personal_keys
@@ -649,6 +657,8 @@ pub async fn login(
         axum::Json(AuthResponse {
             success: true,
             pubkey: public_key,
+            verification_required: None,
+            email: None,
         }),
     );
 
@@ -914,19 +924,163 @@ pub async fn get_bunker_url(
 }
 
 /// Verify email address with token
+/// Handles two flows:
+/// 1. OAuth registration: token in oauth_codes → complete OAuth flow → redirect to client
+/// 2. Normal registration: token in users → mark verified → issue UCAN → set cookie
 pub async fn verify_email(
     tenant: crate::api::tenant::TenantExtractor,
-    State(pool): State<PgPool>,
+    State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
     Json(req): Json<VerifyEmailRequest>,
-) -> Result<Json<VerifyEmailResponse>, AuthError> {
+) -> Result<impl IntoResponse, AuthError> {
+    let pool = &auth_state.state.db;
+    let key_manager = auth_state.state.key_manager.as_ref();
     let tenant_id = tenant.0.id;
+
     tracing::info!(
         "Email verification attempt with token: {}... for tenant: {}",
-        &req.token[..10],
+        &req.token[..std::cmp::min(10, req.token.len())],
         tenant_id
     );
 
-    // Find user with this verification token in this tenant
+    // First: Check oauth_codes for pending OAuth registration
+    let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
+    if let Some(oauth_data) = oauth_code_repo
+        .find_by_verification_token(&req.token, tenant_id)
+        .await?
+    {
+        // Found in oauth_codes - this is an OAuth registration flow
+        tracing::info!(
+            "Email verification for OAuth registration: pubkey {}, email {:?}",
+            oauth_data.user_pubkey,
+            oauth_data.pending_email
+        );
+
+        let email = oauth_data
+            .pending_email
+            .as_ref()
+            .ok_or_else(|| AuthError::Internal("Missing pending email".to_string()))?;
+        let password_hash = oauth_data
+            .pending_password_hash
+            .as_ref()
+            .ok_or_else(|| AuthError::Internal("Missing pending password hash".to_string()))?;
+
+        // Create user with email_verified=true (they just verified!)
+        let user_repo = UserRepository::new(pool.clone());
+
+        // Check if keys were generated (pending_encrypted_secret) or BYOK flow
+        if let Some(ref encrypted_secret) = oauth_data.pending_encrypted_secret {
+            // Auto-generated or direct nsec: create user + personal_keys
+            // Use a transaction to ensure atomicity
+            let now = Utc::now();
+            let mut tx = pool.begin().await?;
+
+            sqlx::query(
+                "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(&oauth_data.user_pubkey)
+            .bind(tenant_id)
+            .bind(email)
+            .bind(password_hash)
+            .bind(true) // email_verified = true
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(&oauth_data.user_pubkey)
+            .bind(encrypted_secret)
+            .bind(tenant_id)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+
+            tracing::info!(
+                "Created user and personal_keys for OAuth registration: {}",
+                oauth_data.user_pubkey
+            );
+        } else {
+            // BYOK flow: just create user, keys will come at token exchange
+            user_repo
+                .create_with_password_verified(
+                    &oauth_data.user_pubkey,
+                    tenant_id,
+                    email,
+                    password_hash,
+                    true, // email_verified = true
+                )
+                .await?;
+
+            tracing::info!(
+                "Created user for BYOK OAuth registration: {}",
+                oauth_data.user_pubkey
+            );
+        }
+
+        // Generate new authorization code for the redirect
+        let new_code: String = rand::thread_rng()
+            .sample_iter(&rand::distributions::Alphanumeric)
+            .take(32)
+            .map(char::from)
+            .collect();
+
+        // Store the new code (10 minute expiry for exchange)
+        let code_expires_at = Utc::now() + Duration::minutes(10);
+        let store_params = keycast_core::repositories::StoreOAuthCodeParams {
+            tenant_id,
+            code: &new_code,
+            user_pubkey: &oauth_data.user_pubkey,
+            client_id: &oauth_data.client_id,
+            redirect_uri: &oauth_data.redirect_uri,
+            scope: &oauth_data.scope,
+            code_challenge: oauth_data.code_challenge.as_deref(),
+            code_challenge_method: oauth_data.code_challenge_method.as_deref(),
+            expires_at: code_expires_at,
+            previous_auth_id: oauth_data.previous_auth_id,
+            state: oauth_data.state.as_deref(),
+        };
+        oauth_code_repo.store(store_params).await?;
+
+        // Delete the pending registration entry
+        oauth_code_repo
+            .delete_by_verification_token(&req.token, tenant_id)
+            .await?;
+
+        // Build redirect URL
+        let mut redirect_url = format!("{}?code={}", oauth_data.redirect_uri, new_code);
+        if let Some(ref state) = oauth_data.state {
+            redirect_url = format!("{}&state={}", redirect_url, state);
+        }
+
+        tracing::info!(
+            event = "email_verification",
+            tenant_id = tenant_id,
+            flow = "oauth",
+            success = true,
+            "Email verified, redirecting to OAuth client"
+        );
+
+        return Ok((
+            axum::http::StatusCode::OK,
+            axum::Json(VerifyEmailResponse {
+                success: true,
+                message: "Email verified! Redirecting to app...".to_string(),
+                redirect_to: Some(redirect_url),
+                authenticated: None,
+            }),
+        )
+            .into_response());
+    }
+
+    // Second: Check users table for normal registration
     let user_repo = UserRepository::new(pool.clone());
     let (public_key, expires_at) = user_repo
         .find_by_verification_token(&req.token, tenant_id)
@@ -936,27 +1090,74 @@ pub async fn verify_email(
     // Check if token is expired
     if let Some(expires) = expires_at {
         if expires < Utc::now() {
-            return Ok(Json(VerifyEmailResponse {
-                success: false,
-                message: "Verification link has expired. Please request a new one.".to_string(),
-            }));
+            return Ok((
+                axum::http::StatusCode::OK,
+                axum::Json(VerifyEmailResponse {
+                    success: false,
+                    message: "Verification link has expired. Please request a new one.".to_string(),
+                    redirect_to: None,
+                    authenticated: None,
+                }),
+            )
+                .into_response());
         }
     }
 
     // Mark email as verified and clear verification token
     user_repo.verify_email(&public_key, tenant_id).await?;
 
+    // Get user's email for UCAN
+    let email = user_repo.get_email(&public_key, tenant_id).await?;
+
+    // Get user's keys to generate UCAN
+    let personal_keys_repo = PersonalKeysRepository::new(pool.clone());
+    let encrypted_secret = personal_keys_repo
+        .find_encrypted_key(&public_key)
+        .await?
+        .ok_or_else(|| AuthError::Internal("Personal keys not found".to_string()))?;
+
+    let decrypted_secret = key_manager
+        .decrypt(&encrypted_secret)
+        .await
+        .map_err(|e| AuthError::Encryption(e.to_string()))?;
+
+    let secret_key = nostr_sdk::secp256k1::SecretKey::from_slice(&decrypted_secret)
+        .map_err(|e| AuthError::Internal(format!("Invalid secret key bytes: {}", e)))?;
+    let keys = Keys::new(secret_key.into());
+
+    // Extract redirect_origin from Origin header for UCAN
+    let redirect_origin = extract_origin_from_headers(&headers)
+        .unwrap_or_else(|_| "https://login.divine.video".to_string());
+
+    // Generate UCAN token for session cookie
+    let ucan_token =
+        generate_ucan_token(&keys, tenant_id, &email, &redirect_origin, None).await?;
+
     tracing::info!(
         event = "email_verification",
         tenant_id = tenant_id,
+        flow = "normal",
         success = true,
-        "Email verified successfully"
+        "Email verified successfully, issuing UCAN"
     );
 
-    Ok(Json(VerifyEmailResponse {
-        success: true,
-        message: "Email verified successfully! You can now use all features.".to_string(),
-    }))
+    // Set UCAN session cookie
+    let cookie = format!(
+        "keycast_session={}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400",
+        ucan_token
+    );
+
+    Ok((
+        axum::http::StatusCode::OK,
+        [(axum::http::header::SET_COOKIE, cookie)],
+        axum::Json(VerifyEmailResponse {
+            success: true,
+            message: "Email verified successfully! You are now logged in.".to_string(),
+            redirect_to: None,
+            authenticated: Some(true),
+        }),
+    )
+        .into_response())
 }
 
 #[derive(Debug, Serialize)]

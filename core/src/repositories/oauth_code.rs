@@ -19,6 +19,7 @@ pub struct OAuthCodeData {
     pub pending_email_verification_token: Option<String>,
     pub pending_encrypted_secret: Option<Vec<u8>>,
     pub previous_auth_id: Option<i32>,
+    pub state: Option<String>,
 }
 
 /// Parameters for storing a basic OAuth code
@@ -34,6 +35,7 @@ pub struct StoreOAuthCodeParams<'a> {
     pub code_challenge_method: Option<&'a str>,
     pub expires_at: DateTime<Utc>,
     pub previous_auth_id: Option<i32>,
+    pub state: Option<&'a str>,
 }
 
 /// Parameters for storing OAuth code with pending registration data
@@ -52,6 +54,7 @@ pub struct StoreOAuthCodeWithRegistrationParams<'a> {
     pub pending_password_hash: &'a str,
     pub pending_email_verification_token: &'a str,
     pub pending_encrypted_secret: Option<&'a [u8]>,
+    pub state: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,8 +70,8 @@ impl OAuthCodeRepository {
     /// Store an OAuth authorization code with PKCE support.
     pub async fn store(&self, params: StoreOAuthCodeParams<'_>) -> Result<(), RepositoryError> {
         sqlx::query(
-            "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, previous_auth_id, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, previous_auth_id, state, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(params.tenant_id)
         .bind(params.code)
@@ -80,6 +83,7 @@ impl OAuthCodeRepository {
         .bind(params.code_challenge_method)
         .bind(params.expires_at)
         .bind(params.previous_auth_id)
+        .bind(params.state)
         .bind(Utc::now())
         .execute(&self.pool)
         .await?;
@@ -94,8 +98,8 @@ impl OAuthCodeRepository {
     ) -> Result<(), RepositoryError> {
         sqlx::query(
             "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at,
-             pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+             pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, state)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(params.tenant_id)
         .bind(params.code)
@@ -111,6 +115,7 @@ impl OAuthCodeRepository {
         .bind(params.pending_password_hash)
         .bind(params.pending_email_verification_token)
         .bind(params.pending_encrypted_secret)
+        .bind(params.state)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -135,10 +140,11 @@ impl OAuthCodeRepository {
             Option<String>,
             Option<Vec<u8>>,
             Option<i32>,
+            Option<String>,
         )> = sqlx::query_as(
             "SELECT user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method,
                     pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret,
-                    previous_auth_id
+                    previous_auth_id, state
              FROM oauth_codes
              WHERE tenant_id = $1 AND code = $2 AND expires_at > $3",
         )
@@ -160,7 +166,74 @@ impl OAuthCodeRepository {
             pending_email_verification_token: row.8,
             pending_encrypted_secret: row.9,
             previous_auth_id: row.10,
+            state: row.11,
         }))
+    }
+
+    /// Find a pending OAuth registration by email verification token.
+    /// Used when user clicks the email verification link to complete OAuth flow.
+    #[allow(clippy::type_complexity)]
+    pub async fn find_by_verification_token(
+        &self,
+        token: &str,
+        tenant_id: i64,
+    ) -> Result<Option<OAuthCodeData>, RepositoryError> {
+        let result: Option<(
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<Vec<u8>>,
+            Option<i32>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method,
+                    pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret,
+                    previous_auth_id, state
+             FROM oauth_codes
+             WHERE pending_email_verification_token = $1 AND tenant_id = $2 AND expires_at > $3",
+        )
+        .bind(token)
+        .bind(tenant_id)
+        .bind(Utc::now())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(result.map(|row| OAuthCodeData {
+            user_pubkey: row.0,
+            client_id: row.1,
+            redirect_uri: row.2,
+            scope: row.3,
+            code_challenge: row.4,
+            code_challenge_method: row.5,
+            pending_email: row.6,
+            pending_password_hash: row.7,
+            pending_email_verification_token: row.8,
+            pending_encrypted_secret: row.9,
+            previous_auth_id: row.10,
+            state: row.11,
+        }))
+    }
+
+    /// Delete pending OAuth registration by verification token.
+    pub async fn delete_by_verification_token(
+        &self,
+        token: &str,
+        tenant_id: i64,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "DELETE FROM oauth_codes WHERE pending_email_verification_token = $1 AND tenant_id = $2",
+        )
+        .bind(token)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Delete an OAuth code (one-time use).
@@ -228,6 +301,7 @@ mod tests {
             code_challenge_method: Some("S256"),
             expires_at,
             previous_auth_id: None,
+            state: None,
         })
         .await
         .unwrap();
