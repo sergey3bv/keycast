@@ -18,8 +18,16 @@ pub struct CapturedEmail {
 /// Trait for email sending - allows swapping implementations for testing
 #[async_trait]
 pub trait EmailSender: Send + Sync {
-    async fn send_verification_email(&self, to_email: &str, verification_token: &str) -> Result<(), String>;
-    async fn send_password_reset_email(&self, to_email: &str, reset_token: &str) -> Result<(), String>;
+    async fn send_verification_email(
+        &self,
+        to_email: &str,
+        verification_token: &str,
+    ) -> Result<(), String>;
+    async fn send_password_reset_email(
+        &self,
+        to_email: &str,
+        reset_token: &str,
+    ) -> Result<(), String>;
 
     /// Get captured emails (only available in dev/test mode)
     fn get_captured_emails(&self) -> Vec<CapturedEmail> {
@@ -68,8 +76,15 @@ impl Default for DevEmailSender {
 
 #[async_trait]
 impl EmailSender for DevEmailSender {
-    async fn send_verification_email(&self, to_email: &str, verification_token: &str) -> Result<(), String> {
-        let verification_url = format!("{}/verify-email?token={}", self.base_url, verification_token);
+    async fn send_verification_email(
+        &self,
+        to_email: &str,
+        verification_token: &str,
+    ) -> Result<(), String> {
+        let verification_url = format!(
+            "{}/verify-email?token={}",
+            self.base_url, verification_token
+        );
 
         tracing::info!("");
         tracing::info!("==================================================");
@@ -84,7 +99,10 @@ impl EmailSender for DevEmailSender {
         tracing::info!("");
 
         // Also print to stderr so it's visible even with log filtering
-        eprintln!("\n\x1b[32m[DEV EMAIL]\x1b[0m Verification link for {}: \x1b[4m{}\x1b[0m\n", to_email, verification_url);
+        eprintln!(
+            "\n\x1b[32m[DEV EMAIL]\x1b[0m Verification link for {}: \x1b[4m{}\x1b[0m\n",
+            to_email, verification_url
+        );
 
         // Capture for testing
         if let Ok(mut captured) = self.captured.lock() {
@@ -99,7 +117,11 @@ impl EmailSender for DevEmailSender {
         Ok(())
     }
 
-    async fn send_password_reset_email(&self, to_email: &str, reset_token: &str) -> Result<(), String> {
+    async fn send_password_reset_email(
+        &self,
+        to_email: &str,
+        reset_token: &str,
+    ) -> Result<(), String> {
         let reset_url = format!("{}/reset-password?token={}", self.base_url, reset_token);
 
         tracing::info!("");
@@ -115,7 +137,10 @@ impl EmailSender for DevEmailSender {
         tracing::info!("");
 
         // Also print to stderr so it's visible even with log filtering
-        eprintln!("\n\x1b[33m[DEV EMAIL]\x1b[0m Password reset link for {}: \x1b[4m{}\x1b[0m\n", to_email, reset_url);
+        eprintln!(
+            "\n\x1b[33m[DEV EMAIL]\x1b[0m Password reset link for {}: \x1b[4m{}\x1b[0m\n",
+            to_email, reset_url
+        );
 
         // Capture for testing
         if let Ok(mut captured) = self.captured.lock() {
@@ -131,7 +156,10 @@ impl EmailSender for DevEmailSender {
     }
 
     fn get_captured_emails(&self) -> Vec<CapturedEmail> {
-        self.captured.lock().map(|guard| guard.clone()).unwrap_or_default()
+        self.captured
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 
     fn clear_captured_emails(&self) {
@@ -179,9 +207,11 @@ pub struct SendGridEmailSender {
 
 impl SendGridEmailSender {
     pub fn new(api_key: String) -> Self {
-        let from_email = env::var("FROM_EMAIL").unwrap_or_else(|_| "noreply@keycast.app".to_string());
+        let from_email =
+            env::var("FROM_EMAIL").unwrap_or_else(|_| "noreply@keycast.app".to_string());
         let from_name = env::var("FROM_NAME").unwrap_or_else(|_| "diVine".to_string());
-        let base_url = env::var("BASE_URL").unwrap_or_else(|_| "https://login.divine.video".to_string());
+        let base_url =
+            env::var("BASE_URL").unwrap_or_else(|_| "https://login.divine.video".to_string());
 
         tracing::info!("Email service initialized with SendGrid");
 
@@ -353,9 +383,7 @@ impl EmailSender for SendGridEmailSender {
 /// - Otherwise: use DevEmailSender (development/testing)
 pub fn create_email_sender() -> Arc<dyn EmailSender> {
     match env::var("SENDGRID_API_KEY") {
-        Ok(api_key) if !api_key.is_empty() => {
-            Arc::new(SendGridEmailSender::new(api_key))
-        }
+        Ok(api_key) if !api_key.is_empty() => Arc::new(SendGridEmailSender::new(api_key)),
         _ => {
             tracing::warn!("SENDGRID_API_KEY not set - using development email sender");
             Arc::new(DevEmailSender::new())
@@ -381,7 +409,9 @@ impl EmailService {
         to_email: &str,
         verification_token: &str,
     ) -> Result<(), String> {
-        self.inner.send_verification_email(to_email, verification_token).await
+        self.inner
+            .send_verification_email(to_email, verification_token)
+            .await
     }
 
     pub async fn send_password_reset_email(
@@ -389,6 +419,8 @@ impl EmailService {
         to_email: &str,
         reset_token: &str,
     ) -> Result<(), String> {
-        self.inner.send_password_reset_email(to_email, reset_token).await
+        self.inner
+            .send_password_reset_email(to_email, reset_token)
+            .await
     }
 }

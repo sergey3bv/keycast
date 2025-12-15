@@ -2375,10 +2375,7 @@ pub async fn oauth_login(
 
     // Check if email is verified
     if !email_verified {
-        tracing::warn!(
-            "OAuth login failed: email not verified for {}",
-            req.email
-        );
+        tracing::warn!("OAuth login failed: email not verified for {}", req.email);
         return Err(OAuthError::InvalidRequest(
             "Please verify your email address before signing in. Check your inbox for the verification link.".to_string(),
         ));

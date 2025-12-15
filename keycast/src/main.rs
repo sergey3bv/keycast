@@ -356,6 +356,18 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         .build();
     tracing::info!("✔︎ Tenant cache initialized (preload deferred)");
 
+    // Create bcrypt queue for async password hashing during registration
+    // Uses email verification latency as natural buffer for CPU-intensive work
+    let bcrypt_queue = keycast_api::bcrypt_queue::BcryptQueue::new();
+    let bcrypt_sender = bcrypt_queue.sender();
+    let _bcrypt_worker_handles = bcrypt_queue.spawn_workers(database.pool.clone());
+    let _bcrypt_cleanup_handle =
+        keycast_api::bcrypt_queue::spawn_cleanup_task(database.pool.clone());
+    tracing::info!(
+        "✔︎ Bcrypt queue initialized ({} workers, cleanup every 5min)",
+        num_cpus::get()
+    );
+
     // Create API state with http_handler_cache for on-demand loading
     // Note: api no longer depends on signer's handler cache (decoupled)
     let api_state = Arc::new(keycast_api::state::KeycastState {
@@ -365,6 +377,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         http_handler_cache: new_http_handler_cache(),
         server_keys,
         tenant_cache,
+        bcrypt_sender,
     });
 
     // Set global state for routes that use it

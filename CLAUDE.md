@@ -196,7 +196,7 @@ Optional:
 - `USE_GCP_KMS`: Use Google Cloud KMS instead of file-based encryption (default: `false`)
 - `BUNKER_RELAYS`: Comma-separated relay URLs for NIP-46 communication (default: `wss://relay.divine.video,wss://relay.primal.net,wss://relay.nsec.app,wss://nos.lol`)
 - `RUST_LOG`: Log level configuration (default: `info`)
-- `SQLX_POOL_SIZE`: Database connection pool size (should match Cloud Run concurrency, default: `10`)
+- `SQLX_POOL_SIZE`: Database connection pool size (should match Cloud Run concurrency, default: `50`)
 - `VITE_ALLOWED_PUBKEYS`: Comma-separated pubkeys for whitelist access (web frontend)
 - `ENABLE_EXAMPLES`: Enable `/examples` directory serving (default: `false`, set to `true` for development)
 
@@ -254,4 +254,4 @@ gcloud logging read 'resource.type=cloud_run_revision AND resource.labels.servic
 - Database migrations are run manually via `tools/run-migrations.sh` (not on startup)
 - Signer daemon monitors database for new/removed authorizations and adjusts connections accordingly
 - Build issues on low-memory VMs: Need 2GB+ RAM for Vite build; may require swap space or retries
-- Cloud Run uses `concurrency=10` (optimized for CPU-bound crypto workloads)
+- Cloud Run uses `concurrency=50` (registration uses async bcrypt queue, enabling higher concurrency)

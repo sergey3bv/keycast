@@ -23,4 +23,4 @@ pub use policy::PolicyRepository;
 pub use signing_activity::SigningActivityRepository;
 pub use stored_key::StoredKeyRepository;
 pub use team::TeamRepository;
-pub use user::UserRepository;
+pub use user::{UserRepository, VerificationTokenData};

@@ -5,7 +5,17 @@ use crate::repositories::RepositoryError;
 use crate::types::user::User;
 use chrono::{DateTime, Utc};
 use nostr_sdk::PublicKey;
-use sqlx::PgPool;
+use sqlx::{FromRow, PgPool};
+
+/// Data returned when looking up a user by verification token.
+/// Includes fields needed to check async bcrypt completion state.
+#[derive(Debug, FromRow)]
+pub struct VerificationTokenData {
+    pub pubkey: String,
+    pub email_verification_expires_at: Option<DateTime<Utc>>,
+    pub password_hash: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
 
 /// Repository for user-related database operations.
 #[derive(Debug, Clone)]
@@ -258,6 +268,11 @@ impl UserRepository {
     /// Creates both the user record and personal key in a single transaction,
     /// ensuring consistency if either operation fails.
     ///
+    /// # Arguments
+    ///
+    /// * `password_hash` - Optional password hash. Pass `None` for async bcrypt flow where
+    ///   the hash is computed in background and updated later via `UPDATE users SET password_hash`.
+    ///
     /// # Errors
     ///
     /// Returns [`RepositoryError::Duplicate`] if email already exists.
@@ -268,7 +283,7 @@ impl UserRepository {
         pubkey: &str,
         tenant_id: i64,
         email: &str,
-        password_hash: &str,
+        password_hash: Option<&str>,
         verification_token: &str,
         verification_expires_at: DateTime<Utc>,
         encrypted_secret: &[u8],
@@ -277,6 +292,7 @@ impl UserRepository {
         let now = Utc::now();
 
         // Insert user with email verification token
+        // password_hash may be NULL for async bcrypt flow (computed in background)
         sqlx::query(
             "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, email_verification_token, email_verification_expires_at, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
@@ -319,9 +335,9 @@ impl UserRepository {
         &self,
         token: &str,
         tenant_id: i64,
-    ) -> Result<Option<(String, Option<DateTime<Utc>>)>, RepositoryError> {
+    ) -> Result<Option<VerificationTokenData>, RepositoryError> {
         sqlx::query_as(
-            "SELECT pubkey, email_verification_expires_at FROM users
+            "SELECT pubkey, email_verification_expires_at, password_hash, created_at FROM users
              WHERE email_verification_token = $1 AND tenant_id = $2",
         )
         .bind(token)

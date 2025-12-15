@@ -42,12 +42,12 @@ The system currently relies on these specific GCP managed services.
 Service: keycast
 Image: us-central1-docker.pkg.dev/openvine-co/docker/keycast:latest
 
-Current settings (testing - will need adjustment for production):
+Current settings:
   CPU: 4 vCPU
   Memory: 4 GiB
   Min instances: 3
   Max instances: 200
-  Concurrency: 10
+  Concurrency: 50
   Session affinity: enabled (CRITICAL)
   Execution: Gen2 + CPU boost
   VPC egress: all-traffic
@@ -88,17 +88,22 @@ Purpose: Cluster coordination (hashring, heartbeats)
 
 ```
 PostgreSQL max_connections: 250
-Cloud Run concurrency: 10 per instance
-SQLX_POOL_SIZE: 10 per instance
+Cloud Run concurrency: 50 per instance
+SQLX_POOL_SIZE: 50 per instance
 
 Why pool_size = concurrency:
-  - Worst case: all 10 concurrent requests need DB simultaneously
+  - Worst case: all 50 concurrent requests need DB simultaneously
   - In practice, fewer connections needed because:
     - CPU-bound crypto runs off-pool (spawn_blocking)
     - Connections released between queries (except in transactions)
-  - PgBouncer multiplexes: 200 instances × 10 = 2000 client connections → 200 backend
+    - Registration now I/O-bound (async bcrypt queue)
+  - PgBouncer multiplexes: 200 instances × 50 = 10000 client connections → 200 backend
 
 Rule: Start with pool_size = concurrency. Lower only if measured.
+
+Note on concurrency=50: Registration uses async bcrypt queue (password hashing
+in background workers), so HTTP requests complete in ~10ms instead of ~350ms.
+This allows 5x higher concurrency without blocking request threads on bcrypt.
 ```
 
 ---
@@ -122,7 +127,7 @@ Rule: Start with pool_size = concurrency. Lower only if measured.
 | `GCP_PROJECT_ID` | `openvine-co` |
 | `ALLOWED_ORIGINS` | `https://login.divine.video` |
 | `RUST_LOG` | `info` |
-| `SQLX_POOL_SIZE` | `10` |
+| `SQLX_POOL_SIZE` | `50` |
 | `SQLX_STATEMENT_CACHE` | `100` |
 
 ---
@@ -346,9 +351,14 @@ For a test environment, Cloud Run's built-in metrics + log queries for custom da
 **Mixed workload.** Crypto operations are CPU-bound, but significant I/O exists throughout the request paths.
 
 ```
-CPU-bound:
+CPU-bound (request path):
   - secp256k1 signing, NIP-44/NIP-04 encrypt/decrypt
+  - Login bcrypt verification (~300ms)
   - Uses spawn_blocking to avoid blocking async runtime
+
+CPU-bound (background):
+  - Registration bcrypt hashing (async queue, 4 workers)
+  - ~13 hashes/sec per instance capacity
 
 I/O-bound (Network):
   - NIP-46 relay WebSocket traffic (receive requests, send responses)
@@ -356,24 +366,45 @@ I/O-bound (Network):
   - KMS API calls on cache miss
 
 I/O-bound (Database):
+  - Registration (~10ms, bcrypt decoupled)
   - OAuth flow queries, authorization lookups on cache miss
   - Cold start loads all authorizations
 
 Workers: 2× CPU cores (min 8), Queue: 4096 items with backpressure
+Bcrypt workers: num_cpus (4 on 4 vCPU), Queue: 350 items with backpressure
 ```
 
-**Scaling recommendation:** Cloud Run autoscales based on per-instance CPU utilization and request concurrency. Requests are routed away from high-CPU instances even if concurrency limit isn't reached. Session affinity is broken when an instance hits max CPU—requests go to other instances. Crypto signing dominates CPU under sustained load. However, significant I/O-bound work exists:
-- NIP-46: WebSocket relay traffic + Redis hashring lookups
-- Cold caches: DB queries + KMS decryption
-- OAuth flows: DB session/authorization lookups
+**Async bcrypt architecture:** Registration uses a background worker queue for password
+hashing. HTTP requests return in ~10ms (vs ~350ms with sync bcrypt). This decouples
+signup surge handling from HTTP latency—other endpoints remain responsive during
+registration spikes. The bcrypt queue (350 items) provides ~27s burst buffer per instance.
+
+**Scaling recommendation:** Cloud Run autoscales based on per-instance CPU utilization and request concurrency. Requests are routed away from high-CPU instances even if concurrency limit isn't reached. Session affinity is broken when an instance hits max CPU—requests go to other instances.
+
+Scaling triggers (now decoupled):
+- HTTP concurrency limit → scale out (configurable, currently 50)
+- CPU from signing workloads → scale out
+- CPU from bcrypt workers → scale out (independent of HTTP handling)
 
 Monitor **P95 latency** and **cache miss rate** alongside CPU. High latency with low CPU suggests I/O saturation—check Redis, relays, or session affinity (cache misses).
 
-- Current concurrency: 10 requests/instance
+- Current concurrency: 50 requests/instance
 - If `keycast_nip46_queue_dropped_total` increases, add instances
-- Memory is not typically the bottleneck (4 GiB); primary consumer is the handler cache (decrypted keys, auth metadata)
+- Memory is not typically the bottleneck (4 GiB); primary consumer is the handler cache
+
+**Signup surge capacity:**
+```
+Per instance:  ~13 registrations/sec (bcrypt limited)
+3 instances:   ~39/sec
+50 instances:  ~650/sec
+200 instances: ~2,600/sec (max)
+
+For anticipated surges: increase min-instances to pre-warm capacity
+```
 
 **Latency expectations:**
+- Registration: ~10ms (bcrypt in background)
+- Login: ~300ms (bcrypt verify, sync)
 - HTTP RPC signing: Fast (cache hit) to slower (cache miss requires KMS decrypt)
 - NIP-46 relay signing: Above + network RTT to relays (varies by relay latency)
 

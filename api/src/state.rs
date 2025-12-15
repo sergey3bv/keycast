@@ -1,4 +1,5 @@
 use crate::api::tenant::Tenant;
+use crate::bcrypt_queue::BcryptSender;
 use crate::handlers::http_rpc_handler::HttpHandlerCache;
 use keycast_core::encryption::KeyManager;
 use keycast_core::signing_handler::SignerHandlersCache;
@@ -34,6 +35,9 @@ pub struct KeycastState {
     pub server_keys: Keys,
     /// Tenant cache: domain -> Tenant (preloaded at startup for zero-latency lookups)
     pub tenant_cache: TenantCache,
+    /// Bcrypt queue sender for async password hashing during registration
+    /// Workers hash passwords in background; DB tracks pending state via NULL password_hash
+    pub bcrypt_sender: BcryptSender,
 }
 
 pub static KEYCAST_STATE: OnceCell<Arc<KeycastState>> = OnceCell::new();

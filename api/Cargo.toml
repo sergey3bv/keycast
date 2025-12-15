@@ -49,6 +49,10 @@ hex = "0.4"
 blake3 = "1.5"
 moka = { version = "0.12", features = ["future"] }
 reqwest = { version = "0.12", features = ["json"] }
+# Async bcrypt queue dependencies
+crossbeam-channel = "0.5"
+num_cpus = "1.16"
+secrecy = "0.10"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

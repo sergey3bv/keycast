@@ -9,6 +9,9 @@ use axum::{
 };
 use bcrypt::{hash, verify, DEFAULT_COST};
 use chrono::{Duration, Utc};
+use secrecy::SecretString;
+
+use crate::bcrypt_queue::{BcryptJob, BcryptQueueError};
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, OAuthCodeRepository,
@@ -168,6 +171,12 @@ pub struct VerifyEmailResponse {
     /// For normal flows: indicates user is now authenticated (UCAN cookie set)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authenticated: Option<bool>,
+    /// Status for async operations: "processing" when password hash is pending
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Seconds to wait before retrying when status is "processing"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,7 +245,13 @@ pub enum AuthError {
     EmailSendFailed(String),
     DuplicateKey, // Nostr pubkey already registered (BYOK case)
     BadRequest(String),
-    Forbidden(String), // User has no authorization for this origin
+    Forbidden(String),   // User has no authorization for this origin
+    RegistrationExpired, // Async bcrypt timed out (instance died)
+    ServiceUnavailable {
+        // Server at capacity or shutting down
+        message: String,
+        retry_after: Option<u32>,
+    },
 }
 
 impl IntoResponse for AuthError {
@@ -322,6 +337,25 @@ impl IntoResponse for AuthError {
                 StatusCode::FORBIDDEN,
                 msg,
             ),
+            AuthError::RegistrationExpired => (
+                StatusCode::GONE,
+                "Registration expired. Please register again.".to_string(),
+            ),
+            AuthError::ServiceUnavailable { message, retry_after } => {
+                // Return with Retry-After header if provided
+                let response = (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({ "error": message })),
+                );
+                if let Some(seconds) = retry_after {
+                    return (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        [("Retry-After", seconds.to_string())],
+                        Json(serde_json::json!({ "error": message })),
+                    ).into_response();
+                }
+                return response.into_response();
+            }
         };
 
         (status, Json(serde_json::json!({ "error": message }))).into_response()
@@ -438,16 +472,9 @@ pub async fn register(
         "Registration attempt"
     );
 
-    // Hash password (spawn_blocking to avoid blocking async runtime)
-    // Note: Email uniqueness is enforced by idx_users_email_tenant constraint.
-    // We catch the constraint violation on INSERT instead of pre-checking,
-    // which saves a DB round-trip and reduces connection pool contention.
-    let password = req.password.clone();
-    let password_hash = tokio::task::spawn_blocking(move || hash(&password, DEFAULT_COST))
-        .await
-        .map_err(|e| AuthError::Internal(format!("Task join error: {}", e)))??;
-
     // Generate email verification token
+    // Note: Password hashing is deferred to background worker via bcrypt queue
+    // Email uniqueness is enforced by idx_users_email_tenant constraint
     let verification_token = generate_secure_token();
     let verification_expires = Utc::now() + Duration::hours(EMAIL_VERIFICATION_EXPIRY_HOURS);
 
@@ -484,6 +511,7 @@ pub async fn register(
         .map_err(|e| AuthError::Encryption(e.to_string()))?;
 
     // Register user with personal key in a single transaction
+    // Password hash is NULL initially - will be set by bcrypt worker
     // Returns Err(RepositoryError::Duplicate) if email already exists, which maps to AuthError::EmailAlreadyExists
     let user_repo = UserRepository::new(pool.clone());
     user_repo
@@ -491,12 +519,46 @@ pub async fn register(
             &public_key.to_hex(),
             tenant_id,
             &req.email,
-            &password_hash,
+            None, // password_hash computed async by bcrypt worker
             &verification_token,
             verification_expires,
             &encrypted_secret,
         )
         .await?;
+
+    // Queue bcrypt job to hash password in background
+    // Worker will UPDATE users SET password_hash = $hash WHERE email_verification_token = $token
+    let bcrypt_result = auth_state.state.bcrypt_sender.try_send(BcryptJob {
+        token: verification_token.clone(),
+        password: SecretString::from(req.password.clone()),
+    });
+
+    if let Err(e) = bcrypt_result {
+        // If queue fails, we have a user row with NULL password_hash
+        // Clean up by deleting the user row (it would fail verification anyway)
+        tracing::error!("Failed to queue bcrypt job: {:?}, cleaning up user row", e);
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1 AND tenant_id = $2")
+            .bind(public_key.to_hex())
+            .bind(tenant_id)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1 AND tenant_id = $2")
+            .bind(public_key.to_hex())
+            .bind(tenant_id)
+            .execute(pool)
+            .await;
+
+        return match e {
+            BcryptQueueError::AtCapacity => Err(AuthError::ServiceUnavailable {
+                message: "Server at capacity, please try again".to_string(),
+                retry_after: Some(5),
+            }),
+            BcryptQueueError::ShuttingDown => Err(AuthError::ServiceUnavailable {
+                message: "Server restarting, please try again".to_string(),
+                retry_after: Some(10),
+            }),
+        };
+    }
 
     // Track successful registration
     METRICS.inc_registration();
@@ -1075,6 +1137,8 @@ pub async fn verify_email(
                 message: "Email verified! Redirecting to app...".to_string(),
                 redirect_to: Some(redirect_url),
                 authenticated: None,
+                status: None,
+                retry_after: None,
             }),
         )
             .into_response());
@@ -1082,13 +1146,15 @@ pub async fn verify_email(
 
     // Second: Check users table for normal registration
     let user_repo = UserRepository::new(pool.clone());
-    let (public_key, expires_at) = user_repo
+    let token_data = user_repo
         .find_by_verification_token(&req.token, tenant_id)
         .await?
         .ok_or(AuthError::InvalidToken)?;
 
+    let public_key = token_data.pubkey;
+
     // Check if token is expired
-    if let Some(expires) = expires_at {
+    if let Some(expires) = token_data.email_verification_expires_at {
         if expires < Utc::now() {
             return Ok((
                 axum::http::StatusCode::OK,
@@ -1097,10 +1163,45 @@ pub async fn verify_email(
                     message: "Verification link has expired. Please request a new one.".to_string(),
                     redirect_to: None,
                     authenticated: None,
+                    status: None,
+                    retry_after: None,
                 }),
             )
                 .into_response());
         }
+    }
+
+    // Check async bcrypt state: password_hash IS NULL means still processing
+    if token_data.password_hash.is_none() {
+        let age = Utc::now().signed_duration_since(token_data.created_at);
+        if age.num_seconds() > 120 {
+            // Hash should complete in <1s normally. After 2min, assume instance died.
+            // User needs to re-register (cleanup job will delete this row)
+            tracing::warn!(
+                "Password hash not completed after {}s for token {}..., likely instance died",
+                age.num_seconds(),
+                &req.token[..std::cmp::min(8, req.token.len())]
+            );
+            return Err(AuthError::RegistrationExpired);
+        }
+        // Still processing - tell frontend to poll
+        tracing::debug!(
+            "Password hash still processing (age: {}s) for token {}...",
+            age.num_seconds(),
+            &req.token[..std::cmp::min(8, req.token.len())]
+        );
+        return Ok((
+            axum::http::StatusCode::OK,
+            axum::Json(VerifyEmailResponse {
+                success: false,
+                message: "Processing your registration, please wait...".to_string(),
+                redirect_to: None,
+                authenticated: None,
+                status: Some("processing".to_string()),
+                retry_after: Some(1),
+            }),
+        )
+            .into_response());
     }
 
     // Mark email as verified and clear verification token
@@ -1130,8 +1231,7 @@ pub async fn verify_email(
         .unwrap_or_else(|_| "https://login.divine.video".to_string());
 
     // Generate UCAN token for session cookie
-    let ucan_token =
-        generate_ucan_token(&keys, tenant_id, &email, &redirect_origin, None).await?;
+    let ucan_token = generate_ucan_token(&keys, tenant_id, &email, &redirect_origin, None).await?;
 
     tracing::info!(
         event = "email_verification",
@@ -1155,6 +1255,8 @@ pub async fn verify_email(
             message: "Email verified successfully! You are now logged in.".to_string(),
             redirect_to: None,
             authenticated: Some(true),
+            status: None,
+            retry_after: None,
         }),
     )
         .into_response())

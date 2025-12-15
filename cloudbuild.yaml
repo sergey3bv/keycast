@@ -38,7 +38,7 @@ steps:
       - '--timeout=300'
       - '--min-instances=3'
       - '--max-instances=200'
-      - '--concurrency=10'
+      - '--concurrency=50'
       - '--no-cpu-throttling'
       - '--execution-environment=gen2'
       - '--cpu-boost'
@@ -51,7 +51,7 @@ steps:
       - '--subnet=default'
       - '--vpc-egress=all-traffic'
       - '--set-secrets=DATABASE_URL=keycast-database-url:latest,SERVER_NSEC=keycast-ucan-secret:latest,SENDGRID_API_KEY=keycast-sendgrid-api-key:latest,REDIS_URL=keycast-redis-url:latest'
-      - '--set-env-vars=NODE_ENV=production,USE_GCP_KMS=true,GCP_PROJECT_ID=${PROJECT_ID},ALLOWED_ORIGINS=https://login.divine.video,APP_URL=https://login.divine.video,FROM_EMAIL=noreply@divine.video,RUST_LOG=info,ENABLE_EXAMPLES=true,DISABLE_EMAILS=true,SQLX_STATEMENT_CACHE=100,SQLX_POOL_SIZE=10'
+      - '--set-env-vars=NODE_ENV=production,USE_GCP_KMS=true,GCP_PROJECT_ID=${PROJECT_ID},ALLOWED_ORIGINS=https://login.divine.video,APP_URL=https://login.divine.video,FROM_EMAIL=noreply@divine.video,RUST_LOG=info,ENABLE_EXAMPLES=true,DISABLE_EMAILS=true,SQLX_STATEMENT_CACHE=100,SQLX_POOL_SIZE=50'
 
   # Smoke tests - verify deployment
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'

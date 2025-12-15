@@ -8,9 +8,103 @@
 
 	const api = new KeycastApi();
 
-	let status = $state<'loading' | 'success' | 'oauth_redirect' | 'error' | 'no-token'>('loading');
+	let status = $state<'loading' | 'processing' | 'success' | 'oauth_redirect' | 'error' | 'no-token'>('loading');
 	let message = $state('');
 	let redirectUrl = $state('');
+
+	// Helper function to sleep for ms
+	function sleep(ms: number): Promise<void> {
+		return new Promise(resolve => setTimeout(resolve, ms));
+	}
+
+	// Response type from the verify-email API
+	interface VerifyEmailResponse {
+		success: boolean;
+		message?: string;
+		redirect_to?: string;
+		authenticated?: boolean;
+		status?: string;
+		retry_after?: number;
+	}
+
+	async function verifyEmail(token: string): Promise<void> {
+		const maxAttempts = 30; // Max 30 seconds of polling
+
+		for (let attempt = 0; attempt < maxAttempts; attempt++) {
+			try {
+				const response = await api.post<VerifyEmailResponse>('/auth/verify-email', { token });
+
+				// Handle "processing" status - bcrypt still hashing
+				if (response.status === 'processing') {
+					status = 'processing';
+					message = response.message || 'Processing your registration...';
+					const waitTime = (response.retry_after || 1) * 1000;
+					await sleep(waitTime);
+					continue;
+				}
+
+				if (response.success) {
+					// Check if this is an OAuth flow (has redirect_to)
+					if (response.redirect_to) {
+						status = 'oauth_redirect';
+						message = 'Email verified! Redirecting to application...';
+						redirectUrl = response.redirect_to;
+						toast.success('Email verified!');
+
+						// Redirect to OAuth client immediately
+						setTimeout(() => {
+							window.location.href = response.redirect_to!;
+						}, 1500);
+					} else if (response.authenticated) {
+						// Normal flow - user is now logged in
+						status = 'success';
+						message = response.message || 'Email verified! You are now logged in.';
+						toast.success('Email verified!');
+
+						// Redirect to home/dashboard
+						setTimeout(() => {
+							goto('/');
+						}, 2000);
+					} else {
+						// Legacy flow - just verified, redirect to login
+						status = 'success';
+						message = response.message || 'Email verified successfully!';
+						toast.success('Email verified!');
+
+						setTimeout(() => {
+							goto('/login');
+						}, 3000);
+					}
+				} else {
+					status = 'error';
+					message = response.message || 'Verification failed';
+				}
+				return; // Exit after successful handling
+			} catch (err: any) {
+				// Check for 410 Gone (registration expired)
+				if (err.status === 410) {
+					status = 'error';
+					message = 'Registration expired. Please register again.';
+					return;
+				}
+				// Check for 503 Service Unavailable (server busy)
+				if (err.status === 503) {
+					status = 'processing';
+					message = 'Server is busy, please wait...';
+					await sleep(5000);
+					continue;
+				}
+				console.error('Verification error:', err);
+				status = 'error';
+				message = err.message || 'Verification failed. The link may have expired.';
+				return;
+			}
+		}
+
+		// Timed out after max attempts
+		status = 'error';
+		message = 'Verification timed out. Please try again.';
+	}
 
 	onMount(async () => {
 		const token = $page.url.searchParams.get('token');
@@ -21,55 +115,7 @@
 			return;
 		}
 
-		try {
-			const response = await api.post<{
-				success: boolean;
-				message?: string;
-				redirect_to?: string;
-				authenticated?: boolean;
-			}>('/auth/verify-email', { token });
-
-			if (response.success) {
-				// Check if this is an OAuth flow (has redirect_to)
-				if (response.redirect_to) {
-					status = 'oauth_redirect';
-					message = 'Email verified! Redirecting to application...';
-					redirectUrl = response.redirect_to;
-					toast.success('Email verified!');
-
-					// Redirect to OAuth client immediately
-					setTimeout(() => {
-						window.location.href = response.redirect_to!;
-					}, 1500);
-				} else if (response.authenticated) {
-					// Normal flow - user is now logged in
-					status = 'success';
-					message = response.message || 'Email verified! You are now logged in.';
-					toast.success('Email verified!');
-
-					// Redirect to home/dashboard
-					setTimeout(() => {
-						goto('/');
-					}, 2000);
-				} else {
-					// Legacy flow - just verified, redirect to login
-					status = 'success';
-					message = response.message || 'Email verified successfully!';
-					toast.success('Email verified!');
-
-					setTimeout(() => {
-						goto('/login');
-					}, 3000);
-				}
-			} else {
-				status = 'error';
-				message = response.message || 'Verification failed';
-			}
-		} catch (err: any) {
-			console.error('Verification error:', err);
-			status = 'error';
-			message = err.message || 'Verification failed. The link may have expired.';
-		}
+		await verifyEmail(token);
 	});
 </script>
 
@@ -96,6 +142,17 @@
 			</div>
 			<h1>Verifying your email...</h1>
 			<p class="subtitle">Please wait</p>
+
+		{:else if status === 'processing'}
+			<div class="status-icon loading">
+				<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" fill="currentColor" viewBox="0 0 256 256" class="spin">
+					<path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm0,176A72,72,0,1,1,200,128,72.08,72.08,0,0,1,128,200Z" opacity="0.2"></path>
+					<path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm0,16a88,88,0,0,1,88,88h-16a72,72,0,0,0-72-72Z"></path>
+				</svg>
+			</div>
+			<h1>Almost there...</h1>
+			<p class="subtitle">{message}</p>
+			<p class="processing-notice">Finishing up your registration</p>
 
 		{:else if status === 'oauth_redirect'}
 			<div class="status-icon success">
@@ -225,6 +282,12 @@
 	}
 
 	.redirect-notice {
+		color: var(--color-divine-text-tertiary);
+		font-size: 0.85rem;
+		margin-bottom: 1.25rem;
+	}
+
+	.processing-notice {
 		color: var(--color-divine-text-tertiary);
 		font-size: 0.85rem;
 		margin-bottom: 1.25rem;
