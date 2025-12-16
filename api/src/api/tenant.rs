@@ -221,6 +221,21 @@ fn validate_domain(domain: &str) -> Result<(), TenantError> {
         ));
     }
 
+    // If ALLOWED_TENANT_DOMAINS is set, only allow those domains (prevents Host header spoofing)
+    if let Ok(allowed) = std::env::var("ALLOWED_TENANT_DOMAINS") {
+        let is_allowed = allowed.split(',').any(|d| d.trim() == domain);
+        if !is_allowed {
+            return Err(TenantError::ValidationFailed(format!(
+                "Domain '{}' not in allowed list",
+                domain
+            )));
+        }
+        // Domain is in allowlist, skip other validation
+        return Ok(());
+    }
+
+    // No allowlist configured - fall back to format validation (auto-provisioning enabled)
+
     // Length check (max 253 chars per DNS spec)
     if domain.len() > 253 {
         return Err(TenantError::InvalidDomain("Domain too long".to_string()));
@@ -405,5 +420,50 @@ mod tests {
         };
 
         assert_eq!(tenant.email_from(), "noreply@test.com");
+    }
+
+    #[test]
+    fn test_validate_domain_allowlist() {
+        // Set allowlist
+        std::env::set_var("ALLOWED_TENANT_DOMAINS", "example.com,localhost,test.io");
+
+        // Allowed domains pass
+        assert!(validate_domain("example.com").is_ok());
+        assert!(validate_domain("localhost").is_ok());
+        assert!(validate_domain("test.io").is_ok());
+
+        // Non-allowed domains fail
+        assert!(validate_domain("evil.com").is_err());
+        assert!(validate_domain("spoofed.example.com").is_err());
+
+        // Clean up
+        std::env::remove_var("ALLOWED_TENANT_DOMAINS");
+    }
+
+    #[test]
+    fn test_validate_domain_allowlist_with_spaces() {
+        // Allowlist with spaces around commas
+        std::env::set_var("ALLOWED_TENANT_DOMAINS", "example.com, localhost , test.io");
+
+        assert!(validate_domain("example.com").is_ok());
+        assert!(validate_domain("localhost").is_ok());
+        assert!(validate_domain("test.io").is_ok());
+
+        std::env::remove_var("ALLOWED_TENANT_DOMAINS");
+    }
+
+    #[test]
+    fn test_validate_domain_no_allowlist_uses_format_validation() {
+        // Ensure no allowlist is set
+        std::env::remove_var("ALLOWED_TENANT_DOMAINS");
+
+        // Valid domains pass format validation
+        assert!(validate_domain("example.com").is_ok());
+        assert!(validate_domain("localhost").is_ok());
+
+        // Invalid domains fail format validation
+        assert!(validate_domain("").is_err());
+        assert!(validate_domain("no-dot").is_err());
+        assert!(validate_domain("192.168.1.1").is_err());
     }
 }

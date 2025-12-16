@@ -69,7 +69,14 @@ impl ClusterCoordinator {
         // Broadcast channel for membership events
         let (event_tx, _) = broadcast::channel(16);
 
-        // Publish join event
+        // Establish Pub/Sub subscription BEFORE publishing join event.
+        // This guarantees we're listening before other coordinators can see our join.
+        let client = redis::Client::open(redis_url)?;
+        let mut pubsub = client.get_async_pubsub().await?;
+        pubsub.subscribe(&channel).await?;
+        tracing::debug!(channel = %channel, "Pub/Sub subscription established");
+
+        // NOW publish join event (other instances will receive it)
         Self::publish_event(&mut registry, "join", &instance_id).await?;
 
         let registry = Arc::new(tokio::sync::Mutex::new(registry));
@@ -82,8 +89,9 @@ impl ClusterCoordinator {
             event_tx.clone(),
         );
 
-        // Spawn Pub/Sub listener task
-        let pubsub_handle = Self::spawn_pubsub_task(
+        // Spawn Pub/Sub listener task with already-subscribed connection
+        let pubsub_handle = Self::spawn_pubsub_listener(
+            pubsub,
             redis_url.to_string(),
             instance_id.clone(),
             channel,
@@ -217,7 +225,10 @@ impl ClusterCoordinator {
         })
     }
 
-    fn spawn_pubsub_task(
+    /// Spawn a Pub/Sub listener task with an already-subscribed connection.
+    /// If the connection drops, the task will reconnect and resubscribe.
+    fn spawn_pubsub_listener(
+        initial_pubsub: PubSub,
         redis_url: String,
         my_instance_id: String,
         channel: String,
@@ -226,36 +237,57 @@ impl ClusterCoordinator {
         event_tx: broadcast::Sender<MembershipEvent>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            // First iteration: use the already-subscribed connection
+            let mut first_run = true;
+            let mut current_pubsub: Option<PubSub> = Some(initial_pubsub);
+
             loop {
                 if cancel_token.is_cancelled() {
                     break;
                 }
 
-                // Connect to Redis for Pub/Sub
-                let client = match redis::Client::open(redis_url.as_str()) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("Failed to create Redis client for Pub/Sub: {}", e);
-                        tokio::select! {
-                            _ = cancel_token.cancelled() => break,
-                            _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                // Get connection: use initial on first run, reconnect on subsequent runs
+                let pubsub = if first_run {
+                    first_run = false;
+                    current_pubsub.take().unwrap()
+                } else {
+                    // Reconnect to Redis
+                    let client = match redis::Client::open(redis_url.as_str()) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!("Failed to create Redis client for Pub/Sub: {}", e);
+                            tokio::select! {
+                                _ = cancel_token.cancelled() => break,
+                                _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                            }
                         }
-                    }
-                };
+                    };
 
-                let conn = match client.get_async_pubsub().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!("Failed to get Pub/Sub connection: {}", e);
+                    let mut conn = match client.get_async_pubsub().await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!("Failed to get Pub/Sub connection: {}", e);
+                            tokio::select! {
+                                _ = cancel_token.cancelled() => break,
+                                _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                            }
+                        }
+                    };
+
+                    // Resubscribe after reconnect
+                    if let Err(e) = conn.subscribe(&channel).await {
+                        tracing::error!("Failed to resubscribe to Pub/Sub channel: {}", e);
                         tokio::select! {
                             _ = cancel_token.cancelled() => break,
                             _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
                         }
                     }
+                    tracing::debug!(channel = %channel, "Pub/Sub resubscribed after reconnect");
+                    conn
                 };
 
                 if let Err(e) = Self::run_pubsub_loop(
-                    conn,
+                    pubsub,
                     &my_instance_id,
                     &channel,
                     &ring,
@@ -274,17 +306,16 @@ impl ClusterCoordinator {
         })
     }
 
+    /// Process messages on an already-subscribed Pub/Sub connection.
     async fn run_pubsub_loop(
         mut pubsub: PubSub,
         my_instance_id: &str,
-        channel: &str,
+        _channel: &str,
         ring: &Arc<ArcSwap<HashRing>>,
         cancel_token: &CancellationToken,
         event_tx: &broadcast::Sender<MembershipEvent>,
     ) -> Result<(), Error> {
-        pubsub.subscribe(channel).await?;
-        tracing::debug!("Subscribed to {}", channel);
-
+        // Connection is already subscribed by caller
         let mut stream = pubsub.on_message();
 
         loop {
@@ -559,8 +590,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Wait for Pub/Sub event (5s timeout for CI reliability)
-        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        // Wait for Pub/Sub event (subscription guaranteed before coord2 starts)
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("Timeout waiting for join event")
             .expect("Channel closed");

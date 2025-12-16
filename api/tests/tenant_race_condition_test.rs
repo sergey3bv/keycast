@@ -107,7 +107,7 @@ async fn test_tenant_sequence_after_seeded_data() {
     // The default tenant (id=1) is inserted by migrations
     // Verify it exists
     let default_tenant: Option<(i64,)> =
-        sqlx::query_as("SELECT id FROM tenants WHERE domain = 'default'")
+        sqlx::query_as("SELECT id FROM tenants WHERE domain = 'login.divine.video'")
             .fetch_optional(&pool)
             .await
             .expect("Failed to query default tenant");
