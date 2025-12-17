@@ -2,6 +2,7 @@
 
 use super::{KeyManager, KeyManagerError};
 use async_trait::async_trait;
+use zeroize::Zeroizing;
 
 pub struct AwsKeyManager {
     // Add AWS KMS client here
@@ -20,7 +21,10 @@ impl KeyManager for AwsKeyManager {
         todo!("Implement AWS KMS encryption")
     }
 
-    async fn decrypt(&self, ciphertext_bytes: &[u8]) -> Result<Vec<u8>, KeyManagerError> {
+    async fn decrypt(
+        &self,
+        ciphertext_bytes: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, KeyManagerError> {
         todo!("Implement AWS KMS decryption")
     }
 }

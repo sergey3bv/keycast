@@ -13,6 +13,7 @@
 use hkdf::Hkdf;
 use nostr_sdk::{Keys, SecretKey};
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 /// Domain separator for bunker key derivation (versioned for future changes)
 pub const HKDF_INFO_PREFIX: &str = "keycast-bunker-nip46-v1-";
@@ -37,24 +38,26 @@ pub const HKDF_INFO_PREFIX: &str = "keycast-bunker-nip46-v1-";
 pub fn derive_bunker_keys(user_secret: &SecretKey, connection_secret: &str) -> Keys {
     let hkdf = Hkdf::<Sha256>::new(None, user_secret.as_secret_bytes());
 
-    let info = format!("{}{}", HKDF_INFO_PREFIX, connection_secret);
+    // Wrap info string in Zeroizing since it contains the connection secret
+    let info = Zeroizing::new(format!("{}{}", HKDF_INFO_PREFIX, connection_secret));
 
     // Loop until valid secp256k1 scalar (probability of retry: ~2^-128)
     for counter in 0u32.. {
-        let mut bytes = [0u8; 32];
+        // Wrap intermediate bytes in Zeroizing for auto-zeroization on drop
+        let mut bytes = Zeroizing::new([0u8; 32]);
         let derived_info = if counter == 0 {
             info.clone()
         } else {
-            format!("{}-retry{}", info, counter)
+            Zeroizing::new(format!("{}-retry{}", &*info, counter))
         };
 
-        hkdf.expand(derived_info.as_bytes(), &mut bytes)
+        hkdf.expand(derived_info.as_bytes(), bytes.as_mut())
             .expect("32 bytes is valid HKDF-SHA256 output length");
 
-        if let Ok(secret) = SecretKey::from_slice(&bytes) {
+        if let Ok(secret) = SecretKey::from_slice(&*bytes) {
             return Keys::new(secret);
         }
-        // Astronomically unlikely to ever loop, but mathematically correct
+        // bytes auto-zeroized on next iteration
     }
     unreachable!("HKDF will always produce a valid key within reasonable iterations")
 }

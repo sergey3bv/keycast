@@ -8,6 +8,7 @@ use google_cloud_kms::grpc::kms::v1::{DecryptRequest, EncryptRequest};
 use std::env;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
+use zeroize::Zeroizing;
 
 /// Maximum retry attempts for KMS operations before failing.
 const MAX_KMS_RETRIES: u32 = 3;
@@ -109,7 +110,10 @@ impl KeyManager for GcpKeyManager {
         Ok(ciphertext)
     }
 
-    async fn decrypt(&self, ciphertext_bytes: &[u8]) -> Result<Vec<u8>, KeyManagerError> {
+    async fn decrypt(
+        &self,
+        ciphertext_bytes: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, KeyManagerError> {
         debug!(
             "Decrypting {} bytes with Google Cloud KMS",
             ciphertext_bytes.len()
@@ -152,7 +156,7 @@ impl KeyManager for GcpKeyManager {
         let plaintext = response.plaintext;
         debug!("Successfully decrypted to {} bytes", plaintext.len());
 
-        Ok(plaintext)
+        Ok(Zeroizing::new(plaintext))
     }
 }
 
@@ -179,6 +183,6 @@ mod tests {
             .await
             .expect("Decryption failed");
 
-        assert_eq!(plaintext, decrypted.as_slice());
+        assert_eq!(plaintext.as_slice(), decrypted.as_slice());
     }
 }

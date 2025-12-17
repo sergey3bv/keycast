@@ -8,6 +8,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rand::Rng;
 use std::env;
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 pub struct FileKeyManager {
     cipher: Aes256Gcm,
@@ -16,25 +17,30 @@ pub struct FileKeyManager {
 impl FileKeyManager {
     pub fn new() -> Result<Self, KeyManagerError> {
         let key = Self::load_key()?;
-        let cipher = Aes256Gcm::new(&key.into());
+        let cipher = Aes256Gcm::new(&(*key).into());
         Ok(Self { cipher })
     }
 
-    fn load_key() -> Result<[u8; 32], KeyManagerError> {
+    fn load_key() -> Result<Zeroizing<[u8; 32]>, KeyManagerError> {
         let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("Failed to get parent directory")
             .to_path_buf();
         let key_path = project_root.join("master.key");
 
-        let key_str = std::fs::read_to_string(key_path)
-            .map_err(|e| KeyManagerError::LoadKey(e.to_string()))?;
+        // Wrap in Zeroizing so the string is zeroized after use
+        let key_str = Zeroizing::new(
+            std::fs::read_to_string(key_path)
+                .map_err(|e| KeyManagerError::LoadKey(e.to_string()))?,
+        );
 
-        BASE64
+        let key_bytes: [u8; 32] = BASE64
             .decode(key_str.trim())
             .map_err(|e| KeyManagerError::LoadKey(e.to_string()))?
             .try_into()
-            .map_err(|_| KeyManagerError::LoadKey("Invalid key length".to_string()))
+            .map_err(|_| KeyManagerError::LoadKey("Invalid key length".to_string()))?;
+
+        Ok(Zeroizing::new(key_bytes))
     }
 }
 
@@ -55,7 +61,10 @@ impl KeyManager for FileKeyManager {
         Ok(result)
     }
 
-    async fn decrypt(&self, ciphertext_bytes: &[u8]) -> Result<Vec<u8>, KeyManagerError> {
+    async fn decrypt(
+        &self,
+        ciphertext_bytes: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, KeyManagerError> {
         if ciphertext_bytes.len() < 12 {
             return Err(KeyManagerError::Decrypt("Ciphertext too short".to_string()));
         }
@@ -63,9 +72,12 @@ impl KeyManager for FileKeyManager {
         let (nonce, encrypted) = ciphertext_bytes.split_at(12);
         let nonce = Nonce::from_slice(nonce);
 
-        self.cipher
+        let plaintext = self
+            .cipher
             .decrypt(nonce, encrypted)
-            .map_err(|e| KeyManagerError::Decrypt(e.to_string()))
+            .map_err(|e| KeyManagerError::Decrypt(e.to_string()))?;
+
+        Ok(Zeroizing::new(plaintext))
     }
 }
 
@@ -90,8 +102,8 @@ mod tests {
         // Decrypt the encrypted bytes
         let decrypted = key_manager.decrypt(&encrypted).await?;
 
-        // Verify the decrypted bytes match the original
-        assert_eq!(secret_key_vec, decrypted);
+        // Verify the decrypted bytes match the original (Zeroizing derefs to Vec<u8>)
+        assert_eq!(secret_key_vec, *decrypted);
 
         Ok(())
     }
@@ -109,11 +121,11 @@ mod tests {
         // Verify we get different ciphertexts (due to different nonces)
         assert_ne!(encrypted1, encrypted2);
 
-        // But both should decrypt to the same original data
+        // But both should decrypt to the same original data (Zeroizing derefs to Vec<u8>)
         let decrypted1 = key_manager.decrypt(&encrypted1).await?;
         let decrypted2 = key_manager.decrypt(&encrypted2).await?;
-        assert_eq!(decrypted1, decrypted2);
-        assert_eq!(decrypted1, secret_key_bytes);
+        assert_eq!(*decrypted1, *decrypted2);
+        assert_eq!(&*decrypted1, &secret_key_bytes[..]);
 
         Ok(())
     }

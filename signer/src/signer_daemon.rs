@@ -12,6 +12,7 @@ use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
 use moka::future::Cache;
 use nostr_sdk::prelude::*;
+use secrecy::{ExposeSecret, SecretString};
 use sqlx::PgPool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +34,7 @@ pub struct Nip46Handler {
     /// Keys for signing user events
     pub user_keys: Keys,
     /// Connection secret for NIP-46 connect validation
-    secret: String,
+    secret: SecretString,
     authorization_id: i32,
     tenant_id: i64,
     is_oauth: bool,
@@ -55,7 +56,7 @@ impl Nip46Handler {
         Self {
             bunker_keys,
             user_keys,
-            secret,
+            secret: SecretString::from(secret),
             authorization_id,
             tenant_id,
             is_oauth,
@@ -122,7 +123,7 @@ impl Nip46Handler {
     ) -> SignerResult<String> {
         if !self.is_oauth {
             // For regular authorizations, just validate secret
-            if provided_secret == self.secret {
+            if provided_secret == self.secret.expose_secret() {
                 return Ok("ack".to_string());
             } else {
                 return Err(SignerError::permission_denied("Invalid secret"));
@@ -671,7 +672,7 @@ impl UnifiedSigner {
                 let handler = Nip46Handler {
                     bunker_keys,
                     user_keys,
-                    secret: auth.secret.clone(),
+                    secret: SecretString::from(auth.secret.clone()),
                     authorization_id: auth.id,
                     tenant_id,
                     is_oauth: true,
@@ -724,7 +725,7 @@ impl UnifiedSigner {
                 let handler = Nip46Handler {
                     bunker_keys,
                     user_keys,
-                    secret: connection_secret,
+                    secret: SecretString::from(connection_secret),
                     authorization_id: auth_id,
                     tenant_id,
                     is_oauth: false,
@@ -843,7 +844,7 @@ impl UnifiedSigner {
                         let handler = Nip46Handler {
                             bunker_keys,
                             user_keys,
-                            secret: auth.secret.clone(),
+                            secret: SecretString::from(auth.secret.clone()),
                             authorization_id: auth.id,
                             tenant_id: auth.tenant_id,
                             is_oauth: true,
@@ -927,7 +928,7 @@ impl UnifiedSigner {
                                 let handler = Nip46Handler {
                                     bunker_keys,
                                     user_keys,
-                                    secret: connection_secret,
+                                    secret: SecretString::from(connection_secret),
                                     authorization_id: auth_id,
                                     tenant_id,
                                     is_oauth: false,
@@ -1631,7 +1632,7 @@ mod tests {
         Nip46Handler {
             bunker_keys,
             user_keys,
-            secret: "test_secret".to_string(),
+            secret: SecretString::from("test_secret".to_string()),
             authorization_id: auth_id,
             tenant_id: 1,
             is_oauth: true,
@@ -1748,7 +1749,7 @@ mod tests {
         let test_handler = Nip46Handler {
             bunker_keys: Keys::generate(),
             user_keys: Keys::generate(),
-            secret: "test".to_string(),
+            secret: SecretString::from("test".to_string()),
             authorization_id: 999,
             tenant_id: 1,
             is_oauth: true,

@@ -4,6 +4,7 @@ pub mod gcp_key_manager;
 
 use async_trait::async_trait;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 #[derive(Error, Debug)]
 pub enum KeyManagerError {
@@ -26,5 +27,5 @@ pub enum KeyManagerError {
 #[async_trait]
 pub trait KeyManager: Send + Sync {
     async fn encrypt(&self, plaintext_bytes: &[u8]) -> Result<Vec<u8>, KeyManagerError>;
-    async fn decrypt(&self, ciphertext_bytes: &[u8]) -> Result<Vec<u8>, KeyManagerError>;
+    async fn decrypt(&self, ciphertext_bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, KeyManagerError>;
 }

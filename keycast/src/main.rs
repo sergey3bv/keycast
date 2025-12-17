@@ -35,6 +35,7 @@ use tower_http::trace::TraceLayer;
 use tracing::Level;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 async fn health_check() -> impl IntoResponse {
     StatusCode::OK
@@ -291,14 +292,15 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         Box::new(FileKeyManager::new()?)
     };
 
-    // Load server keys for signing UCANs
-    let server_nsec = env::var("SERVER_NSEC")?; // Validated above
+    // Load server keys for signing UCANs (wrap in Zeroizing for auto-zeroization)
+    let server_nsec = Zeroizing::new(env::var("SERVER_NSEC")?); // Validated above
     let server_keys = Keys::parse(&server_nsec).map_err(|e| {
         format!(
             "Invalid SERVER_NSEC: {}. Must be valid hex (64 chars) or nsec bech32.",
             e
         )
     })?;
+    // server_nsec is zeroized here when dropped
     tracing::info!(
         "✔︎ Server keys loaded (pubkey: {})",
         server_keys.public_key().to_hex()

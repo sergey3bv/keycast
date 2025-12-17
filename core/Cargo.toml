@@ -32,3 +32,5 @@ tracing-subscriber = { workspace = true }
 urlencoding = "2.1"
 uuid = { workspace = true }
 anchorhash = "0.2"
+secrecy = { workspace = true }
+zeroize = { workspace = true }
