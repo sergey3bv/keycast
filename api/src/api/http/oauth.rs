@@ -163,6 +163,7 @@ async fn store_oauth_code_with_pending_registration(
     pending_email_verification_token: &str,
     pending_encrypted_secret: Option<&[u8]>,
     state: Option<&str>,
+    device_code: Option<&str>,
 ) -> Result<(), OAuthError> {
     let repo = OAuthCodeRepository::new(pool.clone());
     repo.store_with_pending_registration(StoreOAuthCodeWithRegistrationParams {
@@ -180,6 +181,7 @@ async fn store_oauth_code_with_pending_registration(
         pending_email_verification_token,
         pending_encrypted_secret,
         state,
+        device_code,
     })
     .await?;
     Ok(())
@@ -1545,6 +1547,7 @@ pub async fn authorize_get(
         const codeChallengeMethod = '{}';
         const defaultRegister = new URLSearchParams(window.location.search).get('default_register') === 'true';
         const byokPubkey = new URLSearchParams(window.location.search).get('byok_pubkey');
+        const state = new URLSearchParams(window.location.search).get('state');
 
         // Set app icon letter
         document.getElementById('app_icon_letter').textContent = clientId.charAt(0).toUpperCase();
@@ -1599,7 +1602,7 @@ pub async fn authorize_get(
             document.getElementById('error').style.display = 'none';
         }}
 
-        function showVerificationNotice(email) {{
+        function showVerificationNotice(email, deviceCode) {{
             // Hide forms and show verification notice
             document.getElementById('login_view').classList.remove('active');
             document.getElementById('register_view').classList.remove('active');
@@ -1610,16 +1613,22 @@ pub async fn authorize_get(
             if (emailSpan) emailSpan.textContent = email;
             notice.style.display = 'block';
 
+            // Store device_code for polling (RFC 8628: secret, never in URL)
+            // See: https://datatracker.ietf.org/doc/html/rfc8628
+            if (deviceCode) {{
+                sessionStorage.setItem('keycast_device_code', deviceCode);
+            }}
+
             // Start polling for verification completion (multi-device support)
             startVerificationPolling();
         }}
 
         function startVerificationPolling() {{
-            const urlParams = new URLSearchParams(window.location.search);
-            const state = urlParams.get('state');
+            // RFC 8628: Use device_code (secret, from response body) not state (public, in URL)
+            const deviceCode = sessionStorage.getItem('keycast_device_code');
 
-            if (!state) {{
-                console.log('No state parameter, polling disabled');
+            if (!deviceCode) {{
+                console.log('No device_code, polling disabled');
                 return;
             }}
 
@@ -1627,13 +1636,16 @@ pub async fn authorize_get(
 
             const pollInterval = setInterval(async () => {{
                 try {{
-                    const response = await fetch(`/api/oauth/poll?state=${{encodeURIComponent(state)}}`);
+                    const response = await fetch(`/api/oauth/poll?device_code=${{encodeURIComponent(deviceCode)}}`);
 
                     if (response.status === 200) {{
                         clearInterval(pollInterval);
+                        sessionStorage.removeItem('keycast_device_code');
                         const data = await response.json();
 
-                        // Redirect to app with code
+                        // Redirect to app with code (state is for CSRF, include if available)
+                        const urlParams = new URLSearchParams(window.location.search);
+                        const state = urlParams.get('state');
                         let url = `${{redirectUri}}?code=${{encodeURIComponent(data.code)}}`;
                         if (state) url += `&state=${{encodeURIComponent(state)}}`;
                         window.location.href = url;
@@ -1649,6 +1661,7 @@ pub async fn authorize_get(
             // Stop after 30 minutes
             setTimeout(() => {{
                 clearInterval(pollInterval);
+                sessionStorage.removeItem('keycast_device_code');
                 console.log('Polling timed out');
             }}, 30 * 60 * 1000);
         }}
@@ -1679,7 +1692,8 @@ pub async fn authorize_get(
                         redirect_uri: redirectUri,
                         scope: scope,
                         code_challenge: codeChallenge || undefined,
-                        code_challenge_method: codeChallengeMethod || undefined
+                        code_challenge_method: codeChallengeMethod || undefined,
+                        state: state || undefined
                     }})
                 }});
 
@@ -1687,7 +1701,8 @@ pub async fn authorize_get(
                     const data = await response.json().catch(() => ({{}}));
                     // Check if email not verified
                     if (data.code === 'EMAIL_NOT_VERIFIED' || data.verification_required) {{
-                        showVerificationNotice(data.email || email);
+                        // No device_code for login flow - user needs to check email
+                        showVerificationNotice(data.email || email, null);
                         return;
                     }}
                     showError(data.error || 'Login failed');
@@ -1736,7 +1751,8 @@ pub async fn authorize_get(
                         redirect_uri: redirectUri,
                         scope: scope,
                         code_challenge: codeChallenge || undefined,
-                        code_challenge_method: codeChallengeMethod || undefined
+                        code_challenge_method: codeChallengeMethod || undefined,
+                        state: state || undefined
                     }})
                 }});
 
@@ -1749,7 +1765,7 @@ pub async fn authorize_get(
 
                 // Check if email verification is required
                 if (data.verification_required) {{
-                    showVerificationNotice(data.email || email);
+                    showVerificationNotice(data.email || email, data.device_code);
                     return;
                 }}
 
@@ -2603,6 +2619,16 @@ pub async fn oauth_register(
         .map(char::from)
         .collect();
 
+    // Generate RFC 8628-style device_code for secure polling
+    // Unlike 'state' (visible in URL), device_code is only returned in response body
+    // This prevents polling credential leakage via referrer headers, logs, or browser history
+    // See: https://datatracker.ietf.org/doc/html/rfc8628
+    let device_code: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
+
     // Use 24-hour expiry for pending registrations (matches email verification expiry)
     let expires_at = Utc::now() + Duration::hours(24);
 
@@ -2625,6 +2651,7 @@ pub async fn oauth_register(
         &verification_token,
         pending_encrypted_secret.as_deref(),
         req.state.as_deref(),
+        Some(&device_code),
     )
     .await?;
 
@@ -2657,10 +2684,12 @@ pub async fn oauth_register(
 
     // DO NOT issue UCAN or set session cookie - user must verify email first
     // Return verification_required response so frontend shows "check your email" message
+    // device_code is RFC 8628 polling credential - only returned here, never in URLs
     Ok(Json(serde_json::json!({
         "verification_required": true,
         "email": req.email,
-        "pubkey": public_key.to_hex()
+        "pubkey": public_key.to_hex(),
+        "device_code": device_code
     }))
     .into_response())
 }
@@ -3319,7 +3348,9 @@ pub async fn connect_post(
 
 #[derive(Debug, Deserialize)]
 pub struct PollRequest {
-    pub state: String,
+    /// RFC 8628 device_code - secret polling credential returned in registration response body
+    /// Unlike 'state' (visible in URL), device_code is never exposed in URLs or referrer headers
+    pub device_code: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -3327,21 +3358,25 @@ pub struct PollResponse {
     pub code: String,
 }
 
-/// GET /oauth/poll?state={state}
+/// GET /oauth/poll?device_code={device_code}
 /// Polling endpoint for multi-device OAuth flow (email verified on different device)
+/// Uses RFC 8628-style device_code (secret, returned in response body) for secure polling
 /// Returns HTTP 200 with code when ready, HTTP 202 if pending, HTTP 500 on server error
+/// See: https://datatracker.ietf.org/doc/html/rfc8628
 pub async fn poll(
     State(auth_state): State<super::routes::AuthState>,
     Query(req): Query<PollRequest>,
 ) -> Result<Response, OAuthError> {
-    // Validate state parameter (basic sanity check - alphanumeric, reasonable length)
-    if req.state.len() > 128
+    // Validate device_code parameter (basic sanity check - alphanumeric, reasonable length)
+    if req.device_code.len() > 128
         || !req
-            .state
+            .device_code
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        return Err(OAuthError::InvalidRequest("Invalid state parameter".into()));
+        return Err(OAuthError::InvalidRequest(
+            "Invalid device_code parameter".into(),
+        ));
     }
 
     let Some(redis) = &auth_state.state.redis else {
@@ -3351,7 +3386,7 @@ pub async fn poll(
         ));
     };
 
-    let key = format!("oauth_poll:{}", req.state);
+    let key = format!("oauth_poll:{}", req.device_code);
 
     match redis::cmd("GET")
         .arg(&key)
@@ -3373,7 +3408,7 @@ pub async fn poll(
                 StatusCode::ACCEPTED,
                 Json(serde_json::json!({ "status": "pending" })),
             )
-            .into_response())
+                .into_response())
         }
         Err(e) => {
             tracing::error!("Redis error in poll: {}", e);

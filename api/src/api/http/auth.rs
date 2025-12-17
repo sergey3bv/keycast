@@ -1111,10 +1111,12 @@ pub async fn verify_email(
         };
         oauth_code_repo.store(store_params).await?;
 
-        // Store code in Redis for multi-device polling
-        if let Some(ref state) = oauth_data.state {
+        // Store code in Redis for multi-device polling (RFC 8628 pattern)
+        // Use device_code (secret, from response body) not state (public, in URL)
+        // See: https://datatracker.ietf.org/doc/html/rfc8628
+        if let Some(ref device_code) = oauth_data.device_code {
             if let Some(redis) = &auth_state.state.redis {
-                let key = format!("oauth_poll:{}", state);
+                let key = format!("oauth_poll:{}", device_code);
                 if let Err(e) = redis::cmd("SETEX")
                     .arg(&key)
                     .arg(600) // 10 minute TTL
@@ -1125,7 +1127,10 @@ pub async fn verify_email(
                     tracing::warn!("Failed to store OAuth code in Redis for polling: {}", e);
                     // Continue - redirect flow still works for same-device verification
                 } else {
-                    tracing::debug!("Stored OAuth code in Redis for polling: state={}", state);
+                    tracing::debug!(
+                        "Stored OAuth code in Redis for polling: device_code={}",
+                        device_code
+                    );
                 }
             }
         }

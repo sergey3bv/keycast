@@ -20,6 +20,8 @@ pub struct OAuthCodeData {
     pub pending_encrypted_secret: Option<Vec<u8>>,
     pub previous_auth_id: Option<i32>,
     pub state: Option<String>,
+    /// RFC 8628 device_code for secure polling (returned in response body, never in URLs)
+    pub device_code: Option<String>,
 }
 
 /// Parameters for storing a basic OAuth code
@@ -55,6 +57,8 @@ pub struct StoreOAuthCodeWithRegistrationParams<'a> {
     pub pending_email_verification_token: &'a str,
     pub pending_encrypted_secret: Option<&'a [u8]>,
     pub state: Option<&'a str>,
+    /// RFC 8628 device_code for secure polling (returned in response body, never in URLs)
+    pub device_code: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,8 +102,8 @@ impl OAuthCodeRepository {
     ) -> Result<(), RepositoryError> {
         sqlx::query(
             "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at,
-             pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, state)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+             pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, state, device_code)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
         )
         .bind(params.tenant_id)
         .bind(params.code)
@@ -116,6 +120,7 @@ impl OAuthCodeRepository {
         .bind(params.pending_email_verification_token)
         .bind(params.pending_encrypted_secret)
         .bind(params.state)
+        .bind(params.device_code)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -141,10 +146,11 @@ impl OAuthCodeRepository {
             Option<Vec<u8>>,
             Option<i32>,
             Option<String>,
+            Option<String>,
         )> = sqlx::query_as(
             "SELECT user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method,
                     pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret,
-                    previous_auth_id, state
+                    previous_auth_id, state, device_code
              FROM oauth_codes
              WHERE tenant_id = $1 AND code = $2 AND expires_at > $3",
         )
@@ -167,6 +173,7 @@ impl OAuthCodeRepository {
             pending_encrypted_secret: row.9,
             previous_auth_id: row.10,
             state: row.11,
+            device_code: row.12,
         }))
     }
 
@@ -191,10 +198,11 @@ impl OAuthCodeRepository {
             Option<Vec<u8>>,
             Option<i32>,
             Option<String>,
+            Option<String>,
         )> = sqlx::query_as(
             "SELECT user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method,
                     pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret,
-                    previous_auth_id, state
+                    previous_auth_id, state, device_code
              FROM oauth_codes
              WHERE pending_email_verification_token = $1 AND tenant_id = $2 AND expires_at > $3",
         )
@@ -217,6 +225,7 @@ impl OAuthCodeRepository {
             pending_encrypted_secret: row.9,
             previous_auth_id: row.10,
             state: row.11,
+            device_code: row.12,
         }))
     }
 

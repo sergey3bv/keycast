@@ -17,6 +17,8 @@ const STORAGE_KEY_SESSION = 'keycast_session';
 const STORAGE_KEY_HANDLE = 'keycast_auth_handle';
 /** Storage key for PKCE verifier (survives page reload during OAuth redirect) */
 const STORAGE_KEY_PKCE = 'keycast_pkce';
+/** Storage key for OAuth state (enables multi-device email verification polling) */
+const STORAGE_KEY_STATE = 'keycast_oauth_state';
 
 /**
  * In-memory storage fallback when no storage is provided
@@ -136,12 +138,17 @@ export class KeycastOAuth {
     // Persist PKCE to storage (survives page reload during OAuth redirect)
     this.storage.setItem(STORAGE_KEY_PKCE, JSON.stringify(pkce));
 
+    // Generate state for multi-device email verification polling
+    const state = crypto.randomUUID();
+    this.storage.setItem(STORAGE_KEY_STATE, state);
+
     const url = new URL(`${this.config.serverUrl}/api/oauth/authorize`);
     url.searchParams.set('client_id', this.config.clientId);
     url.searchParams.set('redirect_uri', this.config.redirectUri);
     url.searchParams.set('scope', options.scopes?.join(' ') ?? 'policy:social');
     url.searchParams.set('code_challenge', pkce.challenge);
     url.searchParams.set('code_challenge_method', 'S256');
+    url.searchParams.set('state', state);
 
     if (options.defaultRegister) {
       url.searchParams.set('default_register', 'true');
@@ -186,7 +193,7 @@ export class KeycastOAuth {
     }
 
     if (!codeVerifier) {
-      throw new Error('No PKCE verifier available. Call getAuthorizationUrl first or provide verifier.');
+      throw new Error('Session not found. This can happen if you opened this link on a different device or browser than where you started sign-in. Please return to your original device, or start a new sign-in from this one.');
     }
 
     const response = await this.fetch(`${this.config.serverUrl}/api/oauth/token`, {
@@ -208,9 +215,10 @@ export class KeycastOAuth {
       throw new Error(error.error_description ?? error.error ?? 'Token exchange failed');
     }
 
-    // Clear PKCE after successful exchange (both memory and storage)
+    // Clear PKCE and state after successful exchange (both memory and storage)
     this.pendingPkce = null;
     this.storage.removeItem(STORAGE_KEY_PKCE);
+    this.storage.removeItem(STORAGE_KEY_STATE);
 
     const tokenResponse = data as TokenResponse;
 
