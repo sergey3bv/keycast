@@ -4,8 +4,11 @@
 
 use nostr_sdk::nips::nip44;
 use nostr_sdk::{Event, Keys, PublicKey, UnsignedEvent};
+use secrecy::SecretString;
 use thiserror::Error;
 use tokio::task::JoinError;
+
+use crate::secret_types::DecryptedPlaintext;
 
 /// 32-byte key for efficient cache lookups (stack-only, no heap allocation)
 pub type CacheKey = [u8; 32];
@@ -84,18 +87,21 @@ impl SigningSession {
     }
 
     /// Decrypt ciphertext using NIP-44 (CPU-bound crypto runs on spawn_blocking)
+    /// Returns DecryptedPlaintext (SecretString) for automatic memory zeroization on drop.
     pub async fn nip44_decrypt(
         &self,
         sender: &PublicKey,
         ciphertext: &str,
-    ) -> Result<String, SessionError> {
+    ) -> Result<DecryptedPlaintext, SessionError> {
         let secret = self.keys.secret_key().clone();
         let sender = *sender;
         let ciphertext = ciphertext.to_string();
 
-        tokio::task::spawn_blocking(move || nip44::decrypt(&secret, &sender, &ciphertext))
-            .await?
-            .map_err(|e| SessionError::Encryption(e.to_string()))
+        tokio::task::spawn_blocking(move || {
+            nip44::decrypt(&secret, &sender, &ciphertext).map(SecretString::from)
+        })
+        .await?
+        .map_err(|e| SessionError::Encryption(e.to_string()))
     }
 }
 

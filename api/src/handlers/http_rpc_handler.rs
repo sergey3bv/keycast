@@ -2,11 +2,13 @@
 // ABOUTME: Caches authorization metadata AND permissions for spam protection without DB hits
 
 use chrono::{DateTime, Utc};
+use keycast_core::secret_types::DecryptedPlaintext;
 use keycast_core::signing_session::{CacheKey, SigningSession};
 use keycast_core::traits::CustomPermission;
 use moka::future::Cache;
 use nostr_sdk::nips::nip04;
 use nostr_sdk::{Event, Keys, PublicKey, UnsignedEvent};
+use secrecy::SecretString;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -246,11 +248,12 @@ impl HttpRpcHandler {
 
     /// Decrypt ciphertext using NIP-44 after checking validity and permissions
     /// (CPU-bound crypto runs on spawn_blocking via SigningSession)
+    /// Returns DecryptedPlaintext (SecretString) for automatic memory zeroization on drop.
     pub async fn nip44_decrypt(
         &self,
         sender: &PublicKey,
         ciphertext: &str,
-    ) -> Result<String, HandlerError> {
+    ) -> Result<DecryptedPlaintext, HandlerError> {
         if !self.is_valid() {
             return Err(HandlerError::AuthorizationInvalid);
         }
@@ -288,11 +291,12 @@ impl HttpRpcHandler {
 
     /// Decrypt ciphertext using NIP-04 after checking validity and permissions
     /// (CPU-bound crypto runs on spawn_blocking)
+    /// Returns DecryptedPlaintext (SecretString) for automatic memory zeroization on drop.
     pub async fn nip04_decrypt(
         &self,
         sender: &PublicKey,
         ciphertext: &str,
-    ) -> Result<String, HandlerError> {
+    ) -> Result<DecryptedPlaintext, HandlerError> {
         if !self.is_valid() {
             return Err(HandlerError::AuthorizationInvalid);
         }
@@ -303,10 +307,12 @@ impl HttpRpcHandler {
         let sender = *sender;
         let ciphertext = ciphertext.to_string();
 
-        tokio::task::spawn_blocking(move || nip04::decrypt(&secret, &sender, &ciphertext))
-            .await
-            .map_err(|e| HandlerError::Encryption(format!("blocking task failed: {}", e)))?
-            .map_err(|e| HandlerError::Encryption(e.to_string()))
+        tokio::task::spawn_blocking(move || {
+            nip04::decrypt(&secret, &sender, &ciphertext).map(SecretString::from)
+        })
+        .await
+        .map_err(|e| HandlerError::Encryption(format!("blocking task failed: {}", e)))?
+        .map_err(|e| HandlerError::Encryption(e.to_string()))
     }
 }
 

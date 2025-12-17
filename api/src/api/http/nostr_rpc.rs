@@ -15,6 +15,7 @@ use keycast_core::repositories::{
 use keycast_core::signing_session::{parse_cache_key, CacheKey, SigningSession};
 use keycast_core::traits::CustomPermission;
 use nostr_sdk::{Keys, PublicKey, UnsignedEvent};
+use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -183,7 +184,8 @@ pub async fn nostr_rpc(
             // Crypto runs on spawn_blocking to avoid blocking async workers
             let plaintext = handler.nip44_decrypt(&sender_pubkey, &ciphertext).await?;
 
-            JsonValue::String(plaintext)
+            // Expose secret only at serialization boundary
+            JsonValue::String(plaintext.expose_secret().to_string())
         }
 
         "nip04_encrypt" => {
@@ -203,7 +205,8 @@ pub async fn nostr_rpc(
             // Crypto runs on spawn_blocking to avoid blocking async workers
             let plaintext = handler.nip04_decrypt(&sender_pubkey, &ciphertext).await?;
 
-            JsonValue::String(plaintext)
+            // Expose secret only at serialization boundary
+            JsonValue::String(plaintext.expose_secret().to_string())
         }
 
         method => {

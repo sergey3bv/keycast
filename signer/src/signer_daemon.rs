@@ -968,7 +968,8 @@ impl UnifiedSigner {
 
         // Try NIP-44 first (new standard), fall back to NIP-04
         // CPU-bound crypto wrapped in spawn_blocking to avoid blocking async runtime
-        let (decrypted, use_nip44) = {
+        // Returns SecretString for automatic memory zeroization on drop
+        let (decrypted, use_nip44): (SecretString, bool) = {
             let secret = bunker_secret.clone();
             let sender_pubkey = event.pubkey;
             let content = event.content.clone();
@@ -977,14 +978,14 @@ impl UnifiedSigner {
                 match nip44::decrypt(&secret, &sender_pubkey, &content) {
                     Ok(d) => {
                         tracing::debug!("Successfully decrypted with NIP-44");
-                        Ok((d, true))
+                        Ok((SecretString::from(d), true))
                     }
                     Err(nip44_err) => {
                         tracing::debug!("NIP-44 decrypt failed ({}), trying NIP-04...", nip44_err);
                         match nip04::decrypt(&secret, &sender_pubkey, &content) {
                             Ok(d) => {
                                 tracing::debug!("Successfully decrypted with NIP-04");
-                                Ok((d, false))
+                                Ok((SecretString::from(d), false))
                             }
                             Err(nip04_err) => {
                                 tracing::error!(
@@ -1003,10 +1004,13 @@ impl UnifiedSigner {
             .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
         };
 
-        tracing::debug!("Decrypted NIP-46 request: {}", decrypted);
+        tracing::debug!(
+            "Decrypted NIP-46 request ({} bytes)",
+            decrypted.expose_secret().len()
+        );
 
-        // Parse the JSON-RPC request
-        let request: serde_json::Value = serde_json::from_str(&decrypted)?;
+        // Parse the JSON-RPC request - expose secret only for deserialization
+        let request: serde_json::Value = serde_json::from_str(decrypted.expose_secret())?;
         let method = request["method"]
             .as_str()
             .ok_or(SignerError::MissingParameter("method"))?;
@@ -1146,20 +1150,22 @@ impl UnifiedSigner {
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
 
                 // CPU-bound crypto wrapped in spawn_blocking
-                let plaintext = {
+                // Returns SecretString for automatic memory zeroization on drop
+                let plaintext: SecretString = {
                     let secret = handler.user_keys.secret_key().clone();
                     let pubkey = third_party_pubkey;
                     let text = ciphertext.to_string();
-                    tokio::task::spawn_blocking(move || nip44::decrypt(&secret, &pubkey, &text))
-                        .await
-                        .map_err(|e| {
-                            SignerError::internal(format!("spawn_blocking failed: {}", e))
-                        })??
+                    tokio::task::spawn_blocking(move || {
+                        nip44::decrypt(&secret, &pubkey, &text).map(SecretString::from)
+                    })
+                    .await
+                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
                 };
 
+                // Expose secret only at serialization boundary
                 serde_json::json!({
                     "id": request_id,
-                    "result": plaintext
+                    "result": plaintext.expose_secret()
                 })
             }
             "nip04_encrypt" => {
@@ -1204,20 +1210,22 @@ impl UnifiedSigner {
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
 
                 // CPU-bound crypto wrapped in spawn_blocking
-                let plaintext = {
+                // Returns SecretString for automatic memory zeroization on drop
+                let plaintext: SecretString = {
                     let secret = handler.user_keys.secret_key().clone();
                     let pubkey = third_party_pubkey;
                     let text = ciphertext.to_string();
-                    tokio::task::spawn_blocking(move || nip04::decrypt(&secret, &pubkey, &text))
-                        .await
-                        .map_err(|e| {
-                            SignerError::internal(format!("spawn_blocking failed: {}", e))
-                        })??
+                    tokio::task::spawn_blocking(move || {
+                        nip04::decrypt(&secret, &pubkey, &text).map(SecretString::from)
+                    })
+                    .await
+                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
                 };
 
+                // Expose secret only at serialization boundary
                 serde_json::json!({
                     "id": request_id,
-                    "result": plaintext
+                    "result": plaintext.expose_secret()
                 })
             }
             _ => {

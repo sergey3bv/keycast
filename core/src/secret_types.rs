@@ -10,3 +10,7 @@ pub type DecryptedSecret = Zeroizing<Vec<u8>>;
 
 /// Connection secret for NIP-46 - provides Debug redaction + auto-zeroize on drop.
 pub type ConnectionSecret = SecretString;
+
+/// Decrypted plaintext from NIP-04/NIP-44 - auto-zeroizes on drop.
+/// Use `.expose_secret()` only at the point where plaintext must be serialized/returned.
+pub type DecryptedPlaintext = SecretString;

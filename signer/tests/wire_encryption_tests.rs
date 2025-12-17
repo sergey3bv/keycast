@@ -3,6 +3,7 @@
 
 use nostr_sdk::nips::{nip04, nip44};
 use nostr_sdk::prelude::*;
+use secrecy::{ExposeSecret, SecretString};
 
 // ============================================================================
 // Wire Encryption Tests
@@ -314,4 +315,167 @@ fn test_dual_key_separation() {
     )
     .expect("Third party should decrypt payload messages");
     assert_eq!(payload_decrypted, payload_message);
+}
+
+// ============================================================================
+// SecretString Protection Tests
+// These verify that decrypted plaintext is protected by SecretString
+// ============================================================================
+
+/// Test that NIP-44 decrypted content wrapped in SecretString redacts Debug output
+#[test]
+fn test_nip44_decrypt_secretstring_redacts_debug() {
+    let keys1 = Keys::generate();
+    let keys2 = Keys::generate();
+
+    let sensitive_plaintext = "super secret message with passwords and keys";
+
+    let ciphertext = nip44::encrypt(
+        keys1.secret_key(),
+        &keys2.public_key(),
+        sensitive_plaintext,
+        nip44::Version::V2,
+    )
+    .expect("Encryption should succeed");
+
+    // Decrypt and wrap in SecretString (as done in production code)
+    let decrypted = nip44::decrypt(keys2.secret_key(), &keys1.public_key(), &ciphertext)
+        .map(SecretString::from)
+        .expect("Decryption should succeed");
+
+    // Debug output should be redacted
+    let debug_output = format!("{:?}", decrypted);
+    assert!(
+        !debug_output.contains("super secret"),
+        "Debug output should NOT contain plaintext: {}",
+        debug_output
+    );
+    assert!(
+        debug_output.contains("Secret"),
+        "Debug output should indicate it's a secret type: {}",
+        debug_output
+    );
+
+    // expose_secret() should return the actual plaintext
+    assert_eq!(
+        decrypted.expose_secret(),
+        sensitive_plaintext,
+        "expose_secret() should return original plaintext"
+    );
+}
+
+/// Test that NIP-04 decrypted content wrapped in SecretString redacts Debug output
+#[test]
+fn test_nip04_decrypt_secretstring_redacts_debug() {
+    let keys1 = Keys::generate();
+    let keys2 = Keys::generate();
+
+    let sensitive_plaintext = "private key: nsec1abc123...";
+
+    let ciphertext = nip04::encrypt(keys1.secret_key(), &keys2.public_key(), sensitive_plaintext)
+        .expect("Encryption should succeed");
+
+    // Decrypt and wrap in SecretString (as done in production code)
+    let decrypted = nip04::decrypt(keys2.secret_key(), &keys1.public_key(), &ciphertext)
+        .map(SecretString::from)
+        .expect("Decryption should succeed");
+
+    // Debug output should be redacted
+    let debug_output = format!("{:?}", decrypted);
+    assert!(
+        !debug_output.contains("nsec1"),
+        "Debug output should NOT contain plaintext: {}",
+        debug_output
+    );
+
+    // expose_secret() should return the actual plaintext
+    assert_eq!(
+        decrypted.expose_secret(),
+        sensitive_plaintext,
+        "expose_secret() should return original plaintext"
+    );
+}
+
+/// Test that SecretString protects wire decryption (NIP-46 request parsing)
+#[test]
+fn test_wire_decrypt_secretstring_protects_json_rpc() {
+    let bunker_keys = Keys::generate();
+    let client_keys = Keys::generate();
+
+    // Simulate a NIP-46 request with sensitive params
+    let rpc_request =
+        r#"{"method":"nip04_decrypt","params":["abc123","encrypted_dm_content"],"id":"1"}"#;
+
+    let encrypted = nip44::encrypt(
+        client_keys.secret_key(),
+        &bunker_keys.public_key(),
+        rpc_request,
+        nip44::Version::V2,
+    )
+    .expect("Encryption should succeed");
+
+    // Decrypt and wrap in SecretString (as done in signer_daemon.rs)
+    let decrypted: SecretString = nip44::decrypt(
+        bunker_keys.secret_key(),
+        &client_keys.public_key(),
+        &encrypted,
+    )
+    .map(SecretString::from)
+    .expect("Decryption should succeed");
+
+    // Debug should be redacted
+    let debug_output = format!("{:?}", decrypted);
+    assert!(
+        !debug_output.contains("nip04_decrypt"),
+        "Debug should not leak method name"
+    );
+    assert!(
+        !debug_output.contains("encrypted_dm_content"),
+        "Debug should not leak params"
+    );
+
+    // Can still parse JSON via expose_secret()
+    let parsed: serde_json::Value =
+        serde_json::from_str(decrypted.expose_secret()).expect("Should parse JSON");
+    assert_eq!(parsed["method"], "nip04_decrypt");
+}
+
+/// Test that SecretString is used for RPC decrypt response serialization
+#[test]
+fn test_decrypt_response_exposes_at_serialization_boundary() {
+    let user_keys = Keys::generate();
+    let third_party_keys = Keys::generate();
+
+    let dm_content = "Hey, here's the secret meeting location...";
+
+    // Third party sends encrypted DM to user
+    let ciphertext = nip44::encrypt(
+        third_party_keys.secret_key(),
+        &user_keys.public_key(),
+        dm_content,
+        nip44::Version::V2,
+    )
+    .expect("Encryption should succeed");
+
+    // User decrypts (simulates nip44_decrypt RPC handler)
+    let plaintext: SecretString = nip44::decrypt(
+        user_keys.secret_key(),
+        &third_party_keys.public_key(),
+        &ciphertext,
+    )
+    .map(SecretString::from)
+    .expect("Decryption should succeed");
+
+    // Build JSON response - expose secret only at serialization boundary
+    let response = serde_json::json!({
+        "id": "request-123",
+        "result": plaintext.expose_secret()
+    });
+
+    // Response should contain the plaintext for the client
+    assert_eq!(response["result"], dm_content);
+
+    // But the SecretString variable itself remains protected
+    let debug_output = format!("{:?}", plaintext);
+    assert!(!debug_output.contains("secret meeting"));
 }
