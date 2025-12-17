@@ -372,6 +372,7 @@ pub async fn get_or_create_tenant(pool: &PgPool, domain: &str) -> Result<Tenant,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_tenant_settings_parsing() {
@@ -423,6 +424,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_validate_domain_allowlist() {
         // Set allowlist
         std::env::set_var("ALLOWED_TENANT_DOMAINS", "example.com,localhost,test.io");
@@ -441,6 +443,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_validate_domain_allowlist_with_spaces() {
         // Allowlist with spaces around commas
         std::env::set_var("ALLOWED_TENANT_DOMAINS", "example.com, localhost , test.io");
@@ -453,6 +456,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_validate_domain_no_allowlist_uses_format_validation() {
         // Ensure no allowlist is set
         std::env::remove_var("ALLOWED_TENANT_DOMAINS");
