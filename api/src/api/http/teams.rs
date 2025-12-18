@@ -315,15 +315,9 @@ pub async fn get_key(
             .await
             .map_err(|_| ApiError::not_found("Policy not found"))?;
 
-        let users = auth_repo
-            .get_users(auth.id)
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
-
         complete_authorizations.push(AuthorizationWithRelations {
             authorization: auth.clone(),
             policy,
-            users,
             // bunker URL is only available at creation time (secret is now hashed)
             bunker_connection_string: None,
         });
@@ -401,6 +395,7 @@ pub async fn add_authorization(
             &relays,
             request.max_uses,
             request.expires_at,
+            request.label.as_deref(),
         )
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -438,7 +433,7 @@ pub async fn delete_authorization(
         .await
         .map_err(|_| ApiError::not_found("Stored key not found"))?;
 
-    // Delete the authorization (includes user_authorizations cleanup)
+    // Delete the authorization
     let deleted = auth_repo
         .delete_for_stored_key(tenant_id, auth_id, stored_key.id)
         .await

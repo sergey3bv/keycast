@@ -1,8 +1,8 @@
 // ABOUTME: Authorization repository for data access operations
-// ABOUTME: Provides methods for managing authorizations and user authorizations
+// ABOUTME: Provides methods for managing authorizations
 
 use crate::repositories::RepositoryError;
-use crate::types::authorization::{Authorization, UserAuthorization};
+use crate::types::authorization::Authorization;
 use sqlx::PgPool;
 
 /// Repository for authorization database operations.
@@ -25,7 +25,8 @@ impl AuthorizationRepository {
     ) -> Result<Authorization, RepositoryError> {
         sqlx::query_as::<_, Authorization>(
             "SELECT id, tenant_id, stored_key_id, secret_hash, bunker_public_key,
-                    relays, policy_id, max_uses, expires_at, created_at, updated_at
+                    relays, policy_id, max_uses, expires_at, connected_client_pubkey,
+                    connected_at, label, created_at, updated_at
              FROM authorizations WHERE tenant_id = $1 AND id = $2",
         )
         .bind(tenant_id)
@@ -43,7 +44,8 @@ impl AuthorizationRepository {
     ) -> Result<Vec<Authorization>, RepositoryError> {
         sqlx::query_as::<_, Authorization>(
             "SELECT id, tenant_id, stored_key_id, secret_hash, bunker_public_key,
-                    relays, policy_id, max_uses, expires_at, created_at, updated_at
+                    relays, policy_id, max_uses, expires_at, connected_client_pubkey,
+                    connected_at, label, created_at, updated_at
              FROM authorizations WHERE tenant_id = $1 AND stored_key_id = $2",
         )
         .bind(tenant_id)
@@ -85,11 +87,12 @@ impl AuthorizationRepository {
         relays: &serde_json::Value,
         max_uses: Option<i32>,
         expires_at: Option<chrono::DateTime<chrono::Utc>>,
+        label: Option<&str>,
     ) -> Result<Authorization, RepositoryError> {
         sqlx::query_as::<_, Authorization>(
-            "INSERT INTO authorizations (tenant_id, stored_key_id, policy_id, secret_hash, bunker_public_key, relays, max_uses, expires_at, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
-             RETURNING id, tenant_id, stored_key_id, secret_hash, bunker_public_key, relays, policy_id, max_uses, expires_at, created_at, updated_at",
+            "INSERT INTO authorizations (tenant_id, stored_key_id, policy_id, secret_hash, bunker_public_key, relays, max_uses, expires_at, label, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+             RETURNING id, tenant_id, stored_key_id, secret_hash, bunker_public_key, relays, policy_id, max_uses, expires_at, connected_client_pubkey, connected_at, label, created_at, updated_at",
         )
         .bind(tenant_id)
         .bind(stored_key_id)
@@ -99,6 +102,7 @@ impl AuthorizationRepository {
         .bind(relays)
         .bind(max_uses)
         .bind(expires_at)
+        .bind(label)
         .fetch_one(&self.pool)
         .await
         .map_err(Into::into)
@@ -111,114 +115,40 @@ impl AuthorizationRepository {
         tenant_id: i64,
         authorization_id: i32,
     ) -> Result<bool, RepositoryError> {
-        let mut tx = self.pool.begin().await?;
-
-        // Delete user_authorizations first (foreign key constraint)
-        sqlx::query("DELETE FROM user_authorizations WHERE authorization_id = $1")
-            .bind(authorization_id)
-            .execute(&mut *tx)
-            .await?;
-
-        // Delete the authorization
         let result = sqlx::query("DELETE FROM authorizations WHERE tenant_id = $1 AND id = $2")
             .bind(tenant_id)
             .bind(authorization_id)
-            .execute(&mut *tx)
+            .execute(&self.pool)
             .await?;
-
-        tx.commit().await?;
 
         Ok(result.rows_affected() > 0)
     }
 
     /// Delete an authorization by stored_key_id (used when checking ownership).
-    /// Uses a transaction to ensure atomicity.
     pub async fn delete_for_stored_key(
         &self,
         tenant_id: i64,
         authorization_id: i32,
         stored_key_id: i32,
     ) -> Result<bool, RepositoryError> {
-        let mut tx = self.pool.begin().await?;
-
-        // Delete user_authorizations first (foreign key constraint)
-        sqlx::query("DELETE FROM user_authorizations WHERE authorization_id = $1")
-            .bind(authorization_id)
-            .execute(&mut *tx)
-            .await?;
-
-        // Delete the authorization if it belongs to the specified stored key
         let result = sqlx::query(
             "DELETE FROM authorizations WHERE tenant_id = $1 AND id = $2 AND stored_key_id = $3",
         )
         .bind(tenant_id)
         .bind(authorization_id)
         .bind(stored_key_id)
-        .execute(&mut *tx)
+        .execute(&self.pool)
         .await?;
-
-        tx.commit().await?;
 
         Ok(result.rows_affected() > 0)
     }
 
-    /// Get users associated with an authorization.
-    pub async fn get_users(
-        &self,
-        authorization_id: i32,
-    ) -> Result<Vec<UserAuthorization>, RepositoryError> {
-        sqlx::query_as::<_, UserAuthorization>(
-            "SELECT user_pubkey, created_at, updated_at
-             FROM user_authorizations WHERE authorization_id = $1",
-        )
-        .bind(authorization_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(Into::into)
-    }
-
-    /// Add a user to an authorization.
-    pub async fn add_user(
-        &self,
-        authorization_id: i32,
-        user_pubkey: &str,
-    ) -> Result<(), RepositoryError> {
-        sqlx::query(
-            "INSERT INTO user_authorizations (authorization_id, user_pubkey, created_at, updated_at)
-             VALUES ($1, $2, NOW(), NOW())",
-        )
-        .bind(authorization_id)
-        .bind(user_pubkey)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    /// Remove a user from an authorization.
-    pub async fn remove_user(
-        &self,
-        authorization_id: i32,
-        user_pubkey: &str,
-    ) -> Result<(), RepositoryError> {
-        sqlx::query(
-            "DELETE FROM user_authorizations WHERE authorization_id = $1 AND user_pubkey = $2",
-        )
-        .bind(authorization_id)
-        .bind(user_pubkey)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repositories::{
-        PolicyRepository, StoredKeyRepository, TeamRepository, UserRepository,
-    };
+    use crate::repositories::{PolicyRepository, StoredKeyRepository, TeamRepository};
     use nostr_sdk::Keys;
     use sqlx::PgPool;
 
@@ -296,6 +226,7 @@ mod tests {
                 &relays,
                 Some(10i32),
                 None,
+                None,
             )
             .await;
 
@@ -328,6 +259,7 @@ mod tests {
                 secret_hash,
                 &bunker_pubkey,
                 &relays,
+                None,
                 None,
                 None,
             )
@@ -369,6 +301,7 @@ mod tests {
                 &relays,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -380,6 +313,7 @@ mod tests {
                 secret_hash,
                 &generate_bunker_pubkey(),
                 &relays,
+                None,
                 None,
                 None,
             )
@@ -411,6 +345,7 @@ mod tests {
                 &relays,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -421,104 +356,6 @@ mod tests {
 
         let find_result = auth_repo.find(1, auth.id).await;
         assert!(matches!(find_result, Err(RepositoryError::NotFound(_))));
-    }
-
-    #[tokio::test]
-    async fn test_add_and_get_users() {
-        let pool = setup_pool().await;
-        let auth_repo = AuthorizationRepository::new(pool.clone());
-        let user_repo = UserRepository::new(pool.clone());
-        let suffix = test_suffix();
-
-        let (_, key_id, policy_id) = create_test_fixtures(&pool, &suffix).await;
-
-        let relays = serde_json::json!(["wss://relay.test"]);
-        let secret_hash = "$2b$10$test_hash_not_real_but_valid_format_xxxxx";
-        let auth = auth_repo
-            .create(
-                1,
-                key_id,
-                policy_id,
-                secret_hash,
-                &generate_bunker_pubkey(),
-                &relays,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-
-        // Create users first (foreign key constraint)
-        let keys1 = Keys::generate();
-        let keys2 = Keys::generate();
-        user_repo
-            .find_or_create(1, &keys1.public_key())
-            .await
-            .unwrap();
-        user_repo
-            .find_or_create(1, &keys2.public_key())
-            .await
-            .unwrap();
-
-        // Add users
-        auth_repo
-            .add_user(auth.id, &keys1.public_key().to_hex())
-            .await
-            .unwrap();
-        auth_repo
-            .add_user(auth.id, &keys2.public_key().to_hex())
-            .await
-            .unwrap();
-
-        // Get users
-        let users = auth_repo.get_users(auth.id).await;
-        assert!(users.is_ok(), "Should get users");
-        assert_eq!(users.unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_remove_user() {
-        let pool = setup_pool().await;
-        let auth_repo = AuthorizationRepository::new(pool.clone());
-        let user_repo = UserRepository::new(pool.clone());
-        let suffix = test_suffix();
-
-        let (_, key_id, policy_id) = create_test_fixtures(&pool, &suffix).await;
-
-        let relays = serde_json::json!(["wss://relay.test"]);
-        let secret_hash = "$2b$10$test_hash_not_real_but_valid_format_xxxxx";
-        let auth = auth_repo
-            .create(
-                1,
-                key_id,
-                policy_id,
-                secret_hash,
-                &generate_bunker_pubkey(),
-                &relays,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-
-        // Create user first (foreign key constraint)
-        let keys = Keys::generate();
-        user_repo
-            .find_or_create(1, &keys.public_key())
-            .await
-            .unwrap();
-
-        // Add and then remove a user
-        let pubkey = keys.public_key().to_hex();
-        auth_repo.add_user(auth.id, &pubkey).await.unwrap();
-
-        let users_before = auth_repo.get_users(auth.id).await.unwrap();
-        assert_eq!(users_before.len(), 1);
-
-        auth_repo.remove_user(auth.id, &pubkey).await.unwrap();
-
-        let users_after = auth_repo.get_users(auth.id).await.unwrap();
-        assert_eq!(users_after.len(), 0);
     }
 
     #[tokio::test]
@@ -539,6 +376,7 @@ mod tests {
                 secret_hash,
                 &generate_bunker_pubkey(),
                 &relays,
+                None,
                 None,
                 None,
             )
@@ -569,6 +407,7 @@ mod tests {
                 secret_hash,
                 &generate_bunker_pubkey(),
                 &relays,
+                None,
                 None,
                 None,
             )

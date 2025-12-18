@@ -999,12 +999,6 @@ pub async fn verify_email(
     let key_manager = auth_state.state.key_manager.as_ref();
     let tenant_id = tenant.0.id;
 
-    tracing::info!(
-        "Email verification attempt with token: {}... for tenant: {}",
-        &req.token[..std::cmp::min(10, req.token.len())],
-        tenant_id
-    );
-
     // First: Check oauth_codes for pending OAuth registration
     let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
     if let Some(oauth_data) = oauth_code_repo

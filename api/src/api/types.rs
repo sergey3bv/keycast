@@ -55,6 +55,8 @@ pub struct AddAuthorizationRequest {
     #[serde(default)]
     #[serde(with = "chrono::serde::ts_seconds_option")]
     pub expires_at: Option<DateTime<Utc>>,
+    /// Optional label for admin tracking (e.g., person's name who received this authorization)
+    pub label: Option<String>,
 }
 
 impl From<Team> for TeamResponse {

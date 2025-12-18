@@ -17,12 +17,15 @@ export type User = {
 export type Authorization = {
     id: number;
     stored_key_id: number;
-    secret: string;
-    bunker_nsec: string;
+    secret_hash: string;
+    bunker_public_key: string;
     relays: string[];
     policy_id: number;
-    max_uses: number;
-    expires_at: Date;
+    max_uses: number | null;
+    expires_at: Date | null;
+    connected_client_pubkey: string | null;
+    connected_at: Date | null;
+    label: string | null;
     created_at: Date;
     updated_at: Date;
 };
@@ -63,8 +66,7 @@ export type Policy = {
 export type AuthorizationWithRelations = {
     authorization: Authorization;
     policy: Policy;
-    users: User[];
-    bunker_connection_string: string;
+    bunker_connection_string?: string;
 };
 
 export type Permission = {

@@ -20,7 +20,8 @@ CREATE TABLE public.authorizations (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     tenant_id bigint DEFAULT 1 NOT NULL,
     connected_client_pubkey text,
-    connected_at timestamp with time zone
+    connected_at timestamp with time zone,
+    label text
 );
 
 CREATE SEQUENCE public.authorizations_id_seq
@@ -291,24 +292,6 @@ CREATE TABLE signer_instances (
 
 CREATE INDEX idx_signer_instances_heartbeat ON signer_instances(last_heartbeat);
 
-CREATE TABLE public.user_authorizations (
-    id integer NOT NULL,
-    user_pubkey character(64),
-    authorization_id integer,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
-CREATE SEQUENCE public.user_authorizations_id_seq
-    AS integer
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-ALTER SEQUENCE public.user_authorizations_id_seq OWNED BY public.user_authorizations.id;
-
 CREATE TABLE public.user_profiles (
     pubkey character(64) NOT NULL,
     profile_json text NOT NULL,
@@ -352,8 +335,6 @@ ALTER TABLE ONLY public.team_users ALTER COLUMN id SET DEFAULT nextval('public.t
 ALTER TABLE ONLY public.teams ALTER COLUMN id SET DEFAULT nextval('public.teams_id_seq'::regclass);
 
 ALTER TABLE ONLY public.tenants ALTER COLUMN id SET DEFAULT nextval('public.tenants_id_seq'::regclass);
-
-ALTER TABLE ONLY public.user_authorizations ALTER COLUMN id SET DEFAULT nextval('public.user_authorizations_id_seq'::regclass);
 
 ALTER TABLE ONLY public.authorizations
     ADD CONSTRAINT authorizations_pkey PRIMARY KEY (id);
@@ -405,9 +386,6 @@ ALTER TABLE ONLY public.tenants
 
 ALTER TABLE ONLY public.tenants
     ADD CONSTRAINT tenants_pkey PRIMARY KEY (id);
-
-ALTER TABLE ONLY public.user_authorizations
-    ADD CONSTRAINT user_authorizations_pkey PRIMARY KEY (id);
 
 ALTER TABLE ONLY public.user_profiles
     ADD CONSTRAINT user_profiles_pkey PRIMARY KEY (pubkey);
@@ -533,12 +511,6 @@ CREATE INDEX team_users_user_pubkey_idx ON public.team_users USING btree (user_p
 
 CREATE INDEX teams_name_idx ON public.teams USING btree (name);
 
-CREATE INDEX user_authorizations_authorization_id_idx ON public.user_authorizations USING btree (authorization_id);
-
-CREATE UNIQUE INDEX user_authorizations_user_pubkey_authorization_id_idx ON public.user_authorizations USING btree (user_pubkey, authorization_id);
-
-CREATE INDEX user_authorizations_user_pubkey_idx ON public.user_authorizations USING btree (user_pubkey);
-
 CREATE UNIQUE INDEX users_pubkey_idx ON public.users USING btree (pubkey);
 
 -- Functional indexes for CHAR(64)::text (prepared statement compatibility with PgBouncer)
@@ -583,8 +555,6 @@ CREATE TRIGGER team_users_update_trigger BEFORE UPDATE ON public.team_users FOR 
 CREATE TRIGGER teams_update_trigger BEFORE UPDATE ON public.teams FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
 
 CREATE TRIGGER tenants_update_trigger BEFORE UPDATE ON public.tenants FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
-
-CREATE TRIGGER user_authorizations_update_trigger BEFORE UPDATE ON public.user_authorizations FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
 
 CREATE TRIGGER users_update_trigger BEFORE UPDATE ON public.users FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
 
@@ -649,12 +619,6 @@ ALTER TABLE ONLY public.team_users
 
 ALTER TABLE ONLY public.teams
     ADD CONSTRAINT teams_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
-
-ALTER TABLE ONLY public.user_authorizations
-    ADD CONSTRAINT user_authorizations_authorization_id_fkey FOREIGN KEY (authorization_id) REFERENCES public.authorizations(id);
-
-ALTER TABLE ONLY public.user_authorizations
-    ADD CONSTRAINT user_authorizations_user_pubkey_fkey FOREIGN KEY (user_pubkey) REFERENCES public.users(pubkey);
 
 ALTER TABLE ONLY public.user_profiles
     ADD CONSTRAINT user_profiles_pubkey_fkey FOREIGN KEY (pubkey) REFERENCES public.users(pubkey) ON DELETE CASCADE;

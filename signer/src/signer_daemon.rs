@@ -132,25 +132,32 @@ impl Nip46Handler {
             return Err(SignerError::permission_denied("Invalid secret"));
         }
 
-        if !self.is_oauth {
-            // For regular authorizations, secret validation is sufficient
-            // No client tracking (allows shared bunker URLs for teams)
-            return Ok("ack".to_string());
-        }
-
-        // For OAuth authorizations, also enforce one-client-per-bunker (NIP-46 spec)
+        // Enforce one-client-per-authorization (NIP-46 spec: secrets are single-use)
         // Check if a client is already connected
-        let existing_client: Option<String> = sqlx::query_scalar(
-            "SELECT connected_client_pubkey FROM oauth_authorizations
-             WHERE id = $1 AND tenant_id = $2
-               AND revoked_at IS NULL
-               AND (expires_at IS NULL OR expires_at > NOW())",
-        )
-        .bind(self.authorization_id)
-        .bind(self.tenant_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .flatten();
+        let existing_client: Option<String> = if self.is_oauth {
+            sqlx::query_scalar(
+                "SELECT connected_client_pubkey FROM oauth_authorizations
+                 WHERE id = $1 AND tenant_id = $2
+                   AND revoked_at IS NULL
+                   AND (expires_at IS NULL OR expires_at > NOW())",
+            )
+            .bind(self.authorization_id)
+            .bind(self.tenant_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten()
+        } else {
+            sqlx::query_scalar(
+                "SELECT connected_client_pubkey FROM authorizations
+                 WHERE id = $1 AND tenant_id = $2
+                   AND (expires_at IS NULL OR expires_at > NOW())",
+            )
+            .bind(self.authorization_id)
+            .bind(self.tenant_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten()
+        };
 
         match existing_client {
             Some(existing) if existing == client_pubkey => {
@@ -172,19 +179,32 @@ impl Nip46Handler {
             None => {
                 // First connect - store client pubkey
                 tracing::info!(
-                    "First connect for OAuth auth {}, storing client pubkey: {}",
+                    "First connect for auth {} (oauth={}), storing client pubkey: {}",
                     self.authorization_id,
+                    self.is_oauth,
                     client_pubkey
                 );
-                sqlx::query(
-                    "UPDATE oauth_authorizations
-                     SET connected_client_pubkey = $1, connected_at = NOW()
-                     WHERE id = $2",
-                )
-                .bind(client_pubkey)
-                .bind(self.authorization_id)
-                .execute(&self.pool)
-                .await?;
+                if self.is_oauth {
+                    sqlx::query(
+                        "UPDATE oauth_authorizations
+                         SET connected_client_pubkey = $1, connected_at = NOW()
+                         WHERE id = $2",
+                    )
+                    .bind(client_pubkey)
+                    .bind(self.authorization_id)
+                    .execute(&self.pool)
+                    .await?;
+                } else {
+                    sqlx::query(
+                        "UPDATE authorizations
+                         SET connected_client_pubkey = $1, connected_at = NOW()
+                         WHERE id = $2",
+                    )
+                    .bind(client_pubkey)
+                    .bind(self.authorization_id)
+                    .execute(&self.pool)
+                    .await?;
+                }
 
                 Ok("ack".to_string())
             }
@@ -194,46 +214,64 @@ impl Nip46Handler {
     /// Validate that a client is authorized to make requests.
     ///
     /// Checks if the provided client pubkey matches the stored connected client.
-    /// For non-OAuth authorizations, always succeeds.
     ///
     /// # Errors
     ///
     /// Returns error if client pubkey doesn't match the connected client.
     pub async fn validate_client(&self, client_pubkey: &str) -> SignerResult<()> {
-        if !self.is_oauth {
-            // Regular authorizations don't track client pubkey (yet)
-            return Ok(());
-        }
-
         let bunker_pubkey = self.bunker_keys.public_key().to_hex();
 
         // Check if this client is the connected client for any active authorization with this bunker pubkey
-        let is_valid: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM oauth_authorizations
-             WHERE bunker_public_key = $1 AND connected_client_pubkey = $2
-               AND revoked_at IS NULL
-               AND (expires_at IS NULL OR expires_at > NOW()))",
-        )
-        .bind(&bunker_pubkey)
-        .bind(client_pubkey)
-        .fetch_one(&self.pool)
-        .await?;
+        let is_valid: bool = if self.is_oauth {
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM oauth_authorizations
+                 WHERE bunker_public_key = $1 AND connected_client_pubkey = $2
+                   AND revoked_at IS NULL
+                   AND (expires_at IS NULL OR expires_at > NOW()))",
+            )
+            .bind(&bunker_pubkey)
+            .bind(client_pubkey)
+            .fetch_one(&self.pool)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM authorizations
+                 WHERE bunker_public_key = $1 AND connected_client_pubkey = $2
+                   AND (expires_at IS NULL OR expires_at > NOW()))",
+            )
+            .bind(&bunker_pubkey)
+            .bind(client_pubkey)
+            .fetch_one(&self.pool)
+            .await?
+        };
 
         if is_valid {
             Ok(())
         } else {
             // Check if there's any active authorization with NULL connected_client_pubkey
             // If so, this client hasn't connected yet
-            let has_unconnected: bool = sqlx::query_scalar(
-                "SELECT EXISTS(SELECT 1 FROM oauth_authorizations
-                 WHERE bunker_public_key = $1 AND connected_client_pubkey IS NULL
-                   AND revoked_at IS NULL
-                   AND (expires_at IS NULL OR expires_at > NOW()))",
-            )
-            .bind(&bunker_pubkey)
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or(false);
+            let has_unconnected: bool = if self.is_oauth {
+                sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM oauth_authorizations
+                     WHERE bunker_public_key = $1 AND connected_client_pubkey IS NULL
+                       AND revoked_at IS NULL
+                       AND (expires_at IS NULL OR expires_at > NOW()))",
+                )
+                .bind(&bunker_pubkey)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(false)
+            } else {
+                sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM authorizations
+                     WHERE bunker_public_key = $1 AND connected_client_pubkey IS NULL
+                       AND (expires_at IS NULL OR expires_at > NOW()))",
+                )
+                .bind(&bunker_pubkey)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(false)
+            };
 
             if has_unconnected {
                 Err(SignerError::permission_denied(
@@ -257,57 +295,90 @@ impl Nip46Handler {
     ///
     /// Returns error if a different client is already connected.
     pub async fn validate_and_store_client(&self, client_pubkey: &str) -> SignerResult<()> {
-        if !self.is_oauth {
-            return Ok(());
-        }
-
         let bunker_pubkey = self.bunker_keys.public_key().to_hex();
 
         // Check if this client is already the connected client for an active auth
-        let is_valid: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM oauth_authorizations
-             WHERE bunker_public_key = $1 AND connected_client_pubkey = $2
-               AND revoked_at IS NULL
-               AND (expires_at IS NULL OR expires_at > NOW()))",
-        )
-        .bind(&bunker_pubkey)
-        .bind(client_pubkey)
-        .fetch_one(&self.pool)
-        .await?;
+        let is_valid: bool = if self.is_oauth {
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM oauth_authorizations
+                 WHERE bunker_public_key = $1 AND connected_client_pubkey = $2
+                   AND revoked_at IS NULL
+                   AND (expires_at IS NULL OR expires_at > NOW()))",
+            )
+            .bind(&bunker_pubkey)
+            .bind(client_pubkey)
+            .fetch_one(&self.pool)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM authorizations
+                 WHERE bunker_public_key = $1 AND connected_client_pubkey = $2
+                   AND (expires_at IS NULL OR expires_at > NOW()))",
+            )
+            .bind(&bunker_pubkey)
+            .bind(client_pubkey)
+            .fetch_one(&self.pool)
+            .await?
+        };
 
         if is_valid {
             return Ok(());
         }
 
         // Check if there's an unconnected active authorization we can claim
-        let unconnected_id: Option<i32> = sqlx::query_scalar(
-            "SELECT id FROM oauth_authorizations
-             WHERE bunker_public_key = $1 AND connected_client_pubkey IS NULL
-               AND revoked_at IS NULL
-               AND (expires_at IS NULL OR expires_at > NOW())
-             LIMIT 1",
-        )
-        .bind(&bunker_pubkey)
-        .fetch_optional(&self.pool)
-        .await?;
+        let unconnected_id: Option<i32> = if self.is_oauth {
+            sqlx::query_scalar(
+                "SELECT id FROM oauth_authorizations
+                 WHERE bunker_public_key = $1 AND connected_client_pubkey IS NULL
+                   AND revoked_at IS NULL
+                   AND (expires_at IS NULL OR expires_at > NOW())
+                 LIMIT 1",
+            )
+            .bind(&bunker_pubkey)
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                "SELECT id FROM authorizations
+                 WHERE bunker_public_key = $1 AND connected_client_pubkey IS NULL
+                   AND (expires_at IS NULL OR expires_at > NOW())
+                 LIMIT 1",
+            )
+            .bind(&bunker_pubkey)
+            .fetch_optional(&self.pool)
+            .await?
+        };
 
         match unconnected_id {
             Some(auth_id) => {
                 // First request without connect - store this client (graceful upgrade)
                 tracing::info!(
-                    "Storing client pubkey on first request (graceful upgrade) for auth {}: {}",
+                    "Storing client pubkey on first request (graceful upgrade) for auth {} (oauth={}): {}",
                     auth_id,
+                    self.is_oauth,
                     client_pubkey
                 );
-                sqlx::query(
-                    "UPDATE oauth_authorizations
-                     SET connected_client_pubkey = $1, connected_at = NOW()
-                     WHERE id = $2",
-                )
-                .bind(client_pubkey)
-                .bind(auth_id)
-                .execute(&self.pool)
-                .await?;
+                if self.is_oauth {
+                    sqlx::query(
+                        "UPDATE oauth_authorizations
+                         SET connected_client_pubkey = $1, connected_at = NOW()
+                         WHERE id = $2",
+                    )
+                    .bind(client_pubkey)
+                    .bind(auth_id)
+                    .execute(&self.pool)
+                    .await?;
+                } else {
+                    sqlx::query(
+                        "UPDATE authorizations
+                         SET connected_client_pubkey = $1, connected_at = NOW()
+                         WHERE id = $2",
+                    )
+                    .bind(client_pubkey)
+                    .bind(auth_id)
+                    .execute(&self.pool)
+                    .await?;
+                }
 
                 Ok(())
             }

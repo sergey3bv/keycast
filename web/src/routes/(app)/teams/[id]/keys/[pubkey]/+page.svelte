@@ -18,7 +18,6 @@ import type {
 } from "$lib/types";
 import { formattedDate } from "$lib/utils/dates";
 import {
-    type NDKEvent,
     NDKNip07Signer,
     type NDKUser,
     type NDKUserProfile,
@@ -31,8 +30,7 @@ const { id, pubkey } = $page.params;
 const api = new KeycastApi();
 const user = $derived(getCurrentUser()?.user);
 let isLoading = $state(true);
-let unsignedAuthEvent: NDKEvent | null = $state(null);
-let encodedAuthEvent: string | null = $state(null);
+let hasFetched = $state(false);
 let team: Team | null = $state(null);
 let key: StoredKey | null = $state(null);
 let authorizations: AuthorizationWithRelations[] = $state([]);
@@ -40,7 +38,8 @@ let keyUser: NDKUser | null = ndk.getUser({ pubkey });
 let keyUserProfile: NDKUserProfile | null = $state(null);
 
 $effect(() => {
-    if (user?.pubkey && !unsignedAuthEvent) {
+    if (user?.pubkey && !hasFetched) {
+        hasFetched = true;
         const authMethod = getCurrentUser()?.authMethod;
         let authHeaders: Record<string, string> = {};
 
@@ -50,14 +49,12 @@ $effect(() => {
                 "GET",
                 user.pubkey,
             ).then(async (event) => {
-                unsignedAuthEvent = event;
-                if (unsignedAuthEvent) {
+                if (event) {
                     if (!ndk.signer) {
                         ndk.signer = new NDKNip07Signer();
                     }
-                    await unsignedAuthEvent.sign();
-                    encodedAuthEvent = `Nostr ${btoa(JSON.stringify(unsignedAuthEvent))}`;
-                    authHeaders.Authorization = encodedAuthEvent;
+                    await event.sign();
+                    authHeaders.Authorization = `Nostr ${btoa(JSON.stringify(event))}`;
                     api.get(`/teams/${id}/keys/${pubkey}`, {
                         headers: authHeaders,
                     })

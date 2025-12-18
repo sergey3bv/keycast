@@ -79,6 +79,12 @@ pub struct Authorization {
     pub max_uses: Option<i32>,
     /// The date and time at which this authorization expires, None means it never expires
     pub expires_at: Option<DateTime<chrono::Utc>>,
+    /// The public key of the connected client (NIP-46 compliant: one client per authorization)
+    pub connected_client_pubkey: Option<String>,
+    /// When the client connected to this authorization
+    pub connected_at: Option<DateTime<chrono::Utc>>,
+    /// Optional label for admin tracking (e.g., person's name who received this authorization)
+    pub label: Option<String>,
     /// The date and time the authorization was created
     pub created_at: DateTime<chrono::Utc>,
     /// The date and time the authorization was last updated
@@ -91,25 +97,17 @@ pub struct AuthorizationWithRelations {
     pub authorization: Authorization,
     #[sqlx(flatten)]
     pub policy: Policy,
-    pub users: Vec<UserAuthorization>,
     /// The bunker connection string (only available at creation time, None afterward)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bunker_connection_string: Option<String>,
-}
-
-#[derive(Debug, FromRow, Serialize, Deserialize)]
-pub struct UserAuthorization {
-    /// User's Nostr pubkey (NIP-46: `user-pubkey`)
-    pub user_pubkey: String,
-    pub created_at: DateTime<chrono::Utc>,
-    pub updated_at: DateTime<chrono::Utc>,
 }
 
 impl Authorization {
     pub async fn find(pool: &PgPool, tenant_id: i64, id: i32) -> Result<Self, AuthorizationError> {
         let authorization = sqlx::query_as::<_, Authorization>(
             "SELECT id, tenant_id, stored_key_id, secret_hash, bunker_public_key,
-                    relays, policy_id, max_uses, expires_at, created_at, updated_at
+                    relays, policy_id, max_uses, expires_at, connected_client_pubkey,
+                    connected_at, label, created_at, updated_at
              FROM authorizations WHERE tenant_id = $1 AND id = $2",
         )
         .bind(tenant_id)

@@ -113,20 +113,6 @@ impl TeamRepository {
     pub async fn delete(&self, tenant_id: i64, team_id: i32) -> Result<(), RepositoryError> {
         let mut tx = self.pool.begin().await?;
 
-        // Delete user_authorizations for all authorizations linked to stored keys in this team
-        sqlx::query(
-            "DELETE FROM user_authorizations
-             WHERE authorization_id IN (
-                 SELECT a.id FROM authorizations a
-                 JOIN stored_keys sk ON a.stored_key_id = sk.id
-                 WHERE a.tenant_id = $1 AND sk.tenant_id = $1 AND sk.team_id = $2
-             )",
-        )
-        .bind(tenant_id)
-        .bind(team_id)
-        .execute(&mut *tx)
-        .await?;
-
         // Delete authorizations for stored keys in this team
         sqlx::query(
             "DELETE FROM authorizations

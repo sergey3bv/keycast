@@ -14,7 +14,7 @@ import type {
 import { readablePermissionConfig } from "$lib/utils/permissions";
 import { toTitleCase } from "$lib/utils/strings";
 import { type NDKEvent, NDKNip07Signer } from "@nostr-dev-kit/ndk";
-import { CaretRight, X } from "phosphor-svelte";
+import { CaretRight, X, Copy, Check, Warning } from "phosphor-svelte";
 import { toast } from "svelte-hot-french-toast";
 
 const { id, pubkey } = $page.params;
@@ -30,6 +30,7 @@ let expiresAt: Date | null = $state(null);
 let relaysString: string = $state(
     "wss://relay.nsecbunker.com, wss://relay.nsec.app",
 );
+let label: string = $state("");
 
 let relays: string[] = $derived(
     relaysString.split(",").map((relay) => relay.trim()),
@@ -40,6 +41,11 @@ let team: Team | null = $state(null);
 let policies: PolicyWithPermissions[] | null = $state(null);
 let key: StoredKey | null | undefined = $state(null);
 let selectedPolicyId: number | null = $state(null);
+
+// Success modal state
+let showSuccessModal = $state(false);
+let createdBunkerUrl: string | null = $state(null);
+let bunkerUrlCopied = $state(false);
 
 let readyToSubmit = $derived(
     maxUses !== null && relaysString && selectedPolicyId,
@@ -123,6 +129,7 @@ async function createAuthorization() {
             : null,
         relays: relays,
         policy_id: selectedPolicyId,
+        label: label.trim() || null,
     };
 
     const authMethod = getCurrentUser()?.authMethod;
@@ -148,14 +155,33 @@ async function createAuthorization() {
     api.post(`/teams/${id}/keys/${pubkey}/authorizations`, request, {
         headers: authHeaders,
     })
-        .then((_authorization) => {
-            toast.success("Authorization created successfully");
-            goto(`/teams/${id}/keys/${pubkey}`);
+        .then((response) => {
+            // Show success modal with bunker URL - this is the ONLY time the URL is available
+            const authResponse = response as { bunker_url: string };
+            createdBunkerUrl = authResponse.bunker_url;
+            showSuccessModal = true;
         })
         .catch((error) => {
             toast.error("Failed to create authorization");
             toast.error(`Failed to create authorization: ${error.message}`);
         });
+}
+
+function copyBunkerUrl() {
+    if (createdBunkerUrl) {
+        navigator.clipboard.writeText(createdBunkerUrl);
+        bunkerUrlCopied = true;
+        toast.success("Bunker URL copied to clipboard");
+        setTimeout(() => {
+            bunkerUrlCopied = false;
+        }, 2000);
+    }
+}
+
+function closeSuccessModal() {
+    showSuccessModal = false;
+    createdBunkerUrl = null;
+    goto(`/teams/${id}/keys/${pubkey}`);
 }
 </script>
 
@@ -169,6 +195,11 @@ async function createAuthorization() {
 
 <PageSection title="Authorization">
     <form onsubmit={() => createAuthorization()}>
+        <div class="form-group">
+            <label for="label">Label (Optional - e.g., person's name)</label>
+            <input type="text" bind:value={label} placeholder="e.g., John Doe" />
+        </div>
+
         <div class="form-group">
             <label for="maxUses">Maximum uses (Zero for unlimited)</label>
             <input type="number" bind:value={maxUses} />
@@ -228,3 +259,51 @@ async function createAuthorization() {
     </PageSection>
 
     <button onclick={createAuthorization} class="button button-primary" disabled={!readyToSubmit}>Add Authorization</button>
+
+{#if showSuccessModal}
+    <!-- Success Modal -->
+    <div class="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+        <div class="bg-gray-800 rounded-lg p-6 max-w-lg w-full mx-4 shadow-xl">
+            <h2 class="text-xl font-bold text-green-400 mb-4">Authorization Created</h2>
+
+            <div class="bg-yellow-900/50 border border-yellow-600 rounded-lg p-4 mb-4">
+                <div class="flex items-start gap-2">
+                    <Warning size="20" class="text-yellow-500 flex-shrink-0 mt-0.5" />
+                    <div class="text-sm text-yellow-200">
+                        <strong>Important:</strong> This bunker URL can only be shown once.
+                        Copy it now and share it with the team member who will use this authorization.
+                        It cannot be retrieved later.
+                    </div>
+                </div>
+            </div>
+
+            <div class="mb-4">
+                <label class="block text-sm text-gray-400 mb-2">Bunker URL</label>
+                <div class="bg-gray-900 rounded p-3 font-mono text-sm break-all text-gray-300">
+                    {createdBunkerUrl}
+                </div>
+            </div>
+
+            <div class="flex gap-3">
+                <button
+                    onclick={copyBunkerUrl}
+                    class="button button-primary flex items-center gap-2 flex-1 {bunkerUrlCopied ? 'bg-green-600!' : ''}"
+                >
+                    {#if bunkerUrlCopied}
+                        <Check size="20" />
+                        Copied!
+                    {:else}
+                        <Copy size="20" />
+                        Copy Bunker URL
+                    {/if}
+                </button>
+                <button
+                    onclick={closeSuccessModal}
+                    class="button flex-1"
+                >
+                    Done
+                </button>
+            </div>
+        </div>
+    </div>
+{/if}

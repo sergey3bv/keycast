@@ -78,18 +78,6 @@ impl StoredKeyRepository {
     pub async fn delete(&self, tenant_id: i64, key_id: i32) -> Result<(), RepositoryError> {
         let mut tx = self.pool.begin().await?;
 
-        // Delete user_authorizations for this key's authorizations
-        sqlx::query(
-            "DELETE FROM user_authorizations
-             WHERE authorization_id IN (
-                 SELECT id FROM authorizations WHERE tenant_id = $1 AND stored_key_id = $2
-             )",
-        )
-        .bind(tenant_id)
-        .bind(key_id)
-        .execute(&mut *tx)
-        .await?;
-
         // Delete authorizations for this key
         sqlx::query("DELETE FROM authorizations WHERE tenant_id = $1 AND stored_key_id = $2")
             .bind(tenant_id)
