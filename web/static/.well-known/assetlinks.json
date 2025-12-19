@@ -8,13 +8,5 @@
         "CF:7E:6A:A4:99:A8:00:A8:0E:93:E4:07:03:60:38:4F:2F:9C:22:81:3B:3D:7B:81:88:15:A0:1B:37:6F:ED:B1"
       ]
     }
-  },
-  {
-    "relation": ["delegate_permission/common.handle_all_urls"],
-    "target": {
-      "namespace": "android_app",
-      "package_name": "co.openvine.divine",
-      "sha256_cert_fingerprints": []
-    }
   }
 ]
