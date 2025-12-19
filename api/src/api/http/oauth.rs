@@ -1655,7 +1655,23 @@ pub async fn authorize_get(
                         const state = urlParams.get('state');
                         let url = `${{redirectUri}}?code=${{encodeURIComponent(data.code)}}`;
                         if (state) url += `&state=${{encodeURIComponent(state)}}`;
-                        window.location.href = url;
+
+                        // Chrome on Android doesn't trigger App Links for window.location.href
+                        // Use intent:// URL format to force Chrome to check for App Links
+                        // See: https://developer.chrome.com/docs/android/intents
+                        const isAndroid = /Android/i.test(navigator.userAgent);
+                        if (isAndroid && url.startsWith('https://')) {{
+                            try {{
+                                const parsed = new URL(url);
+                                // Intent URL tells Chrome to try App Links first, fall back to browser
+                                const intentUrl = `intent://${{parsed.host}}${{parsed.pathname}}${{parsed.search}}#Intent;scheme=https;action=android.intent.action.VIEW;category=android.intent.category.BROWSABLE;end`;
+                                window.location.href = intentUrl;
+                            }} catch (e) {{
+                                window.location.href = url;
+                            }}
+                        }} else {{
+                            window.location.href = url;
+                        }}
                     }} else if (response.status !== 202) {{
                         console.error('Poll error:', response.status);
                         // Don't clear interval on 500 - keep trying

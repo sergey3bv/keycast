@@ -52,8 +52,22 @@
 						toast.success('Email verified!');
 
 						// Redirect to OAuth client immediately
+						// Chrome on Android doesn't trigger App Links for window.location.href
+						// Use intent:// URL to force Chrome to check for App Links
 						setTimeout(() => {
-							window.location.href = response.redirect_to!;
+							const url = response.redirect_to!;
+							const isAndroid = /Android/i.test(navigator.userAgent);
+							if (isAndroid && url.startsWith('https://')) {
+								try {
+									const parsed = new URL(url);
+									const intentUrl = `intent://${parsed.host}${parsed.pathname}${parsed.search}#Intent;scheme=https;action=android.intent.action.VIEW;category=android.intent.category.BROWSABLE;end`;
+									window.location.href = intentUrl;
+								} catch (e) {
+									window.location.href = url;
+								}
+							} else {
+								window.location.href = url;
+							}
 						}, 1500);
 					} else if (response.authenticated) {
 						// Normal flow - user is now logged in
