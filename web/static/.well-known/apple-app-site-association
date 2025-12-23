@@ -4,8 +4,7 @@
     "details": [
       {
         "appIDs": [
-          "GZCZBKH7MY.co.openvine.keycastFlutterDemo",
-          "GZCZBKH7MY.co.openvine.app"
+          "GZCZBKH7MY.co.openvine.keycastFlutterDemo"
         ],
         "components": [
           {
@@ -22,8 +21,7 @@
   },
   "webcredentials": {
     "apps": [
-      "GZCZBKH7MY.co.openvine.keycastFlutterDemo",
-      "GZCZBKH7MY.co.openvine.app"
+      "GZCZBKH7MY.co.openvine.keycastFlutterDemo"
     ]
   }
 }
