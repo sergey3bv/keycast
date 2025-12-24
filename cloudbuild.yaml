@@ -44,7 +44,7 @@ steps:
       - '--cpu-boost'
       - '--session-affinity'
       - '--use-http2'
-      - '--startup-probe=httpGet.path=/health,httpGet.port=3000,initialDelaySeconds=0,periodSeconds=15,failureThreshold=8,timeoutSeconds=10'
+      - '--startup-probe=httpGet.path=/health,httpGet.port=3000,initialDelaySeconds=0,periodSeconds=3,failureThreshold=20,timeoutSeconds=2'
       - '--liveness-probe=httpGet.path=/health,httpGet.port=3000,periodSeconds=30,timeoutSeconds=5,failureThreshold=3'
       - '--add-cloudsql-instances=openvine-co:us-central1:keycast-db-plus'
       - '--network=default'
