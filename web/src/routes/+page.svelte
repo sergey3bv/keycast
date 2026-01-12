@@ -82,7 +82,10 @@ async function loadTeams() {
 		const response = await api.get<TeamWithRelations[]>('/teams');
 		teams = response || [];
 	} catch (err: any) {
-		console.error('Failed to load teams:', err);
+		// 404 is expected for NIP-07 admins without user records
+		if (err?.status !== 404) {
+			console.error('Failed to load teams:', err);
+		}
 		teams = [];
 	}
 }
@@ -94,7 +97,10 @@ async function loadSessions() {
 		const response = await api.get<{ sessions: BunkerSession[] }>('/user/sessions');
 		sessions = response.sessions || [];
 	} catch (err: any) {
-		console.error('Failed to load sessions:', err);
+		// 404 is expected for NIP-07 admins without user records
+		if (err?.status !== 404) {
+			console.error('Failed to load sessions:', err);
+		}
 		sessions = [];
 	}
 }
@@ -201,12 +207,8 @@ onMount(async () => {
 			userNpub = userObj.pubkey;
 		}
 
-		// Load dashboard data
-		// NIP-07 admins don't have user records - skip all data loading
-		const currentAuth = currentUserCheck.authMethod;
-		if (currentAuth !== 'nip07') {
-			await Promise.all([loadTeams(), loadSessions()]);
-		}
+		// Load dashboard data (gracefully handles missing user records)
+		await Promise.all([loadTeams(), loadSessions()]);
 		isLoadingDashboard = false;
 
 		// Try to fetch user profile for name

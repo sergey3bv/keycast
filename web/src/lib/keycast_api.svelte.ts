@@ -1,5 +1,14 @@
 import { getContext, setContext } from "svelte";
 
+export class ApiError extends Error {
+    status: number;
+    constructor(message: string, status: number) {
+        super(message);
+        this.status = status;
+        this.name = 'ApiError';
+    }
+}
+
 export class KeycastApi {
     private baseUrl: string;
     private defaultHeaders: HeadersInit;
@@ -40,7 +49,7 @@ export class KeycastApi {
                 // If we can't parse JSON, use a generic message
                 errorMessage = 'Something went wrong. Please try again.';
             }
-            throw new Error(errorMessage);
+            throw new ApiError(errorMessage, response.status);
         }
 
         if (response.status === 204) {
