@@ -472,28 +472,36 @@ fn get_server_keys() -> Result<Keys, AuthError> {
 
 /// Build the expected URL from request parts for NIP-98 validation
 fn build_expected_url(headers: &HeaderMap, path: &str) -> Result<String, AuthError> {
-    // Get the host from headers (try multiple options for proxy compatibility)
-    // Cloud Run uses x-forwarded-host, nginx might use host, HTTP/2 uses :authority
-    let host = headers
+    // Try to get host from headers (multiple options for proxy compatibility)
+    // Cloud Run uses x-forwarded-host, nginx uses host, HTTP/2 uses :authority
+    let host_from_headers = headers
         .get("x-forwarded-host")
         .or_else(|| headers.get("host"))
         .or_else(|| headers.get(":authority"))
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| AuthError::BadRequest("Host header required".to_string()))?;
+        .and_then(|v| v.to_str().ok());
 
-    // Check if using HTTPS (via X-Forwarded-Proto or assume based on port)
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_else(|| {
-            if host.contains(":443") || !host.contains(":") {
-                "https"
-            } else {
-                "http"
-            }
-        });
-
-    Ok(format!("{}://{}{}", proto, host, path))
+    // Fall back to APP_URL env var if no host header (common in Cloud Run)
+    if let Some(host) = host_from_headers {
+        let proto = headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_else(|| {
+                if host.contains(":443") || !host.contains(":") {
+                    "https"
+                } else {
+                    "http"
+                }
+            });
+        Ok(format!("{}://{}{}", proto, host, path))
+    } else if let Ok(app_url) = std::env::var("APP_URL") {
+        // Use APP_URL as fallback (strips trailing slash if present)
+        let base = app_url.trim_end_matches('/');
+        Ok(format!("{}{}", base, path))
+    } else {
+        Err(AuthError::BadRequest(
+            "Host header required (or set APP_URL env var)".to_string(),
+        ))
+    }
 }
 
 /// Handle NIP-98 admin login (admin-only, no user record created)
