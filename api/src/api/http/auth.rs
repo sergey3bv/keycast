@@ -472,9 +472,12 @@ fn get_server_keys() -> Result<Keys, AuthError> {
 
 /// Build the expected URL from request parts for NIP-98 validation
 fn build_expected_url(headers: &HeaderMap, path: &str) -> Result<String, AuthError> {
-    // Get the host from headers
+    // Get the host from headers (try multiple options for proxy compatibility)
+    // Cloud Run uses x-forwarded-host, nginx might use host, HTTP/2 uses :authority
     let host = headers
-        .get("host")
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))
+        .or_else(|| headers.get(":authority"))
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| AuthError::BadRequest("Host header required".to_string()))?;
 
