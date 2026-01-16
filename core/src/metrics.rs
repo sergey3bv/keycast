@@ -23,6 +23,8 @@ pub struct Metrics {
     pub nip46_requests_processed: AtomicU64,
     /// NIP-46 requests dropped due to queue full (backpressure)
     pub nip46_requests_queue_dropped: AtomicU64,
+    /// NIP-46 tombstone responses sent (revoked/expired authorizations)
+    pub nip46_tombstone_responses: AtomicU64,
 
     // === HTTP RPC Metrics ===
     /// Total HTTP RPC requests
@@ -67,6 +69,7 @@ impl Metrics {
             nip46_requests_handler_not_found: AtomicU64::new(0),
             nip46_requests_processed: AtomicU64::new(0),
             nip46_requests_queue_dropped: AtomicU64::new(0),
+            nip46_tombstone_responses: AtomicU64::new(0),
             // HTTP RPC metrics
             http_rpc_requests_total: AtomicU64::new(0),
             http_rpc_cache_hits: AtomicU64::new(0),
@@ -118,6 +121,11 @@ impl Metrics {
 
     pub fn inc_queue_dropped(&self) {
         self.nip46_requests_queue_dropped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn inc_nip46_tombstone_response(&self) {
+        self.nip46_tombstone_responses
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -241,6 +249,13 @@ impl Metrics {
         output.push_str(&format!(
             "keycast_nip46_queue_dropped_total {}\n",
             self.nip46_requests_queue_dropped.load(Ordering::Relaxed)
+        ));
+
+        output.push_str("\n# HELP keycast_nip46_tombstone_responses_total NIP-46 error responses sent for revoked/expired authorizations\n");
+        output.push_str("# TYPE keycast_nip46_tombstone_responses_total counter\n");
+        output.push_str(&format!(
+            "keycast_nip46_tombstone_responses_total {}\n",
+            self.nip46_tombstone_responses.load(Ordering::Relaxed)
         ));
 
         // HTTP RPC metrics

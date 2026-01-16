@@ -2974,10 +2974,7 @@ pub async fn delete_account(
                 })
                 .await
             {
-                tracing::warn!(
-                    "Failed to notify signer daemon of bunker removal: {}",
-                    e
-                );
+                tracing::warn!("Failed to notify signer daemon of bunker removal: {}", e);
             }
         }
     }

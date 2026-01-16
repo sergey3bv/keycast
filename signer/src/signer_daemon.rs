@@ -3,6 +3,7 @@
 
 use crate::error::{SignerError, SignerResult};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use cluster_hashring::ClusterCoordinator;
 use keycast_core::authorization_channel::{AuthorizationCommand, AuthorizationReceiver};
 use keycast_core::encryption::KeyManager;
@@ -19,6 +20,21 @@ use std::time::Duration;
 
 /// Default timeout for relay connection operations
 const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Status of a NIP-46 handler for tombstone support
+///
+/// When authorizations are revoked or expired, handlers are kept in memory
+/// as "tombstones" so they can still send error responses to clients instead
+/// of silently timing out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandlerStatus {
+    /// Handler is active and can process requests
+    Active,
+    /// Authorization was revoked by user - can only send error responses
+    Revoked,
+    /// Authorization has expired - can only send error responses
+    Expired,
+}
 
 /// NIP-46 handler for a single authorization
 ///
@@ -39,6 +55,10 @@ pub struct Nip46Handler {
     tenant_id: i64,
     is_oauth: bool,
     pool: PgPool,
+    /// Handler status for tombstone support (Active, Revoked, or Expired)
+    status: HandlerStatus,
+    /// When this handler became a tombstone (for cleanup after 24h)
+    tombstone_at: Option<DateTime<Utc>>,
 }
 
 impl Nip46Handler {
@@ -61,6 +81,41 @@ impl Nip46Handler {
             tenant_id,
             is_oauth,
             pool,
+            status: HandlerStatus::Active,
+            tombstone_at: None,
+        }
+    }
+
+    /// Check if this handler is a tombstone (revoked or expired)
+    pub fn is_tombstone(&self) -> bool {
+        self.status != HandlerStatus::Active
+    }
+
+    /// Get the error message for this tombstone status
+    pub fn tombstone_error_message(&self) -> Option<&'static str> {
+        match self.status {
+            HandlerStatus::Active => None,
+            HandlerStatus::Revoked => Some("Authorization has been revoked"),
+            HandlerStatus::Expired => Some("Authorization has expired"),
+        }
+    }
+
+    /// Compute handler status from OAuth authorization database fields.
+    ///
+    /// Priority: Revoked > Expired > Active
+    fn compute_status_from_oauth(
+        auth: &OAuthAuthorization,
+    ) -> (HandlerStatus, Option<DateTime<Utc>>) {
+        if auth.revoked_at.is_some() {
+            (HandlerStatus::Revoked, auth.revoked_at)
+        } else if let Some(expires_at) = auth.expires_at {
+            if expires_at <= Utc::now() {
+                (HandlerStatus::Expired, Some(expires_at))
+            } else {
+                (HandlerStatus::Active, None)
+            }
+        } else {
+            (HandlerStatus::Active, None)
         }
     }
 
@@ -592,8 +647,14 @@ impl UnifiedSigner {
                             }
                         }
                         AuthorizationCommand::Remove { bunker_pubkey } => {
-                            tracing::debug!("Removing authorization from cache: {}", bunker_pubkey);
-                            handlers_clone.invalidate(&bunker_pubkey).await;
+                            tracing::debug!("Marking authorization as revoked: {}", bunker_pubkey);
+                            if let Some(handler) = handlers_clone.get(&bunker_pubkey).await {
+                                let mut updated = handler.clone();
+                                updated.status = HandlerStatus::Revoked;
+                                updated.tombstone_at = Some(Utc::now());
+                                handlers_clone.insert(bunker_pubkey.clone(), updated).await;
+                            }
+                            // If not in cache, next request will load from DB as revoked
                         }
                         AuthorizationCommand::ReloadAll => {
                             // No-op with lazy loading - cache is populated on-demand
@@ -606,6 +667,38 @@ impl UnifiedSigner {
         } else {
             tracing::warn!("No authorization receiver available, channel updates disabled");
         }
+
+        // Spawn background task for tombstone cleanup (remove old revoked/expired handlers)
+        // This prevents memory buildup from tombstones while still giving clients time to receive errors
+        let handlers_cleanup = handlers.clone();
+        tokio::spawn(async move {
+            // Run every hour, clean up tombstones older than 24 hours
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                let cutoff = Utc::now() - chrono::Duration::hours(24);
+                let mut to_remove = Vec::new();
+
+                // Collect tombstone keys older than 24 hours
+                // Note: iter() yields (Arc<K>, V) pairs, so key is Arc<String>
+                for (key, handler) in handlers_cleanup.iter() {
+                    if let Some(tombstone_at) = handler.tombstone_at {
+                        if tombstone_at < cutoff {
+                            to_remove.push(key.as_ref().clone());
+                        }
+                    }
+                }
+
+                // Remove old tombstones
+                let count = to_remove.len();
+                for key in &to_remove {
+                    handlers_cleanup.invalidate(key).await;
+                }
+                if count > 0 {
+                    tracing::info!("Cleaned up {} old tombstone handlers", count);
+                }
+            }
+        });
 
         // Handle incoming events
         let client = self.client.clone();
@@ -739,6 +832,8 @@ impl UnifiedSigner {
                     tenant_id,
                     is_oauth: true,
                     pool: pool.clone(),
+                    status: HandlerStatus::Active,
+                    tombstone_at: None,
                 };
 
                 handlers.insert(bunker_pubkey.to_string(), handler).await;
@@ -788,6 +883,8 @@ impl UnifiedSigner {
                     tenant_id,
                     is_oauth: false,
                     pool: pool.clone(),
+                    status: HandlerStatus::Active,
+                    tombstone_at: None,
                 };
 
                 handlers.insert(bunker_pubkey.to_string(), handler).await;
@@ -849,12 +946,11 @@ impl UnifiedSigner {
                 tracing::trace!("Bunker {} not in cache, checking database", bunker_pubkey);
 
                 // Query database for OAuth authorization with this bunker pubkey
+                // Include revoked/expired to support tombstone error responses
                 let auth_opt = sqlx::query_as::<_, OAuthAuthorization>(
                     r#"
                     SELECT * FROM oauth_authorizations
                     WHERE bunker_public_key = $1
-                      AND revoked_at IS NULL
-                      AND (expires_at IS NULL OR expires_at > NOW())
                     "#,
                 )
                 .bind(bunker_pubkey)
@@ -863,8 +959,18 @@ impl UnifiedSigner {
 
                 match auth_opt {
                     Some(auth) => {
-                        // Found in database - load it now
-                        tracing::debug!("Loading authorization on-demand: {}", bunker_pubkey);
+                        // Compute status from database fields (revoked/expired/active)
+                        let (status, tombstone_at) = Nip46Handler::compute_status_from_oauth(&auth);
+
+                        if status == HandlerStatus::Active {
+                            tracing::debug!("Loading authorization on-demand: {}", bunker_pubkey);
+                        } else {
+                            tracing::debug!(
+                                "Loading tombstone authorization on-demand: {} (status: {:?})",
+                                bunker_pubkey,
+                                status
+                            );
+                        }
 
                         // Get user's key from personal_keys table (single source of truth)
                         // Must load this first - needed for HKDF bunker key derivation
@@ -901,6 +1007,8 @@ impl UnifiedSigner {
                             tenant_id: auth.tenant_id,
                             is_oauth: true,
                             pool: pool.clone(),
+                            status,
+                            tombstone_at,
                         };
 
                         // Cache it for future requests (LRU will evict old entries automatically)
@@ -918,26 +1026,53 @@ impl UnifiedSigner {
                         );
 
                         // Query regular authorizations table (team bunkers)
-                        let auth_data: Option<(i32, String, i32, i64)> = sqlx::query_as(
-                            r#"SELECT id, secret_hash, stored_key_id, tenant_id
+                        // Include expired to support tombstone error responses
+                        // Note: Team authorizations use hard-delete (no revoked_at), only expires_at
+                        #[allow(clippy::type_complexity)]
+                        let auth_data: Option<(
+                            i32,
+                            String,
+                            i32,
+                            i64,
+                            Option<DateTime<Utc>>,
+                        )> = sqlx::query_as(
+                            r#"SELECT id, secret_hash, stored_key_id, tenant_id, expires_at
                                FROM authorizations
-                               WHERE bunker_public_key = $1
-                                 AND (expires_at IS NULL OR expires_at > NOW())"#,
+                               WHERE bunker_public_key = $1"#,
                         )
                         .bind(bunker_pubkey)
                         .fetch_optional(pool)
                         .await?;
 
                         match auth_data {
-                            Some((auth_id, secret_hash, stored_key_id, tenant_id)) => {
-                                tracing::debug!(
-                                    "Loading team authorization on-demand: {}",
-                                    bunker_pubkey
-                                );
+                            Some((auth_id, secret_hash, stored_key_id, tenant_id, expires_at)) => {
+                                // Compute status from expires_at (team auths don't have revoked_at)
+                                let (status, tombstone_at) = if let Some(exp) = expires_at {
+                                    if exp <= Utc::now() {
+                                        (HandlerStatus::Expired, Some(exp))
+                                    } else {
+                                        (HandlerStatus::Active, None)
+                                    }
+                                } else {
+                                    (HandlerStatus::Active, None)
+                                };
+
+                                if status == HandlerStatus::Active {
+                                    tracing::debug!(
+                                        "Loading team authorization on-demand: {}",
+                                        bunker_pubkey
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        "Loading tombstone team authorization on-demand: {} (status: {:?})",
+                                        bunker_pubkey,
+                                        status
+                                    );
+                                }
 
                                 // Load stored_key (team's signing key) first - needed for HKDF derivation
                                 let stored_key_secret: Vec<u8> = sqlx::query_scalar(
-                                    "SELECT secret_key FROM stored_keys WHERE id = $1 AND tenant_id = $2"
+                                    "SELECT secret_key FROM stored_keys WHERE id = $1 AND tenant_id = $2",
                                 )
                                 .bind(stored_key_id)
                                 .bind(tenant_id)
@@ -972,6 +1107,8 @@ impl UnifiedSigner {
                                     tenant_id,
                                     is_oauth: false,
                                     pool: pool.clone(),
+                                    status,
+                                    tombstone_at,
                                 };
 
                                 // Cache it for future requests
@@ -1054,6 +1191,56 @@ impl UnifiedSigner {
             .as_str()
             .ok_or(SignerError::MissingParameter("method"))?;
         let request_id = request["id"].clone(); // Extract request ID for response
+
+        // Check for tombstone status - send error response instead of processing
+        if let Some(error_message) = handler.tombstone_error_message() {
+            tracing::info!(
+                "Sending tombstone error response for {}: {}",
+                bunker_pubkey,
+                error_message
+            );
+            METRICS.inc_nip46_tombstone_response();
+
+            let response = serde_json::json!({
+                "id": request_id,
+                "error": error_message
+            });
+
+            // Encrypt and send error response (CPU-bound, use spawn_blocking)
+            let response_str = response.to_string();
+            let encrypted_response = {
+                let secret = bunker_secret.clone();
+                let pubkey = event.pubkey;
+                let text = response_str.clone();
+                let use_44 = use_nip44;
+                tokio::task::spawn_blocking(move || {
+                    if use_44 {
+                        nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
+                            .map_err(SignerError::from)
+                    } else {
+                        nip04::encrypt(&secret, &pubkey, &text).map_err(SignerError::from)
+                    }
+                })
+                .await
+                .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
+            };
+
+            let response_event = {
+                let keys = handler.bunker_keys.clone();
+                let content = encrypted_response;
+                let sender = event.pubkey;
+                tokio::task::spawn_blocking(move || {
+                    EventBuilder::new(Kind::NostrConnect, content)
+                        .tags(vec![Tag::public_key(sender)])
+                        .sign_with_keys(&keys)
+                })
+                .await
+                .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))?
+            }?;
+
+            client.send_event(&response_event).await?;
+            return Ok(());
+        }
 
         tracing::info!("Processing NIP-46 method: {}", method);
 
@@ -1728,6 +1915,8 @@ mod tests {
             tenant_id: 1,
             is_oauth: true,
             pool,
+            status: HandlerStatus::Active,
+            tombstone_at: None,
         }
     }
 
@@ -1845,6 +2034,8 @@ mod tests {
             tenant_id: 1,
             is_oauth: true,
             pool: pool.clone(),
+            status: HandlerStatus::Active,
+            tombstone_at: None,
         };
         handlers1.insert("test_key".to_string(), test_handler).await;
 

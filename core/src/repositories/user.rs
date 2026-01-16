@@ -995,20 +995,18 @@ impl UserRepository {
         let mut tx = self.pool.begin().await?;
 
         // Count teams for logging
-        let teams_removed: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM team_users WHERE user_pubkey = $1",
-        )
-        .bind(pubkey)
-        .fetch_one(&mut *tx)
-        .await?;
+        let teams_removed: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM team_users WHERE user_pubkey = $1")
+                .bind(pubkey)
+                .fetch_one(&mut *tx)
+                .await?;
 
         // Count OAuth authorizations for logging
-        let oauth_authorizations_deleted: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM oauth_authorizations WHERE user_pubkey = $1",
-        )
-        .bind(pubkey)
-        .fetch_one(&mut *tx)
-        .await?;
+        let oauth_authorizations_deleted: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM oauth_authorizations WHERE user_pubkey = $1")
+                .bind(pubkey)
+                .fetch_one(&mut *tx)
+                .await?;
 
         // Get bunker pubkeys for signer daemon notification (before deletion)
         let bunker_pubkeys: Vec<String> = sqlx::query_scalar(
