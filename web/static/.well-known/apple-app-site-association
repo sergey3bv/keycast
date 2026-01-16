@@ -16,12 +16,28 @@
             "comment": "OAuth callback with path params"
           }
         ]
+      },
+      {
+        "appIDs": [
+          "GZCZBKH7MY.co.openvine.app"
+        ],
+        "components": [
+          {
+            "/": "/app/callback",
+            "comment": "OAuth callback for Divine app"
+          },
+          {
+            "/": "/app/callback/*",
+            "comment": "OAuth callback with path params"
+          }
+        ]
       }
     ]
   },
   "webcredentials": {
     "apps": [
-      "GZCZBKH7MY.co.openvine.keycastFlutterDemo"
+      "GZCZBKH7MY.co.openvine.keycastFlutterDemo",
+      "GZCZBKH7MY.co.openvine.app"
     ]
   }
 }
