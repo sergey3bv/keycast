@@ -253,6 +253,76 @@ pub async fn preload_user(
     }))
 }
 
+// ============================================================================
+// POST /api/admin/user-token - Get signing token for existing preloaded user
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct UserTokenRequest {
+    pub pubkey: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UserTokenResponse {
+    pub token: String,
+}
+
+/// Get a signing token for an existing preloaded (unclaimed) user.
+/// Requires admin authentication. Only works for users who have not claimed their account.
+pub async fn get_user_token(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    UcanAuth(admin_pubkey_hex): UcanAuth,
+    Json(req): Json<UserTokenRequest>,
+) -> ApiResult<Json<UserTokenResponse>> {
+    let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+
+    // Check if caller is admin
+    if !is_admin_pubkey(&admin_pubkey_hex) {
+        tracing::warn!(
+            "User token request denied for non-whitelisted pubkey: {}",
+            &admin_pubkey_hex[..8]
+        );
+        return Err(ApiError::forbidden("Admin access required"));
+    }
+
+    // Validate pubkey format
+    let user_pubkey = nostr_sdk::PublicKey::from_hex(&req.pubkey)
+        .map_err(|e| ApiError::bad_request(format!("Invalid pubkey: {}", e)))?;
+
+    // Check user exists and is unclaimed
+    let user_repo = UserRepository::new(pool.clone());
+    let is_unclaimed = user_repo.is_unclaimed(&req.pubkey, tenant_id).await?;
+
+    match is_unclaimed {
+        None => {
+            return Err(ApiError::not_found(format!(
+                "User with pubkey {} not found",
+                &req.pubkey[..8]
+            )));
+        }
+        Some(false) => {
+            return Err(ApiError::forbidden(
+                "Cannot generate token for claimed user",
+            ));
+        }
+        Some(true) => {} // User exists and is unclaimed, proceed
+    }
+
+    // Generate signing token
+    let server_keys = get_server_keys()?;
+    let token = generate_preload_ucan(&user_pubkey, tenant_id, &server_keys).await?;
+
+    tracing::info!(
+        "User token generated for pubkey: {} by admin: {}",
+        &req.pubkey[..8],
+        &admin_pubkey_hex[..8]
+    );
+
+    Ok(Json(UserTokenResponse { token }))
+}
+
 /// Generate UCAN for preloaded user signing (server-signed, for user's pubkey)
 async fn generate_preload_ucan(
     user_pubkey: &nostr_sdk::PublicKey,

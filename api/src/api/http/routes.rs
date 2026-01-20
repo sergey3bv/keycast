@@ -148,6 +148,7 @@ pub fn api_routes(
         .route("/admin/status", get(admin::get_admin_status))
         .route("/admin/token", get(admin::get_admin_token))
         .route("/admin/preload-user", post(admin::preload_user))
+        .route("/admin/user-token", post(admin::get_user_token))
         .route("/admin/claim-tokens", post(admin::create_claim_token))
         .layer(auth_cors.clone())
         .with_state(auth_state.clone());
