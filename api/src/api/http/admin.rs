@@ -175,22 +175,37 @@ pub async fn preload_user(
         return Err(ApiError::forbidden("Admin access required"));
     }
 
-    // Check if vine_id already exists
+    // Get server keys early since we need them for both existing and new user paths
+    let server_keys = get_server_keys()?;
+
+    // Check if vine_id already exists - return existing user if found (idempotent)
     let user_repo = UserRepository::new(pool.clone());
-    if let Some(_existing) = user_repo
+    if let Some(existing_pubkey) = user_repo
         .find_pubkey_by_vine_id(&req.vine_id, tenant_id)
         .await?
     {
-        return Err(ApiError::conflict(format!(
-            "User with vine_id {} already exists",
-            req.vine_id
-        )));
+        let existing_user_pubkey = nostr_sdk::PublicKey::from_hex(&existing_pubkey)
+            .map_err(|e| ApiError::Internal(format!("Invalid stored pubkey: {}", e)))?;
+
+        let token = generate_preload_ucan(&existing_user_pubkey, tenant_id, &server_keys).await?;
+
+        tracing::info!(
+            "Returning existing preloaded user for vine_id '{}': {}",
+            req.vine_id,
+            &existing_pubkey[..8]
+        );
+
+        return Ok(Json(PreloadUserResponse {
+            pubkey: existing_pubkey,
+            token,
+        }));
     }
 
-    // Check if username already exists
-    if let Some(_existing) = user_repo
+    // Check if username already exists (different vine_id but same username)
+    if user_repo
         .find_pubkey_by_username(&req.username, tenant_id)
         .await?
+        .is_some()
     {
         return Err(ApiError::conflict(format!(
             "User with username {} already exists",
@@ -223,7 +238,6 @@ pub async fn preload_user(
         .await?;
 
     // Generate signing token for this user (server-signed UCAN)
-    let server_keys = get_server_keys()?;
     let token = generate_preload_ucan(&pubkey, tenant_id, &server_keys).await?;
 
     tracing::info!(
