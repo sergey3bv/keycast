@@ -48,8 +48,8 @@ fn inject_runtime_env(html: &str) -> String {
     // Build runtime environment object
     let mut env_obj = json!({});
 
-    // VITE_DOMAIN - API domain for frontend
-    if let Ok(domain) = env::var("VITE_DOMAIN") {
+    // VITE_DOMAIN - API domain for frontend (from APP_URL)
+    if let Ok(domain) = env::var("APP_URL") {
         env_obj["VITE_DOMAIN"] = json!(domain);
     }
 
@@ -816,7 +816,7 @@ mod tests {
 </html>"#;
 
         // Set environment variables
-        std::env::set_var("VITE_DOMAIN", "https://example.com");
+        std::env::set_var("APP_URL", "https://example.com");
         std::env::set_var("VITE_ALLOWED_PUBKEYS", "pubkey1,pubkey2");
 
         let result = inject_runtime_env(html);
@@ -830,7 +830,7 @@ mod tests {
         assert!(result.contains("</head>"));
 
         // Clean up
-        std::env::remove_var("VITE_DOMAIN");
+        std::env::remove_var("APP_URL");
         std::env::remove_var("VITE_ALLOWED_PUBKEYS");
     }
 
@@ -844,7 +844,7 @@ mod tests {
 </body>
 </html>"#;
 
-        std::env::set_var("VITE_DOMAIN", "https://example.com");
+        std::env::set_var("APP_URL", "https://example.com");
 
         let result = inject_runtime_env(html);
 
@@ -852,7 +852,7 @@ mod tests {
         assert!(result.contains("window.__ENV__"));
         assert!(result.contains("<body>"));
 
-        std::env::remove_var("VITE_DOMAIN");
+        std::env::remove_var("APP_URL");
     }
 
     #[test]
@@ -869,7 +869,7 @@ mod tests {
 </html>"#;
 
         // Clear all env vars that might be set from other tests
-        std::env::remove_var("VITE_DOMAIN");
+        std::env::remove_var("APP_URL");
         std::env::remove_var("VITE_ALLOWED_PUBKEYS");
         std::env::remove_var("VITE_NDK_EXPLICIT_RELAYS");
         std::env::remove_var("VITE_NDK_BUNKER_RELAYS");
@@ -894,7 +894,7 @@ mod tests {
 </body>
 </html>"#;
 
-        std::env::set_var("VITE_DOMAIN", "https://example.com");
+        std::env::set_var("APP_URL", "https://example.com");
         std::env::set_var("VITE_ALLOWED_PUBKEYS", "key1,key2");
         std::env::set_var(
             "VITE_NDK_EXPLICIT_RELAYS",
@@ -909,7 +909,7 @@ mod tests {
         assert!(result.contains("VITE_NDK_EXPLICIT_RELAYS"));
         assert!(result.contains("VITE_NDK_BUNKER_RELAYS"));
 
-        std::env::remove_var("VITE_DOMAIN");
+        std::env::remove_var("APP_URL");
         std::env::remove_var("VITE_ALLOWED_PUBKEYS");
         std::env::remove_var("VITE_NDK_EXPLICIT_RELAYS");
         std::env::remove_var("VITE_NDK_BUNKER_RELAYS");
