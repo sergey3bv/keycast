@@ -4,7 +4,7 @@
 use nostr_sdk::prelude::*;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_NAME_SERVER_URL: &str = "https://names.divine.video";
@@ -97,17 +97,20 @@ pub async fn claim_username(
         name: username.to_string(),
         relays,
     };
-    let body_json = serde_json::to_string(&body)
-        .map_err(|e| DivineNameError::ResponseError(e.to_string()))?;
+    let body_json =
+        serde_json::to_string(&body).map_err(|e| DivineNameError::ResponseError(e.to_string()))?;
 
     // Create NIP-98 auth event
     let auth_event = create_nip98_event(keys, &url, "POST", &body_json).await?;
     let auth_json = serde_json::to_string(&auth_event)
         .map_err(|e| DivineNameError::SigningError(e.to_string()))?;
-    let auth_header = format!("Nostr {}", base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        auth_json.as_bytes()
-    ));
+    let auth_header = format!(
+        "Nostr {}",
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            auth_json.as_bytes()
+        )
+    );
 
     // Make HTTP request
     let client = Client::new();
@@ -123,15 +126,18 @@ pub async fn claim_username(
     let response_text = response.text().await?;
 
     // Parse response
-    let claim_response: ClaimResponse = serde_json::from_str(&response_text)
-        .map_err(|e| DivineNameError::ResponseError(format!(
+    let claim_response: ClaimResponse = serde_json::from_str(&response_text).map_err(|e| {
+        DivineNameError::ResponseError(format!(
             "Failed to parse response: {}. Status: {}, Body: {}",
             e, status, response_text
-        )))?;
+        ))
+    })?;
 
     if !claim_response.ok {
         return Err(DivineNameError::ClaimError(
-            claim_response.error.unwrap_or_else(|| "Unknown error".to_string())
+            claim_response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string()),
         ));
     }
 
@@ -140,8 +146,10 @@ pub async fn claim_username(
 
 /// Check if divine name server integration is enabled
 pub fn is_enabled() -> bool {
-    std::env::var("DIVINE_NAME_SERVER_URL").is_ok() ||
-    std::env::var("ENABLE_DIVINE_NAMES").map(|v| v == "true" || v == "1").unwrap_or(false)
+    std::env::var("DIVINE_NAME_SERVER_URL").is_ok()
+        || std::env::var("ENABLE_DIVINE_NAMES")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false)
 }
 
 /// Response from the availability check endpoint
@@ -166,26 +174,31 @@ pub struct AvailabilityResponse {
 pub async fn check_availability(username: &str) -> Result<(bool, Option<String>), DivineNameError> {
     let base_url = std::env::var("DIVINE_NAME_SERVER_URL")
         .unwrap_or_else(|_| DEFAULT_NAME_SERVER_URL.to_string());
-    let url = format!("{}/api/username/check/{}", base_url.trim_end_matches('/'), username);
+    let url = format!(
+        "{}/api/username/check/{}",
+        base_url.trim_end_matches('/'),
+        username
+    );
 
     let client = Client::new();
-    let response = client
-        .get(&url)
-        .send()
-        .await?;
+    let response = client.get(&url).send().await?;
 
     let status = response.status();
     let response_text = response.text().await?;
 
-    let check_response: AvailabilityResponse = serde_json::from_str(&response_text)
-        .map_err(|e| DivineNameError::ResponseError(format!(
-            "Failed to parse availability response: {}. Status: {}, Body: {}",
-            e, status, response_text
-        )))?;
+    let check_response: AvailabilityResponse =
+        serde_json::from_str(&response_text).map_err(|e| {
+            DivineNameError::ResponseError(format!(
+                "Failed to parse availability response: {}. Status: {}, Body: {}",
+                e, status, response_text
+            ))
+        })?;
 
     if !check_response.ok {
         return Err(DivineNameError::ResponseError(
-            check_response.error.unwrap_or_else(|| "Unknown error".to_string())
+            check_response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string()),
         ));
     }
 
@@ -212,29 +225,36 @@ pub struct PubkeyLookupResponse {
 }
 
 /// Look up a username by pubkey on divine-name-server (no auth required)
-pub async fn lookup_by_pubkey(pubkey: &str) -> Result<Option<PubkeyLookupResponse>, DivineNameError> {
+pub async fn lookup_by_pubkey(
+    pubkey: &str,
+) -> Result<Option<PubkeyLookupResponse>, DivineNameError> {
     let base_url = std::env::var("DIVINE_NAME_SERVER_URL")
         .unwrap_or_else(|_| DEFAULT_NAME_SERVER_URL.to_string());
-    let url = format!("{}/api/username/by-pubkey/{}", base_url.trim_end_matches('/'), pubkey);
+    let url = format!(
+        "{}/api/username/by-pubkey/{}",
+        base_url.trim_end_matches('/'),
+        pubkey
+    );
 
     let client = Client::new();
-    let response = client
-        .get(&url)
-        .send()
-        .await?;
+    let response = client.get(&url).send().await?;
 
     let status = response.status();
     let response_text = response.text().await?;
 
-    let lookup_response: PubkeyLookupResponse = serde_json::from_str(&response_text)
-        .map_err(|e| DivineNameError::ResponseError(format!(
-            "Failed to parse lookup response: {}. Status: {}, Body: {}",
-            e, status, response_text
-        )))?;
+    let lookup_response: PubkeyLookupResponse =
+        serde_json::from_str(&response_text).map_err(|e| {
+            DivineNameError::ResponseError(format!(
+                "Failed to parse lookup response: {}. Status: {}, Body: {}",
+                e, status, response_text
+            ))
+        })?;
 
     if !lookup_response.ok {
         return Err(DivineNameError::ResponseError(
-            lookup_response.error.unwrap_or_else(|| "Unknown error".to_string())
+            lookup_response
+                .error
+                .unwrap_or_else(|| "Unknown error".to_string()),
         ));
     }
 

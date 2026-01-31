@@ -1801,10 +1801,7 @@ pub async fn update_profile(
     if let Some(ref username) = profile.username {
         // Validate username (alphanumeric, dash, underscore only - matches divine-name-server ASCII rules)
         // Note: divine-name-server also supports Unicode/IDN but we keep keycast validation simple
-        if !username
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-')
-        {
+        if !username.chars().all(|c| c.is_alphanumeric() || c == '-') {
             return Err(AuthError::Internal(
                 "Username can only contain letters, numbers, and hyphens".to_string(),
             ));
@@ -1822,7 +1819,9 @@ pub async fn update_profile(
             match crate::divine_names::check_availability(username).await {
                 Ok((available, reason)) => {
                     if !available {
-                        let error_msg = reason.unwrap_or_else(|| "Username is not available on divine.video".to_string());
+                        let error_msg = reason.unwrap_or_else(|| {
+                            "Username is not available on divine.video".to_string()
+                        });
                         tracing::info!(
                             "Username '{}' not available on divine-name-server: {}",
                             username,
@@ -1861,7 +1860,9 @@ pub async fn update_profile(
                 .await
             {
                 if let Ok(decrypted_secret) = key_manager.decrypt(&encrypted_secret).await {
-                    if let Ok(secret_key) = nostr_sdk::secp256k1::SecretKey::from_slice(&decrypted_secret) {
+                    if let Ok(secret_key) =
+                        nostr_sdk::secp256k1::SecretKey::from_slice(&decrypted_secret)
+                    {
                         let keys = Keys::new(secret_key.into());
 
                         // Claim username on divine-name-server

@@ -54,10 +54,12 @@ async fn setup_db() -> PgPool {
         .ok();
 
     // Reset tenant sequence to ensure no conflicts
-    sqlx::query("SELECT setval('tenants_id_seq', (SELECT COALESCE(MAX(id), 1) FROM tenants), true)")
-        .execute(&pool)
-        .await
-        .ok();
+    sqlx::query(
+        "SELECT setval('tenants_id_seq', (SELECT COALESCE(MAX(id), 1) FROM tenants), true)",
+    )
+    .execute(&pool)
+    .await
+    .ok();
 
     pool
 }
