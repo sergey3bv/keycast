@@ -237,6 +237,25 @@ pub async fn preload_user(
         )
         .await?;
 
+    // Claim username on divine-name-server (best-effort, don't fail preload)
+    if crate::divine_names::is_enabled() {
+        match crate::divine_names::claim_username(&keys, &req.username, None).await {
+            Ok(response) if response.ok => {
+                tracing::info!("Username '{}' claimed on divine-name-server", req.username);
+            }
+            Ok(response) => {
+                tracing::warn!(
+                    "Username '{}' claim failed: {}",
+                    req.username,
+                    response.error.unwrap_or_default()
+                );
+            }
+            Err(e) => {
+                tracing::warn!("divine-name-server error for '{}': {}", req.username, e);
+            }
+        }
+    }
+
     // Generate signing token for this user (server-signed UCAN)
     let token = generate_preload_ucan(&pubkey, tenant_id, &server_keys).await?;
 
