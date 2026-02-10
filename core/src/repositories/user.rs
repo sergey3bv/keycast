@@ -15,6 +15,7 @@ pub struct VerificationTokenData {
     pub email_verification_expires_at: Option<DateTime<Utc>>,
     pub password_hash: Option<String>,
     pub created_at: DateTime<Utc>,
+    pub email_verified: bool,
 }
 
 /// Repository for user-related database operations.
@@ -337,7 +338,7 @@ impl UserRepository {
         tenant_id: i64,
     ) -> Result<Option<VerificationTokenData>, RepositoryError> {
         sqlx::query_as(
-            "SELECT pubkey, email_verification_expires_at, password_hash, created_at FROM users
+            "SELECT pubkey, email_verification_expires_at, password_hash, created_at, email_verified FROM users
              WHERE email_verification_token = $1 AND tenant_id = $2",
         )
         .bind(token)
@@ -351,7 +352,7 @@ impl UserRepository {
     pub async fn verify_email(&self, pubkey: &str, tenant_id: i64) -> Result<(), RepositoryError> {
         sqlx::query(
             "UPDATE users
-             SET email_verified = true, email_verification_token = NULL, email_verification_expires_at = NULL, updated_at = $1
+             SET email_verified = true, updated_at = $1
              WHERE pubkey = $2 AND tenant_id = $3",
         )
         .bind(Utc::now())

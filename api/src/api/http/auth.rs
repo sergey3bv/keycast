@@ -1331,6 +1331,22 @@ pub async fn verify_email(
 
     let public_key = token_data.pubkey;
 
+    // Already verified (e.g. user clicked the link again) - show success
+    if token_data.email_verified {
+        return Ok((
+            axum::http::StatusCode::OK,
+            axum::Json(VerifyEmailResponse {
+                success: true,
+                message: "Your email is already verified. You can log in.".to_string(),
+                redirect_to: None,
+                authenticated: None,
+                status: None,
+                retry_after: None,
+            }),
+        )
+            .into_response());
+    }
+
     // Check if token is expired
     if let Some(expires) = token_data.email_verification_expires_at {
         if expires < Utc::now() {
@@ -1382,7 +1398,7 @@ pub async fn verify_email(
             .into_response());
     }
 
-    // Mark email as verified and clear verification token
+    // Mark email as verified (token kept for idempotent re-verification)
     user_repo.verify_email(&public_key, tenant_id).await?;
 
     // Get user's email for UCAN

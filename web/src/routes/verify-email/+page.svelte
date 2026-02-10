@@ -110,7 +110,7 @@
 				}
 				console.error('Verification error:', err);
 				status = 'error';
-				message = err.message || 'Verification failed. The link may have expired.';
+				message = err.message || 'Verification failed. If you have already verified your email, you can log in.';
 				return;
 			}
 		}
