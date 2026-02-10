@@ -33,6 +33,15 @@ impl GcpKeyManager {
 
         let key_name = env::var("GCP_KMS_KEY_NAME").unwrap_or_else(|_| "master-key".to_string());
 
+        Self::from_config(&project_id, &location, &key_ring, &key_name).await
+    }
+
+    pub async fn from_config(
+        project_id: &str,
+        location: &str,
+        key_ring: &str,
+        key_name: &str,
+    ) -> Result<Self, KeyManagerError> {
         info!("Initializing Google Cloud KMS client");
         debug!(
             "Project: {}, Location: {}, Key Ring: {}, Key: {}",

@@ -13,6 +13,7 @@
 //   TENANT_ID (default: 1)
 //   DRY_RUN (default: true)
 //   CONCURRENCY (default: 20) - number of parallel KMS operations
+//   LIMIT (default: 0 = unlimited) - max users to migrate
 
 use keycast_core::encryption::gcp_key_manager::GcpKeyManager;
 use keycast_core::encryption::KeyManager;
@@ -24,10 +25,39 @@ use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use zeroize::Zeroizing;
 
 fn required_env(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("{} is required", name))
+}
+
+async fn validate_schema(
+    pool: &sqlx::PgPool,
+    label: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let required_tables = ["users", "personal_keys"];
+    for table in &required_tables {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = $1
+            )",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await?;
+
+        if !exists {
+            return Err(format!(
+                "{} database is missing required table '{}'. Run migrations first.",
+                label, table
+            )
+            .into());
+        }
+    }
+    println!("{} schema validated (users, personal_keys present)", label);
+    Ok(())
 }
 
 struct SourceUser {
@@ -58,6 +88,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "20".to_string())
         .parse()
         .expect("CONCURRENCY must be a number");
+    let limit: usize = env::var("LIMIT")
+        .unwrap_or_else(|_| "0".to_string())
+        .parse()
+        .expect("LIMIT must be a number");
 
     if dry_run {
         println!("** DRY RUN MODE - no writes will be made **");
@@ -110,6 +144,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Target DB connected");
     println!();
 
+    // Validate both databases have required tables
+    validate_schema(&source_pool, "Source").await?;
+    validate_schema(target_pool.as_ref(), "Target").await?;
+    println!();
+
     // Query all users with personal keys from source
     println!("Querying source users (tenant_id={})...", tenant_id);
     let rows = sqlx::query(
@@ -125,7 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .fetch_all(&source_pool)
     .await?;
 
-    let users: Vec<SourceUser> = rows
+    let mut users: Vec<SourceUser> = rows
         .iter()
         .map(|row| SourceUser {
             pubkey: row.get("pubkey"),
@@ -142,19 +181,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
+    println!("Found {} users with personal keys", users.len());
+    if limit > 0 && limit < users.len() {
+        users.truncate(limit);
+        println!("Limited to {} users", limit);
+    }
     let total = users.len();
-    println!("Found {} users with personal keys", total);
+    println!();
+
+    // Canary: test KMS on the first user before spawning the batch
+    println!("--- Canary Check ---");
+    let canary = &users[0];
+    let canary_label = canary
+        .username
+        .as_deref()
+        .or(canary.email.as_deref())
+        .unwrap_or(&canary.pubkey[..8]);
+    println!("Testing source KMS decrypt on {}...", canary_label);
+    let canary_plaintext = source_kms.decrypt(&canary.encrypted_secret_key).await?;
+    println!("Source KMS decrypt OK ({} bytes)", canary_plaintext.len());
+    if !dry_run {
+        println!("Testing target KMS round-trip...");
+        let canary_ct = target_kms.encrypt(&canary_plaintext).await?;
+        let canary_rt = target_kms.decrypt(&canary_ct).await?;
+        assert_eq!(&*canary_plaintext, &*canary_rt, "KMS round-trip mismatch");
+        println!("Target KMS round-trip OK");
+    }
     println!();
 
     let migrated = Arc::new(AtomicU64::new(0));
     let skipped = Arc::new(AtomicU64::new(0));
-    let failed = Arc::new(AtomicU64::new(0));
     let processed = Arc::new(AtomicU64::new(0));
     let sem = Arc::new(Semaphore::new(concurrency));
 
-    // Migration pass
+    // Migration pass using JoinSet for abort-on-failure
     println!("--- Migration Pass ---");
-    let mut handles = Vec::with_capacity(total);
+    let mut tasks = JoinSet::new();
 
     for user in users {
         let permit = sem.clone().acquire_owned().await?;
@@ -163,10 +225,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let target_pool = target_pool.clone();
         let migrated = migrated.clone();
         let skipped = skipped.clone();
-        let failed = failed.clone();
         let processed = processed.clone();
 
-        let handle = tokio::spawn(async move {
+        tasks.spawn(async move {
             let _permit = permit;
             let label = user
                 .username
@@ -175,79 +236,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(&user.pubkey[..8]);
 
             // Check if user already exists in target (idempotent)
-            let exists: bool = match sqlx::query_scalar(
+            let exists: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM users WHERE pubkey = $1 AND tenant_id = $2)",
             )
             .bind(&user.pubkey)
             .bind(user.tenant_id)
             .fetch_one(target_pool.as_ref())
             .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    let n = processed.fetch_add(1, Ordering::Relaxed) + 1;
-                    println!("[{}/{}] {} ... FAIL (db check: {})", n, total, label, e);
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-            };
+            .map_err(|e| format!("[{}] FAIL (db check: {})", label, e))?;
 
             if exists {
                 let n = processed.fetch_add(1, Ordering::Relaxed) + 1;
                 println!("[{}/{}] {} ... SKIP", n, total, label);
                 skipped.fetch_add(1, Ordering::Relaxed);
-                return;
+                return Ok(());
             }
 
             // Decrypt with source KMS
-            let plaintext: Zeroizing<Vec<u8>> =
-                match source_kms.decrypt(&user.encrypted_secret_key).await {
-                    Ok(pt) => pt,
-                    Err(e) => {
-                        let n = processed.fetch_add(1, Ordering::Relaxed) + 1;
-                        println!(
-                            "[{}/{}] {} ... FAIL (source decrypt: {})",
-                            n, total, label, e
-                        );
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                };
+            let plaintext: Zeroizing<Vec<u8>> = source_kms
+                .decrypt(&user.encrypted_secret_key)
+                .await
+                .map_err(|e| format!("[{}] FAIL (source decrypt: {})", label, e))?;
 
             if dry_run {
                 let n = processed.fetch_add(1, Ordering::Relaxed) + 1;
                 println!("[{}/{}] {} ... OK (dry run)", n, total, label);
                 migrated.fetch_add(1, Ordering::Relaxed);
-                return;
+                return Ok(());
             }
 
             // Re-encrypt with target KMS
-            let target_ciphertext = match target_kms.encrypt(&plaintext).await {
-                Ok(ct) => ct,
-                Err(e) => {
-                    let n = processed.fetch_add(1, Ordering::Relaxed) + 1;
-                    println!(
-                        "[{}/{}] {} ... FAIL (target encrypt: {})",
-                        n, total, label, e
-                    );
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-            };
+            let target_ciphertext = target_kms
+                .encrypt(&plaintext)
+                .await
+                .map_err(|e| format!("[{}] FAIL (target encrypt: {})", label, e))?;
 
             // Atomic insert: user + personal_key in a transaction
-            let tx = match target_pool.begin().await {
-                Ok(tx) => tx,
-                Err(e) => {
-                    let n = processed.fetch_add(1, Ordering::Relaxed) + 1;
-                    println!("[{}/{}] {} ... FAIL (begin tx: {})", n, total, label, e);
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-            };
-            let mut tx = tx;
+            let mut tx = target_pool
+                .begin()
+                .await
+                .map_err(|e| format!("[{}] FAIL (begin tx: {})", label, e))?;
 
-            if let Err(e) = sqlx::query(
+            sqlx::query(
                 "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified,
                                     username, display_name, vine_id, created_at, updated_at)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
@@ -264,15 +294,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .bind(user.updated_at)
             .execute(&mut *tx)
             .await
-            {
-                let n = processed.fetch_add(1, Ordering::Relaxed) + 1;
-                println!("[{}/{}] {} ... FAIL (insert user: {})", n, total, label, e);
-                let _ = tx.rollback().await;
-                failed.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
+            .map_err(|e| format!("[{}] FAIL (insert user: {})", label, e))?;
 
-            if let Err(e) = sqlx::query(
+            sqlx::query(
                 "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
                  VALUES ($1, $2, $3, $4, $5)",
             )
@@ -283,45 +307,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .bind(user.updated_at)
             .execute(&mut *tx)
             .await
-            {
-                let n = processed.fetch_add(1, Ordering::Relaxed) + 1;
-                println!(
-                    "[{}/{}] {} ... FAIL (insert key: {})",
-                    n, total, label, e
-                );
-                let _ = tx.rollback().await;
-                failed.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
+            .map_err(|e| format!("[{}] FAIL (insert key: {})", label, e))?;
 
-            if let Err(e) = tx.commit().await {
-                let n = processed.fetch_add(1, Ordering::Relaxed) + 1;
-                println!("[{}/{}] {} ... FAIL (commit: {})", n, total, label, e);
-                failed.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
+            tx.commit()
+                .await
+                .map_err(|e| format!("[{}] FAIL (commit: {})", label, e))?;
 
             let n = processed.fetch_add(1, Ordering::Relaxed) + 1;
             println!("[{}/{}] {} ... OK", n, total, label);
             migrated.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         });
-        handles.push(handle);
     }
 
-    for h in handles {
-        let _ = h.await;
+    // Drain tasks, abort all on first failure
+    let mut abort_reason: Option<String> = None;
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(msg)) => {
+                println!("{}", msg);
+                abort_reason = Some(msg);
+                tasks.abort_all();
+                break;
+            }
+            Err(e) if e.is_cancelled() => {}
+            Err(e) => {
+                abort_reason = Some(format!("task panicked: {}", e));
+                tasks.abort_all();
+                break;
+            }
+        }
     }
 
     let migrated_val = migrated.load(Ordering::Relaxed);
     let skipped_val = skipped.load(Ordering::Relaxed);
-    let failed_val = failed.load(Ordering::Relaxed);
 
     println!();
     println!("--- Migration Summary ---");
     println!("Total:    {}", total);
     println!("Migrated: {}", migrated_val);
     println!("Skipped:  {}", skipped_val);
-    println!("Failed:   {}", failed_val);
+    if let Some(reason) = &abort_reason {
+        println!("ABORTED:  {}", reason);
+        std::process::exit(1);
+    }
 
     if dry_run {
         println!();
@@ -329,7 +359,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Verification pass (parallel)
+    // Verification pass
     if migrated_val > 0 {
         println!();
         println!("--- Verification Pass ---");
@@ -350,7 +380,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let verify_failed = Arc::new(AtomicU64::new(0));
         let verify_done = Arc::new(AtomicU64::new(0));
 
-        let mut vhandles = Vec::with_capacity(verify_total);
+        let mut vtasks = JoinSet::new();
 
         for row in target_rows {
             let permit = sem.clone().acquire_owned().await?;
@@ -362,7 +392,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pubkey: String = row.get("pubkey");
             let encrypted: Vec<u8> = row.get("encrypted_secret_key");
 
-            let handle = tokio::spawn(async move {
+            vtasks.spawn(async move {
                 let _permit = permit;
                 match target_kms.decrypt(&encrypted).await {
                     Ok(plaintext) => match SecretKey::from_slice(&plaintext) {
@@ -394,11 +424,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("  verified {}/{}", done, verify_total);
                 }
             });
-            vhandles.push(handle);
         }
 
-        for h in vhandles {
-            let _ = h.await;
+        while let Some(result) = vtasks.join_next().await {
+            if let Err(e) = result {
+                if !e.is_cancelled() {
+                    println!("VERIFY: task panicked: {}", e);
+                }
+            }
         }
 
         let v = verified.load(Ordering::Relaxed);
