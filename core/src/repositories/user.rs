@@ -1038,10 +1038,10 @@ impl UserRepository {
                 Err(_) => return Ok(vec![]),
             }
         } else {
-            // Username: case-insensitive, strip dots and hyphens
+            // Username: case-insensitive, strip dots, hyphens, and underscores
             let by_username: Vec<(String,)> = sqlx::query_as(
                 "SELECT pubkey FROM users
-                 WHERE LOWER(REGEXP_REPLACE(username, '[.\\-]', '', 'g')) = LOWER(REGEXP_REPLACE($1, '[.\\-]', '', 'g'))
+                 WHERE LOWER(REGEXP_REPLACE(username, '[._\\-]', '', 'g')) = LOWER(REGEXP_REPLACE($1, '[._\\-]', '', 'g'))
                    AND tenant_id = $2
                  LIMIT 20",
             )
@@ -1052,8 +1052,46 @@ impl UserRepository {
 
             if !by_username.is_empty() {
                 by_username.into_iter().map(|r| r.0).collect()
+            } else if query.len() >= 3 {
+                // Prefix search fallback (uses B-tree index on LOWER(username))
+                let normalized: String = query
+                    .chars()
+                    .filter(|c| c.is_alphanumeric())
+                    .collect::<String>()
+                    .to_lowercase();
+                let pattern = format!("{}%", normalized);
+                let by_prefix: Vec<(String,)> = sqlx::query_as(
+                    "SELECT pubkey FROM users
+                     WHERE LOWER(REGEXP_REPLACE(username, '[._\\-]', '', 'g')) LIKE $1
+                       AND tenant_id = $2
+                     LIMIT 20",
+                )
+                .bind(&pattern)
+                .bind(tenant_id)
+                .fetch_all(&self.pool)
+                .await?;
+
+                if !by_prefix.is_empty() {
+                    by_prefix.into_iter().map(|r| r.0).collect()
+                } else {
+                    // Vine ID fallback: case-insensitive
+                    let by_vine_id: Vec<(String,)> = sqlx::query_as(
+                        "SELECT pubkey FROM users WHERE LOWER(vine_id) = LOWER($1) AND tenant_id = $2 LIMIT 20",
+                    )
+                    .bind(query)
+                    .bind(tenant_id)
+                    .fetch_all(&self.pool)
+                    .await?;
+
+                    if !by_vine_id.is_empty() {
+                        by_vine_id.into_iter().map(|r| r.0).collect()
+                    } else {
+                        // Hex pubkey fallback
+                        vec![query.to_string()]
+                    }
+                }
             } else {
-                // Vine ID fallback: case-insensitive
+                // Query too short for prefix search, try vine_id and hex pubkey
                 let by_vine_id: Vec<(String,)> = sqlx::query_as(
                     "SELECT pubkey FROM users WHERE LOWER(vine_id) = LOWER($1) AND tenant_id = $2 LIMIT 20",
                 )
