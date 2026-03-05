@@ -205,6 +205,42 @@ pub async fn check_availability(username: &str) -> Result<(bool, Option<String>)
     Ok((check_response.available, check_response.reason))
 }
 
+/// Look up a username via NIP-05 nostr.json on divine-name-server.
+/// Returns the hex pubkey if found, None otherwise.
+pub async fn lookup_by_name(username: &str) -> Result<Option<String>, DivineNameError> {
+    let base_url = std::env::var("DIVINE_NAME_SERVER_URL")
+        .unwrap_or_else(|_| DEFAULT_NAME_SERVER_URL.to_string());
+    let encoded_name = urlencoding::encode(username);
+    let url = format!(
+        "{}/.well-known/nostr.json?name={}",
+        base_url.trim_end_matches('/'),
+        encoded_name
+    );
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()?;
+    let response = client.get(&url).send().await?;
+
+    let status = response.status();
+    let response_text = response.text().await?;
+
+    let parsed: serde_json::Value = serde_json::from_str(&response_text).map_err(|e| {
+        DivineNameError::ResponseError(format!(
+            "Failed to parse nostr.json: {}. Status: {}, Body: {}",
+            e, status, response_text
+        ))
+    })?;
+
+    let pubkey = parsed
+        .get("names")
+        .and_then(|names| names.get(username))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    Ok(pubkey)
+}
+
 /// Response from the by-pubkey lookup endpoint
 #[derive(Debug, Deserialize)]
 pub struct PubkeyLookupResponse {

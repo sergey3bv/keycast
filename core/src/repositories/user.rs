@@ -1016,56 +1016,66 @@ impl UserRepository {
 
     /// Look up a user for admin support tools.
     /// Searches by email (if query contains @), npub, username, vine_id, or hex pubkey.
-    pub async fn find_user_for_admin(
+    /// Search for users matching a query. Returns multiple results for username searches.
+    pub async fn find_users_for_admin(
         &self,
         query: &str,
         tenant_id: i64,
-    ) -> Result<Option<AdminUserDetails>, RepositoryError> {
-        let pubkey_hex = if query.contains('@') {
-            // Search by email, resolve to pubkey first
+    ) -> Result<Vec<AdminUserDetails>, RepositoryError> {
+        let pubkeys: Vec<String> = if query.contains('@') {
+            // Search by email — at most one result
             let result: Option<(String,)> =
                 sqlx::query_as("SELECT pubkey FROM users WHERE email = $1 AND tenant_id = $2")
                     .bind(query.to_lowercase())
                     .bind(tenant_id)
                     .fetch_optional(&self.pool)
                     .await?;
-            match result {
-                Some((pk,)) => pk,
-                None => return Ok(None),
-            }
+            result.into_iter().map(|r| r.0).collect()
         } else if query.starts_with("npub") {
-            // Decode npub to hex
+            // Decode npub to hex — at most one result
             match PublicKey::parse(query) {
-                Ok(pk) => pk.to_hex(),
-                Err(_) => return Ok(None),
+                Ok(pk) => vec![pk.to_hex()],
+                Err(_) => return Ok(vec![]),
             }
         } else {
-            // Try username, then vine_id, then fall through to hex pubkey
-            let by_username: Option<(String,)> =
-                sqlx::query_as("SELECT pubkey FROM users WHERE username = $1 AND tenant_id = $2")
-                    .bind(query)
-                    .bind(tenant_id)
-                    .fetch_optional(&self.pool)
-                    .await?;
-            if let Some((pk,)) = by_username {
-                pk
+            // Username: case-insensitive, strip dots and hyphens
+            let by_username: Vec<(String,)> = sqlx::query_as(
+                "SELECT pubkey FROM users
+                 WHERE LOWER(REGEXP_REPLACE(username, '[.\\-]', '', 'g')) = LOWER(REGEXP_REPLACE($1, '[.\\-]', '', 'g'))
+                   AND tenant_id = $2
+                 LIMIT 20",
+            )
+            .bind(query)
+            .bind(tenant_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+            if !by_username.is_empty() {
+                by_username.into_iter().map(|r| r.0).collect()
             } else {
-                let by_vine_id: Option<(String,)> = sqlx::query_as(
-                    "SELECT pubkey FROM users WHERE vine_id = $1 AND tenant_id = $2",
+                // Vine ID fallback: case-insensitive
+                let by_vine_id: Vec<(String,)> = sqlx::query_as(
+                    "SELECT pubkey FROM users WHERE LOWER(vine_id) = LOWER($1) AND tenant_id = $2 LIMIT 20",
                 )
                 .bind(query)
                 .bind(tenant_id)
-                .fetch_optional(&self.pool)
+                .fetch_all(&self.pool)
                 .await?;
-                if let Some((pk,)) = by_vine_id {
-                    pk
+
+                if !by_vine_id.is_empty() {
+                    by_vine_id.into_iter().map(|r| r.0).collect()
                 } else {
-                    query.to_string()
+                    // Hex pubkey fallback
+                    vec![query.to_string()]
                 }
             }
         };
 
-        let row: Option<AdminUserDetails> = sqlx::query_as(
+        if pubkeys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let rows: Vec<AdminUserDetails> = sqlx::query_as(
             "SELECT
                 u.pubkey,
                 u.email,
@@ -1078,14 +1088,27 @@ impl UserRepository {
                 u.updated_at
              FROM users u
              LEFT JOIN personal_keys pk ON pk.user_pubkey = u.pubkey AND pk.tenant_id = u.tenant_id
-             WHERE u.pubkey = $1 AND u.tenant_id = $2",
+             WHERE u.pubkey = ANY($1::text[]) AND u.tenant_id = $2",
         )
-        .bind(&pubkey_hex)
+        .bind(&pubkeys)
         .bind(tenant_id)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
 
-        Ok(row)
+        Ok(rows)
+    }
+
+    /// Look up a single user for admin. Thin wrapper over `find_users_for_admin`.
+    pub async fn find_user_for_admin(
+        &self,
+        query: &str,
+        tenant_id: i64,
+    ) -> Result<Option<AdminUserDetails>, RepositoryError> {
+        Ok(self
+            .find_users_for_admin(query, tenant_id)
+            .await?
+            .into_iter()
+            .next())
     }
 
     /// Delete a user account and all associated data.
@@ -1424,6 +1447,18 @@ mod tests {
         .unwrap();
     }
 
+    async fn create_user_with_username(pool: &PgPool, pubkey: &str, username: &str) {
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at)
+             VALUES ($1, 1, $2, NOW(), NOW())",
+        )
+        .bind(pubkey)
+        .bind(username)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     async fn cleanup_user(pool: &PgPool, pubkey: &str) {
         sqlx::query("DELETE FROM personal_keys WHERE user_pubkey = $1")
             .bind(pubkey)
@@ -1525,5 +1560,39 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none(), "Should return None for nonexistent user");
+    }
+
+    #[tokio::test]
+    async fn test_find_users_for_admin_normalized_username() {
+        let pool = setup_pool().await;
+        let repo = UserRepository::new(pool.clone());
+        let suffix = test_suffix();
+
+        let k1 = Keys::generate();
+        let h1 = k1.public_key().to_hex();
+        let k2 = Keys::generate();
+        let h2 = k2.public_key().to_hex();
+        let k3 = Keys::generate();
+        let h3 = k3.public_key().to_hex();
+
+        // Three users with equivalent normalized usernames
+        create_user_with_username(&pool, &h1, &format!("Lele.Pons-{}", suffix)).await;
+        create_user_with_username(&pool, &h2, &format!("lelepons-{}", suffix)).await;
+        create_user_with_username(&pool, &h3, &format!("LELEPONS-{}", suffix)).await;
+
+        let results = repo
+            .find_users_for_admin(&format!("lelepons-{}", suffix), 1)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 3, "Should find all 3 normalized matches");
+
+        let found_pubkeys: Vec<&str> = results.iter().map(|u| u.pubkey.as_str()).collect();
+        assert!(found_pubkeys.contains(&h1.as_str()));
+        assert!(found_pubkeys.contains(&h2.as_str()));
+        assert!(found_pubkeys.contains(&h3.as_str()));
+
+        cleanup_user(&pool, &h1).await;
+        cleanup_user(&pool, &h2).await;
+        cleanup_user(&pool, &h3).await;
     }
 }

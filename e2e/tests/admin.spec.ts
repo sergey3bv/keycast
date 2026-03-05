@@ -6,6 +6,7 @@ import {
   removeSupportAdmin,
   clearSupportAdmins,
 } from "../helpers/redis";
+import { withDb } from "../helpers/db";
 
 test.describe("Support admin management", () => {
   test.afterEach(async () => {
@@ -150,8 +151,8 @@ test.describe("Support admin management", () => {
     expect(lookupRes.status()).toBe(200);
 
     const lookupBody = await lookupRes.json();
-    expect(lookupBody.found).toBe(true);
-    expect(lookupBody.user.email).toBe(targetEmail);
+    expect(lookupBody.total).toBeGreaterThanOrEqual(1);
+    expect(lookupBody.results[0].email).toBe(targetEmail);
   });
 
   test("support admin cannot access full admin endpoints", async ({
@@ -259,5 +260,125 @@ test.describe("Support admin management", () => {
       timeout: 10000,
     });
     await expect(page).toHaveURL("http://localhost:3000/support-admin");
+  });
+
+  test("multi-result search returns users with similar normalized usernames", async ({
+    request,
+  }) => {
+    const { cookie } = await registerAdmin(request);
+    const sessionCookie = `keycast_session=${parseCookieValue(cookie)}`;
+    const ts = Date.now();
+
+    // Seed 3 users with similar usernames via direct DB insert
+    const usernames = [
+      `Lele.Pons-${ts}`,
+      `lelepons-${ts}`,
+      `LELEPONS-${ts}`,
+    ];
+    const pubkeys: string[] = [];
+
+    for (const username of usernames) {
+      // Generate a deterministic-ish hex pubkey from the username
+      const pk = Array.from(username)
+        .map((c) => c.charCodeAt(0).toString(16).padStart(2, "0"))
+        .join("")
+        .padEnd(64, "0")
+        .slice(0, 64);
+      pubkeys.push(pk);
+
+      await withDb(async (db) => {
+        await db.query(
+          "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at) VALUES ($1, 1, $2, NOW(), NOW()) ON CONFLICT (pubkey) DO NOTHING",
+          [pk, username],
+        );
+      });
+    }
+
+    // Search for the normalized form
+    const lookupRes = await request.get(
+      `/api/admin/user-lookup?q=${encodeURIComponent(`lelepons-${ts}`)}`,
+      { headers: { Cookie: sessionCookie } },
+    );
+    expect(lookupRes.status()).toBe(200);
+
+    const body = await lookupRes.json();
+    expect(body.total).toBe(3);
+    expect(body.results).toHaveLength(3);
+
+    const foundUsernames = body.results.map((r: any) => r.username).sort();
+    expect(foundUsernames).toEqual([...usernames].sort());
+
+    // Cleanup
+    for (const pk of pubkeys) {
+      await withDb(async (db) => {
+        await db.query("DELETE FROM users WHERE pubkey = $1", [pk]);
+      });
+    }
+  });
+
+  test("multi-result search shows expandable list in browser", async ({
+    page,
+    request,
+  }) => {
+    test.setTimeout(60000);
+    const { cookie } = await registerAdmin(request);
+    const sessionValue = parseCookieValue(cookie);
+    const ts = Date.now();
+
+    // Seed 2 users with similar usernames
+    const usernames = [`TestUser-${ts}`, `testuser-${ts}`];
+    const pubkeys: string[] = [];
+
+    for (const username of usernames) {
+      const pk = Array.from(username)
+        .map((c) => c.charCodeAt(0).toString(16).padStart(2, "0"))
+        .join("")
+        .padEnd(64, "0")
+        .slice(0, 64);
+      pubkeys.push(pk);
+
+      await withDb(async (db) => {
+        await db.query(
+          "INSERT INTO users (pubkey, tenant_id, username, created_at, updated_at) VALUES ($1, 1, $2, NOW(), NOW()) ON CONFLICT (pubkey) DO NOTHING",
+          [pk, username],
+        );
+      });
+    }
+
+    await page.context().addCookies([
+      {
+        name: "keycast_session",
+        value: sessionValue,
+        domain: "localhost",
+        path: "/",
+      },
+    ]);
+
+    await page.goto("http://localhost:3000/support-admin");
+    await expect(page.locator("text=Support Admin")).toBeVisible({
+      timeout: 10000,
+    });
+
+    // Search for the users
+    await page.fill(".search-input", `testuser-${ts}`);
+    await page.click(".btn-search");
+
+    // Should see 2 list items
+    await expect(page.locator(".user-list-item")).toHaveCount(2, {
+      timeout: 10000,
+    });
+
+    // Click first item to expand
+    await page.locator(".user-list-row").first().click();
+
+    // Should see expanded card
+    await expect(page.locator(".user-card")).toBeVisible({ timeout: 5000 });
+
+    // Cleanup
+    for (const pk of pubkeys) {
+      await withDb(async (db) => {
+        await db.query("DELETE FROM users WHERE pubkey = $1", [pk]);
+      });
+    }
   });
 });

@@ -4,7 +4,7 @@
 	import { KeycastApi } from '$lib/keycast_api.svelte';
 	import { goto } from '$app/navigation';
 	import Loader from '$lib/components/Loader.svelte';
-	import { ShieldCheck, Warning, MagnifyingGlass, User, Key, Calendar, Globe, Copy, Check, CheckCircle, XCircle, Link } from 'phosphor-svelte';
+	import { ShieldCheck, Warning, MagnifyingGlass, User, Key, Calendar, Globe, Copy, Check, CheckCircle, XCircle, Link, CaretDown, CaretRight } from 'phosphor-svelte';
 	import { nip19 } from 'nostr-tools';
 	import { toast } from 'svelte-hot-french-toast';
 
@@ -16,8 +16,11 @@
 	// User lookup state
 	let searchQuery = $state('');
 	let isSearching = $state(false);
-	let searchResult = $state<null | { found: boolean; user?: UserDetails }>(null);
+	let searchResult = $state<null | { results: UserDetails[]; total: number }>(null);
 	let searchError = $state('');
+
+	// Expand/collapse state
+	let expandedPubkey = $state<string | null>(null);
 
 	// Pubkey display state
 	let pubkeyFormat = $state<'hex' | 'npub'>('npub');
@@ -43,7 +46,6 @@
 	}
 
 	onMount(async () => {
-		// Verify admin status via API (uses keycast_session cookie directly)
 		try {
 			const response = await api.get<{ is_admin: boolean; role: string | null }>('/admin/status');
 			if (!response.is_admin) {
@@ -66,12 +68,17 @@
 		isSearching = true;
 		searchError = '';
 		searchResult = null;
+		expandedPubkey = null;
 
 		try {
-			const result = await api.get<{ found: boolean; user?: UserDetails }>(
+			const result = await api.get<{ results: UserDetails[]; total: number }>(
 				`/admin/user-lookup?q=${encodeURIComponent(q)}`
 			);
 			searchResult = result;
+			// Auto-expand if single result
+			if (result.results.length === 1) {
+				expandedPubkey = result.results[0].pubkey;
+			}
 		} catch (err: any) {
 			searchError = err.message || 'Search failed';
 		} finally {
@@ -162,9 +169,18 @@
 		}
 	}
 
+	function toggleExpand(pubkey: string) {
+		expandedPubkey = expandedPubkey === pubkey ? null : pubkey;
+	}
+
 	$effect(() => {
-		if (searchResult?.found && searchResult.user?.vine_id && !searchResult.user?.email) {
-			loadClaimToken(searchResult.user.pubkey);
+		if (expandedPubkey && searchResult) {
+			const user = searchResult.results.find(u => u.pubkey === expandedPubkey);
+			if (user?.vine_id && !user?.email) {
+				loadClaimToken(user.pubkey);
+			} else {
+				claimToken = null;
+			}
 		} else {
 			claimToken = null;
 		}
@@ -223,130 +239,159 @@
 			{/if}
 
 			{#if searchResult}
-				{#if !searchResult.found}
+				{#if searchResult.results.length === 0}
 					<div class="no-result">
 						<p>No user found matching that query.</p>
 					</div>
-				{:else if searchResult.user}
-					{@const u = searchResult.user}
-					<div class="user-card">
-						<div class="user-card-header">
-							<User size={20} weight="fill" />
-							<div class="user-header-info">
-								<span class="user-name">{u.email || u.display_name || u.username || truncateFormatted(u.pubkey)}</span>
-								{#if u.email}
-									<span class="user-sub mono">
-										<Key size={12} />
-										<span title={formatPubkey(u.pubkey)}>{truncateFormatted(u.pubkey)}</span>
-									</span>
-								{/if}
-							</div>
+				{:else}
+					{#if searchResult.total >= 20}
+						<div class="results-banner warning">
+							<Warning size={14} />
+							<span>Showing first 20 of many results — refine your search</span>
 						</div>
-
-						<div class="status-strip">
-							<div class="status-item" class:status-ok={u.email_verified} class:status-warn={u.email && !u.email_verified} class:status-none={!u.email}>
-								{#if u.email_verified}
-									<CheckCircle size={14} weight="fill" />
-									<span>Email verified</span>
-								{:else if u.email}
-									<XCircle size={14} weight="fill" />
-									<span>Email unverified</span>
-								{:else}
-									<span class="status-neutral">No email</span>
-								{/if}
-							</div>
-							<div class="status-item" class:status-ok={u.active_sessions > 0} class:status-none={u.active_sessions === 0}>
-								<span>{u.active_sessions} active {u.active_sessions === 1 ? 'session' : 'sessions'}</span>
-							</div>
+					{:else if searchResult.total > 1}
+						<div class="results-banner">
+							<span>{searchResult.total} users found</span>
 						</div>
+					{/if}
 
-						<div class="user-fields">
-							<div class="field">
-								<span class="field-label"><Key size={14} /> Pubkey</span>
-								<span class="field-value mono">
-									<span title={formatPubkey(u.pubkey)}>{truncateFormatted(u.pubkey)}</span>
-									<button class="icon-btn" onclick={() => copyPubkey(u.pubkey)} title="Copy pubkey">
-										{#if copiedPubkey}
-											<Check size={14} />
+					<div class="user-list">
+						{#each searchResult.results as u (u.pubkey)}
+							{@const isExpanded = expandedPubkey === u.pubkey}
+							<div class="user-list-item" class:expanded={isExpanded}>
+								<button class="user-list-row" onclick={() => toggleExpand(u.pubkey)}>
+									<span class="expand-icon">
+										{#if isExpanded}
+											<CaretDown size={14} weight="bold" />
 										{:else}
-											<Copy size={14} />
+											<CaretRight size={14} weight="bold" />
 										{/if}
-									</button>
-									<button
-										class="format-toggle"
-										onclick={() => pubkeyFormat = pubkeyFormat === 'hex' ? 'npub' : 'hex'}
-										title="Switch between npub and hex format"
-									>
-										{pubkeyFormat === 'hex' ? 'npub' : 'hex'}
-									</button>
-								</span>
-							</div>
+									</span>
+									<User size={16} weight="fill" />
+									<span class="list-name">{u.display_name || u.username || u.email || truncateFormatted(u.pubkey)}</span>
+									{#if u.username}
+										<span class="list-username">@{u.username}</span>
+									{/if}
+									<span class="list-sessions">{u.active_sessions} {u.active_sessions === 1 ? 'session' : 'sessions'}</span>
+								</button>
 
-							{#if u.username}
-								<div class="field">
-									<span class="field-label"><User size={14} /> Username</span>
-									<span class="field-value">{u.username}</span>
-								</div>
-							{/if}
-
-							{#if u.vine_id}
-								<div class="field">
-									<span class="field-label"><Globe size={14} /> Vine ID</span>
-									<span class="field-value">{u.vine_id}</span>
-								</div>
-							{/if}
-
-							<div class="field">
-								<span class="field-label"><Calendar size={14} /> Created</span>
-								<span class="field-value">{formatDate(u.created_at)}</span>
-							</div>
-
-							<div class="field">
-								<span class="field-label"><Calendar size={14} /> Last active</span>
-								<span class="field-value">{u.last_active ? formatDate(u.last_active) : 'Never'}</span>
-							</div>
-						</div>
-
-						{#if u.vine_id && !u.email}
-							<div class="claim-section">
-								<div class="claim-header">
-									<Link size={16} />
-									<span class="claim-title">Claim Link</span>
-								</div>
-								{#if isLoadingClaimToken}
-									<p class="claim-loading">Checking for existing claim link...</p>
-								{:else if claimToken}
-									<div class="claim-url-display">
-										<div class="claim-url-row">
-											<input
-												type="text"
-												value={claimToken.claim_url}
-												readonly
-												class="claim-url-input"
-											/>
-											<button class="icon-btn" onclick={copyClaimUrl} title="Copy claim URL">
-												{#if copiedClaimUrl}
-													<Check size={14} />
+								{#if isExpanded}
+									<div class="user-card">
+										<div class="status-strip">
+											<div class="status-item" class:status-ok={u.email_verified} class:status-warn={u.email && !u.email_verified} class:status-none={!u.email}>
+												{#if u.email_verified}
+													<CheckCircle size={14} weight="fill" />
+													<span>Email verified</span>
+												{:else if u.email}
+													<XCircle size={14} weight="fill" />
+													<span>Email unverified</span>
 												{:else}
-													<Copy size={14} />
+													<span class="status-neutral">No email</span>
 												{/if}
-											</button>
+											</div>
+											<div class="status-item" class:status-ok={u.active_sessions > 0} class:status-none={u.active_sessions === 0}>
+												<span>{u.active_sessions} active {u.active_sessions === 1 ? 'session' : 'sessions'}</span>
+											</div>
 										</div>
-										<span class="claim-expiry">
-											Expires {formatDate(claimToken.expires_at)}
-										</span>
+
+										<div class="user-fields">
+											<div class="field">
+												<span class="field-label"><Key size={14} /> Pubkey</span>
+												<span class="field-value mono">
+													<span title={formatPubkey(u.pubkey)}>{truncateFormatted(u.pubkey)}</span>
+													<button class="icon-btn" onclick={() => copyPubkey(u.pubkey)} title="Copy pubkey">
+														{#if copiedPubkey}
+															<Check size={14} />
+														{:else}
+															<Copy size={14} />
+														{/if}
+													</button>
+													<button
+														class="format-toggle"
+														onclick={() => pubkeyFormat = pubkeyFormat === 'hex' ? 'npub' : 'hex'}
+														title="Switch between npub and hex format"
+													>
+														{pubkeyFormat === 'hex' ? 'npub' : 'hex'}
+													</button>
+												</span>
+											</div>
+
+											{#if u.email}
+												<div class="field">
+													<span class="field-label">Email</span>
+													<span class="field-value">{u.email}</span>
+												</div>
+											{/if}
+
+											{#if u.username}
+												<div class="field">
+													<span class="field-label"><User size={14} /> Username</span>
+													<span class="field-value">{u.username}</span>
+												</div>
+											{/if}
+
+											{#if u.vine_id}
+												<div class="field">
+													<span class="field-label"><Globe size={14} /> Vine ID</span>
+													<span class="field-value">{u.vine_id}</span>
+												</div>
+											{/if}
+
+											<div class="field">
+												<span class="field-label"><Calendar size={14} /> Created</span>
+												<span class="field-value">{formatDate(u.created_at)}</span>
+											</div>
+
+											<div class="field">
+												<span class="field-label"><Calendar size={14} /> Last active</span>
+												<span class="field-value">{u.last_active ? formatDate(u.last_active) : 'Never'}</span>
+											</div>
+										</div>
+
+										{#if u.vine_id && !u.email}
+											<div class="claim-section">
+												<div class="claim-header">
+													<Link size={16} />
+													<span class="claim-title">Claim Link</span>
+												</div>
+												{#if isLoadingClaimToken}
+													<p class="claim-loading">Checking for existing claim link...</p>
+												{:else if claimToken}
+													<div class="claim-url-display">
+														<div class="claim-url-row">
+															<input
+																type="text"
+																value={claimToken.claim_url}
+																readonly
+																class="claim-url-input"
+															/>
+															<button class="icon-btn" onclick={copyClaimUrl} title="Copy claim URL">
+																{#if copiedClaimUrl}
+																	<Check size={14} />
+																{:else}
+																	<Copy size={14} />
+																{/if}
+															</button>
+														</div>
+														<span class="claim-expiry">
+															Expires {formatDate(claimToken.expires_at)}
+														</span>
+													</div>
+												{:else}
+													<button
+														class="btn-generate-claim"
+														onclick={() => generateClaimToken(u.vine_id!)}
+														disabled={isGeneratingClaimToken}
+													>
+														{isGeneratingClaimToken ? 'Generating...' : 'Generate Claim Link'}
+													</button>
+												{/if}
+											</div>
+										{/if}
 									</div>
-								{:else}
-									<button
-										class="btn-generate-claim"
-										onclick={() => generateClaimToken(u.vine_id!)}
-										disabled={isGeneratingClaimToken}
-									>
-										{isGeneratingClaimToken ? 'Generating...' : 'Generate Claim Link'}
-									</button>
 								{/if}
 							</div>
-						{/if}
+						{/each}
 					</div>
 				{/if}
 			{/if}
@@ -494,6 +539,26 @@
 		margin: -0.5rem 0 1rem 0.25rem;
 	}
 
+	.results-banner {
+		display: flex;
+		align-items: center;
+		gap: 0.375rem;
+		padding: 0.5rem 0.75rem;
+		margin-bottom: 0.5rem;
+		border-radius: 8px;
+		font-size: 0.8rem;
+		font-weight: 500;
+		color: var(--color-divine-text-secondary);
+		background: var(--color-divine-surface);
+		border: 1px solid var(--color-divine-border);
+	}
+
+	.results-banner.warning {
+		color: var(--color-divine-warning);
+		background: color-mix(in srgb, var(--color-divine-warning) 10%, var(--color-divine-bg));
+		border-color: color-mix(in srgb, var(--color-divine-warning) 30%, transparent);
+	}
+
 	.btn-search {
 		padding: 0.625rem 1.25rem;
 		background: var(--color-divine-green);
@@ -543,45 +608,80 @@
 		margin: 0;
 	}
 
-	/* User card */
-	.user-card {
+	/* User list */
+	.user-list {
+		display: flex;
+		flex-direction: column;
+		gap: 0;
 		background: var(--color-divine-surface);
 		border: 1px solid var(--color-divine-border);
 		border-radius: 12px;
 		overflow: hidden;
 	}
 
-	.user-card-header {
+	.user-list-item {
+		border-bottom: 1px solid var(--color-divine-border);
+	}
+
+	.user-list-item:last-child {
+		border-bottom: none;
+	}
+
+	.user-list-item.expanded {
+		background: var(--color-divine-muted);
+	}
+
+	.user-list-row {
 		display: flex;
 		align-items: center;
-		gap: 0.625rem;
-		padding: 1rem 1.25rem;
-		border-bottom: 1px solid var(--color-divine-border);
-		color: var(--color-divine-green);
-	}
-
-	.user-header-info {
-		display: flex;
-		flex-direction: column;
-		gap: 0.2rem;
-		min-width: 0;
-	}
-
-	.user-name {
+		gap: 0.5rem;
+		width: 100%;
+		padding: 0.75rem 1rem;
+		background: transparent;
+		border: none;
+		cursor: pointer;
+		text-align: left;
 		color: var(--color-divine-text);
-		font-weight: 600;
-		font-size: 1rem;
+		font-size: 0.85rem;
+		transition: background 0.15s;
+	}
+
+	.user-list-row:hover {
+		background: var(--color-divine-muted);
+	}
+
+	.expand-icon {
+		color: var(--color-divine-text-tertiary);
+		flex-shrink: 0;
+		display: flex;
+		align-items: center;
+	}
+
+	.list-name {
+		font-weight: 500;
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
+		min-width: 0;
 	}
 
-	.user-sub {
-		display: flex;
-		align-items: center;
-		gap: 0.25rem;
+	.list-username {
+		color: var(--color-divine-text-tertiary);
+		font-size: 0.775rem;
+		flex-shrink: 0;
+	}
+
+	.list-sessions {
+		margin-left: auto;
 		color: var(--color-divine-text-tertiary);
 		font-size: 0.725rem;
+		white-space: nowrap;
+		flex-shrink: 0;
+	}
+
+	/* User card (expanded detail) */
+	.user-card {
+		border-top: 1px solid var(--color-divine-border);
 	}
 
 	.status-strip {
@@ -635,7 +735,7 @@
 	}
 
 	.field:hover {
-		background: var(--color-divine-muted);
+		background: color-mix(in srgb, var(--color-divine-muted) 50%, transparent);
 	}
 
 	.field-label {

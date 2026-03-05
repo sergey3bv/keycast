@@ -814,9 +814,8 @@ pub struct UserLookupQuery {
 
 #[derive(Debug, Serialize)]
 pub struct UserLookupResponse {
-    pub found: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub user: Option<UserLookupDetails>,
+    pub results: Vec<UserLookupDetails>,
+    pub total: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -833,7 +832,8 @@ pub struct UserLookupDetails {
     pub last_active: Option<String>,
 }
 
-/// Look up a user by email or pubkey. Available to support admins and above.
+/// Look up users by email, username, vine_id, or pubkey. Available to support admins and above.
+/// Returns multiple results for username searches (case-insensitive, dot/hyphen normalized).
 pub async fn get_user_lookup(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
@@ -853,44 +853,51 @@ pub async fn get_user_lookup(
     }
 
     let user_repo = UserRepository::new(pool.clone());
-    let result = user_repo.find_user_for_admin(q, tenant_id).await?;
+    let mut users = user_repo.find_users_for_admin(q, tenant_id).await?;
 
-    match result {
-        None => Ok(Json(UserLookupResponse {
-            found: false,
-            user: None,
-        })),
-        Some(details) => {
-            // Count active sessions and find most recent activity
-            let oauth_repo = OAuthAuthorizationRepository::new(pool.clone());
-            let sessions = oauth_repo
-                .list_active_sessions(&details.pubkey, tenant_id)
-                .await
-                .unwrap_or_default();
-
-            let last_active = sessions
-                .iter()
-                .filter_map(|s| s.5.as_deref())
-                .max()
-                .map(String::from);
-
-            Ok(Json(UserLookupResponse {
-                found: true,
-                user: Some(UserLookupDetails {
-                    pubkey: details.pubkey,
-                    email: details.email,
-                    email_verified: details.email_verified,
-                    username: details.username,
-                    display_name: details.display_name,
-                    vine_id: details.vine_id,
-                    has_personal_key: details.has_personal_key,
-                    active_sessions: sessions.len() as i64,
-                    created_at: details.created_at.to_rfc3339(),
-                    last_active,
-                }),
-            }))
+    // Divine name server fallback: if no results and query looks like a username
+    if users.is_empty()
+        && !q.contains('@')
+        && !q.starts_with("npub")
+        && q.len() != 64
+        && crate::divine_names::is_enabled()
+    {
+        if let Ok(Some(hex_pubkey)) = crate::divine_names::lookup_by_name(q).await {
+            users = user_repo.find_users_for_admin(&hex_pubkey, tenant_id).await?;
         }
     }
+
+    let oauth_repo = OAuthAuthorizationRepository::new(pool.clone());
+    let total = users.len();
+    let mut results = Vec::with_capacity(total);
+
+    for details in users {
+        let sessions = oauth_repo
+            .list_active_sessions(&details.pubkey, tenant_id)
+            .await
+            .unwrap_or_default();
+
+        let last_active = sessions
+            .iter()
+            .filter_map(|s| s.5.as_deref())
+            .max()
+            .map(String::from);
+
+        results.push(UserLookupDetails {
+            pubkey: details.pubkey,
+            email: details.email,
+            email_verified: details.email_verified,
+            username: details.username,
+            display_name: details.display_name,
+            vine_id: details.vine_id,
+            has_personal_key: details.has_personal_key,
+            active_sessions: sessions.len() as i64,
+            created_at: details.created_at.to_rfc3339(),
+            last_active,
+        });
+    }
+
+    Ok(Json(UserLookupResponse { results, total }))
 }
 
 // ============================================================================
