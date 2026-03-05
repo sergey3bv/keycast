@@ -33,27 +33,18 @@ async fn create_policy_with_permissions(
     team_id: i32,
     permission_configs: Vec<(&str, serde_json::Value)>,
 ) -> i32 {
-    // Ensure team exists first (check if exists, create if not)
-    let team_exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM teams WHERE id = $1 AND tenant_id = $2)")
-            .bind(team_id)
-            .bind(tenant_id)
-            .fetch_one(pool)
-            .await
-            .expect("Failed to check team existence");
-
-    if !team_exists {
-        sqlx::query(
-            "INSERT INTO teams (id, name, tenant_id, created_at, updated_at)
-             VALUES ($1, $2, $3, NOW(), NOW())",
-        )
-        .bind(team_id)
-        .bind("Test Team")
-        .bind(tenant_id)
-        .execute(pool)
-        .await
-        .expect("Failed to create team");
-    }
+    // Ensure team exists (ON CONFLICT to handle parallel test execution)
+    sqlx::query(
+        "INSERT INTO teams (id, name, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, $3, NOW(), NOW())
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(team_id)
+    .bind("Test Team")
+    .bind(tenant_id)
+    .execute(pool)
+    .await
+    .expect("Failed to create team");
 
     // Create policy (policies table doesn't have tenant_id)
     let policy_id: i32 = sqlx::query_scalar(
@@ -752,27 +743,18 @@ async fn create_team_authorization_with_expiry(
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
     key_manager: &dyn KeyManager,
 ) -> (String, Keys, Keys) {
-    // Ensure team exists first
-    let team_exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM teams WHERE id = $1 AND tenant_id = $2)")
-            .bind(team_id)
-            .bind(tenant_id)
-            .fetch_one(pool)
-            .await
-            .expect("Failed to check team existence");
-
-    if !team_exists {
-        sqlx::query(
-            "INSERT INTO teams (id, name, tenant_id, created_at, updated_at)
-             VALUES ($1, $2, $3, NOW(), NOW())",
-        )
-        .bind(team_id)
-        .bind("Test Team for Expiry")
-        .bind(tenant_id)
-        .execute(pool)
-        .await
-        .expect("Failed to create team");
-    }
+    // Ensure team exists (ON CONFLICT to handle parallel test execution)
+    sqlx::query(
+        "INSERT INTO teams (id, name, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, $3, NOW(), NOW())
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(team_id)
+    .bind("Test Team for Expiry")
+    .bind(tenant_id)
+    .execute(pool)
+    .await
+    .expect("Failed to create team");
 
     // Generate bunker and user keys
     let bunker_keys = Keys::generate();
