@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod atproto;
 pub mod auth;
 pub mod claim;
 pub mod headless;

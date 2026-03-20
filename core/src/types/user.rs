@@ -28,6 +28,15 @@ pub struct User {
     pub updated_at: DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserAtprotoState {
+    pub enabled: bool,
+    pub state: Option<String>,
+    pub did: Option<String>,
+    pub error: Option<String>,
+    pub updated_at: Option<DateTime<chrono::Utc>>,
+}
+
 /// A team user is a representation of a user's membership in a team, this is a join table
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct TeamUser {

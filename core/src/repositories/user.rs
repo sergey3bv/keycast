@@ -2,7 +2,7 @@
 // ABOUTME: Provides methods for finding, creating, and querying user data
 
 use crate::repositories::RepositoryError;
-use crate::types::user::User;
+use crate::types::user::{User, UserAtprotoState};
 use chrono::{DateTime, Utc};
 use nostr_sdk::PublicKey;
 use sqlx::{FromRow, PgPool};
@@ -601,6 +601,19 @@ impl UserRepository {
             .map_err(Into::into)
     }
 
+    /// Get username for a globally unique pubkey.
+    pub async fn get_username_by_pubkey(
+        &self,
+        pubkey: &str,
+    ) -> Result<Option<Option<String>>, RepositoryError> {
+        sqlx::query_as("SELECT username FROM users WHERE pubkey = $1")
+            .bind(pubkey)
+            .fetch_optional(&self.pool)
+            .await
+            .map(|opt: Option<(Option<String>,)>| opt.map(|r| r.0))
+            .map_err(Into::into)
+    }
+
     /// Get user's email and verified status.
     /// Returns None if user doesn't exist, Some with nullable email/verified if user exists.
     pub async fn get_account_status(
@@ -653,6 +666,124 @@ impl UserRepository {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Update a user's ATProto lifecycle state.
+    pub async fn set_atproto_state(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+        enabled: bool,
+        state: Option<&str>,
+        did: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            "UPDATE users
+             SET atproto_enabled = $1,
+                 atproto_state = $2,
+                 atproto_did = $3,
+                 atproto_error = $4,
+                 atproto_updated_at = $5,
+                 updated_at = $5
+             WHERE pubkey = $6 AND tenant_id = $7",
+        )
+        .bind(enabled)
+        .bind(state)
+        .bind(did)
+        .bind(error)
+        .bind(now)
+        .bind(pubkey)
+        .bind(tenant_id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound("user not found".to_string()));
+        }
+
+        Ok(())
+    }
+
+    /// Update a user's ATProto lifecycle state using globally unique pubkey lookup.
+    pub async fn set_atproto_state_by_pubkey(
+        &self,
+        pubkey: &str,
+        enabled: bool,
+        state: Option<&str>,
+        did: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            "UPDATE users
+             SET atproto_enabled = $1,
+                 atproto_state = $2,
+                 atproto_did = $3,
+                 atproto_error = $4,
+                 atproto_updated_at = $5,
+                 updated_at = $5
+             WHERE pubkey = $6",
+        )
+        .bind(enabled)
+        .bind(state)
+        .bind(did)
+        .bind(error)
+        .bind(now)
+        .bind(pubkey)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(RepositoryError::NotFound("user not found".to_string()));
+        }
+
+        Ok(())
+    }
+
+    /// Get a user's ATProto lifecycle state.
+    pub async fn get_atproto_state(
+        &self,
+        pubkey: &str,
+        tenant_id: i64,
+    ) -> Result<Option<UserAtprotoState>, RepositoryError> {
+        sqlx::query_as::<_, UserAtprotoState>(
+            "SELECT
+                atproto_enabled AS enabled,
+                atproto_state AS state,
+                atproto_did AS did,
+                atproto_error AS error,
+                atproto_updated_at AS updated_at
+             FROM users
+             WHERE pubkey = $1 AND tenant_id = $2",
+        )
+        .bind(pubkey)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
+    }
+
+    /// Get a user's ATProto lifecycle state using globally unique pubkey lookup.
+    pub async fn get_atproto_state_by_pubkey(
+        &self,
+        pubkey: &str,
+    ) -> Result<Option<UserAtprotoState>, RepositoryError> {
+        sqlx::query_as::<_, UserAtprotoState>(
+            "SELECT
+                atproto_enabled AS enabled,
+                atproto_state AS state,
+                atproto_did AS did,
+                atproto_error AS error,
+                atproto_updated_at AS updated_at
+             FROM users
+             WHERE pubkey = $1",
+        )
+        .bind(pubkey)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(Into::into)
     }
 
     /// Get user's email and password hash for credential verification.

@@ -8,7 +8,9 @@ use keycast_core::authorization_channel::AuthorizationSender;
 use sqlx::PgPool;
 use std::sync::Arc;
 
-use crate::api::http::{admin, auth, claim, headless, metrics, nostr_rpc, oauth, policies, teams};
+use crate::api::http::{
+    admin, atproto, auth, claim, headless, metrics, nostr_rpc, oauth, policies, teams,
+};
 use crate::state::KeycastState;
 use axum::response::Json as AxumJson;
 use serde_json::Value as JsonValue;
@@ -94,15 +96,25 @@ pub fn api_routes(
         .route("/user/pubkey", get(auth::get_pubkey))
         .route("/user/account", get(auth::get_account_status))
         .route("/user/profile", get(auth::get_profile))
+        .route("/user/atproto/status", get(atproto::atproto_status))
         .route("/user/sessions", get(auth::list_sessions))
         .route("/user/permissions", get(auth::list_permissions))
         .route("/user/sessions/disconnect", post(auth::disconnect_client))
+        .route("/user/atproto/enable", post(atproto::enable_atproto))
+        .route("/user/atproto/disable", post(atproto::disable_atproto))
         .route(
             "/user/verify-password",
             post(auth::verify_password_for_export),
         )
         .route("/user/change-password", post(auth::change_password))
         .layer(auth_cors.clone())
+        .with_state(pool.clone());
+
+    let internal_service_routes = Router::new()
+        .route(
+            "/internal/atproto/state",
+            post(atproto::internal_sync_atproto),
+        )
         .with_state(pool.clone());
 
     // Profile update route needs auth_state for key access (divine-name-server NIP-98 auth)
@@ -232,6 +244,7 @@ pub fn api_routes(
     Router::new()
         .merge(first_party_routes) // Has auth_cors (credentials, accepts passwords)
         .merge(user_routes) // Has auth_cors (authenticated, needs cookies)
+        .merge(internal_service_routes) // Service-authenticated route, not browser-facing
         .merge(profile_update_routes) // Has auth_cors (needs key_manager for divine-names)
         .merge(bunker_routes) // Has auth_cors (bunker creation)
         .merge(key_export_routes) // Has auth_cors (authenticated, needs cookies)
