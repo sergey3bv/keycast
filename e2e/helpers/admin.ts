@@ -9,39 +9,11 @@ export const ADMIN_PUBKEY =
 const ADMIN_EMAIL = "e2e-admin-fixed@test.local";
 const ADMIN_PASSWORD = "AdminPass123!";
 
-export async function registerAdmin(
+async function verifyAdminEmail(
   request: APIRequestContext,
 ): Promise<{ cookie: string }> {
-  const registerRes = await request.post("/api/auth/register", {
-    data: { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, nsec: ADMIN_SECRET_KEY },
-  });
-
-  // 409 means already registered (idempotent for re-runs)
-  if (registerRes.status() === 409) {
-    const loginRes = await request.post("/api/auth/login", {
-      data: { email: ADMIN_EMAIL, password: ADMIN_PASSWORD },
-    });
-    if (!loginRes.ok()) {
-      const body = await loginRes.text();
-      throw new Error(`Admin login failed (${loginRes.status()}): ${body}`);
-    }
-    const setCookie = loginRes.headers()["set-cookie"];
-    if (!setCookie?.includes("keycast_session=")) {
-      throw new Error("No keycast_session cookie in login response");
-    }
-    return { cookie: setCookie };
-  }
-
-  if (!registerRes.ok()) {
-    const body = await registerRes.text();
-    throw new Error(
-      `Admin registration failed (${registerRes.status()}): ${body}`,
-    );
-  }
-
   const token = await getVerificationToken(ADMIN_EMAIL);
 
-  // Retry until bcrypt finishes hashing the password
   for (let attempt = 0; attempt < 10; attempt++) {
     const verifyRes = await request.post("/api/auth/verify-email", {
       data: { token },
@@ -68,4 +40,40 @@ export async function registerAdmin(
   }
 
   throw new Error("Admin email verification timed out (password hash not ready)");
+}
+
+export async function registerAdmin(
+  request: APIRequestContext,
+): Promise<{ cookie: string }> {
+  const registerRes = await request.post("/api/auth/register", {
+    data: { email: ADMIN_EMAIL, password: ADMIN_PASSWORD, nsec: ADMIN_SECRET_KEY },
+  });
+
+  // 409 means already registered (idempotent for re-runs)
+  if (registerRes.status() === 409) {
+    const loginRes = await request.post("/api/auth/login", {
+      data: { email: ADMIN_EMAIL, password: ADMIN_PASSWORD },
+    });
+    if (loginRes.status() === 403) {
+      return verifyAdminEmail(request);
+    }
+    if (!loginRes.ok()) {
+      const body = await loginRes.text();
+      throw new Error(`Admin login failed (${loginRes.status()}): ${body}`);
+    }
+    const setCookie = loginRes.headers()["set-cookie"];
+    if (!setCookie?.includes("keycast_session=")) {
+      throw new Error("No keycast_session cookie in login response");
+    }
+    return { cookie: setCookie };
+  }
+
+  if (!registerRes.ok()) {
+    const body = await registerRes.text();
+    throw new Error(
+      `Admin registration failed (${registerRes.status()}): ${body}`,
+    );
+  }
+
+  return verifyAdminEmail(request);
 }

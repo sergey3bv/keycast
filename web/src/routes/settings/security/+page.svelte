@@ -2,6 +2,7 @@
 	import { getCurrentUser, setCurrentUser } from '$lib/current_user.svelte';
 	import { getAccountStatus, isEmailVerified, fetchAccountStatus } from '$lib/account_status.svelte';
 	import { KeycastApi } from '$lib/keycast_api.svelte';
+	import AtprotoSettingsCard from '$lib/components/AtprotoSettingsCard.svelte';
 	import { BRAND } from '$lib/brand';
 	import { toast } from 'svelte-hot-french-toast';
 	import { goto } from '$app/navigation';
@@ -224,6 +225,8 @@
 			<a href="/" class="btn-primary">Go to Dashboard</a>
 		</div>
 	{:else}
+	<AtprotoSettingsCard />
+
 	<!-- Password Verification Section (Always Visible) -->
 	<div class="section">
 		<div class="section-header">

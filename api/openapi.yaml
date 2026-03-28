@@ -268,20 +268,30 @@ components:
       properties:
         enabled:
           type: boolean
+          description: Whether future ATProto cross-publishing is enabled for this user.
         state:
           type: string
           nullable: true
+          enum:
+            - pending
+            - ready
+            - failed
+            - disabled
+          description: Lifecycle state for ATProto provisioning. Null means ATProto has never been enabled.
           example: "pending"
         did:
           type: string
           nullable: true
+          description: PLC DID assigned to the user once provisioning reaches the ready state.
           example: "did:plc:abc123"
         error:
           type: string
           nullable: true
+          description: User-visible error from the last failed provisioning attempt, if any.
         username:
           type: string
           nullable: true
+          description: Claimed username associated with the ATProto lifecycle state.
           example: "alice"
       required:
         - enabled
@@ -500,91 +510,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-
-  /user/atproto/enable:
-    post:
-      summary: Enable ATProto provisioning
-      description: Enable ATProto opt-in after username claim, set lifecycle to pending, and trigger provisioning.
-      tags:
-        - User
-      security:
-        - BearerAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/AtprotoEnableRequest'
-      responses:
-        '202':
-          description: ATProto provisioning accepted
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/AtprotoStatusResponse'
-        '400':
-          description: Username missing, unclaimed, or mismatched
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '401':
-          description: Unauthorized
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-
-  /user/atproto/status:
-    get:
-      summary: Get ATProto lifecycle status
-      description: Returns ATProto enablement and provisioning lifecycle fields for the authenticated user.
-      tags:
-        - User
-      security:
-        - BearerAuth: []
-      responses:
-        '200':
-          description: Current ATProto status
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/AtprotoStatusResponse'
-        '401':
-          description: Unauthorized
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '404':
-          description: User not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-
-  /user/atproto/disable:
-    post:
-      summary: Disable ATProto publishing
-      description: Disable ATProto publishing for the authenticated user and trigger downstream disable cleanup.
-      tags:
-        - User
-      security:
-        - BearerAuth: []
-      responses:
-        '200':
-          description: ATProto publishing disabled
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/AtprotoStatusResponse'
-        '401':
-          description: Unauthorized
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-
     post:
       summary: Update user profile
       description: Update username, display name, or avatar URL for the authenticated user.
@@ -616,6 +541,90 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/UserProfile'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /user/atproto/enable:
+    post:
+      summary: Enable ATProto provisioning
+      description: Enable ATProto opt-in after username claim, return the claimed username with a pending lifecycle state, and trigger provisioning.
+      tags:
+        - User
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AtprotoEnableRequest'
+      responses:
+        '202':
+          description: ATProto provisioning accepted and lifecycle set to pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AtprotoStatusResponse'
+        '400':
+          description: Username missing, unclaimed, or mismatched
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /user/atproto/status:
+    get:
+      summary: Get ATProto lifecycle status
+      description: Returns the authenticated user's enabled flag, lifecycle state, DID, last provisioning error, and claimed username.
+      tags:
+        - User
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Current ATProto status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AtprotoStatusResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: User not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /user/atproto/disable:
+    post:
+      summary: Disable ATProto publishing
+      description: Disable ATProto publishing for the authenticated user, trigger downstream cleanup, and return enabled=false with state=disabled.
+      tags:
+        - User
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: ATProto publishing disabled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AtprotoStatusResponse'
         '401':
           description: Unauthorized
           content:

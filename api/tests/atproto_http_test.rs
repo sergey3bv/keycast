@@ -42,6 +42,9 @@ async fn enable_sets_pending_and_returns_accepted() {
 
     assert!(response.enabled);
     assert_eq!(response.state.as_deref(), Some("pending"));
+    assert_eq!(response.username.as_deref(), Some(username.as_str()));
+    assert_eq!(response.did, None);
+    assert_eq!(response.error, None);
 }
 
 #[tokio::test]
@@ -71,7 +74,9 @@ async fn disable_marks_disabled() {
 
     assert!(!response.enabled);
     assert_eq!(response.state.as_deref(), Some("disabled"));
+    assert_eq!(response.username.as_deref(), Some(username.as_str()));
     assert_eq!(response.did, None);
+    assert_eq!(response.error, None);
 }
 
 #[tokio::test]
@@ -102,6 +107,7 @@ async fn status_returns_username_and_lifecycle_fields() {
     assert_eq!(response.username.as_deref(), Some(username.as_str()));
     assert!(response.enabled);
     assert_eq!(response.state.as_deref(), Some("failed"));
+    assert_eq!(response.did, None);
     assert_eq!(response.error.as_deref(), Some("provisioning failed"));
 }
 
@@ -148,8 +154,10 @@ async fn enable_trigger_failure_marks_failed_state() {
     let response = get_user_atproto_status(&repo, tenant_id, &user_pubkey)
         .await
         .expect("status should succeed");
+    assert_eq!(response.username.as_deref(), Some(username.as_str()));
     assert!(response.enabled);
     assert_eq!(response.state.as_deref(), Some("failed"));
+    assert_eq!(response.did, None);
     assert_eq!(
         response.error.as_deref(),
         Some("provisioning service returned 502 Bad Gateway: gateway unavailable"),

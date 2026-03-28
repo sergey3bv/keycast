@@ -388,7 +388,7 @@ $effect(() => {
 							{/if}
 							<a href="/settings/security" class="identity-link">
 								<Gear size={16} />
-								<span>Security Settings</span>
+								<span>Security &amp; Bluesky</span>
 							</a>
 						</div>
 					{/if}
