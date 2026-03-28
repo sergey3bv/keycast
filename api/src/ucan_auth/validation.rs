@@ -109,15 +109,16 @@ pub async fn validate_ucan_token(
     let issuer_pubkey = did_to_nostr_pubkey(ucan.issuer())?;
     let issuer_pubkey_hex = issuer_pubkey.to_hex();
     let user_pubkey_hex = user_pubkey.to_hex();
-    let server_pubkey = server_pubkey()?;
-
-    if issuer_pubkey_hex != user_pubkey_hex && issuer_pubkey_hex != server_pubkey {
-        return Err(anyhow!(
-            "Invalid UCAN issuer: must be signed by user ({}) or server ({}), got {}",
-            &user_pubkey_hex[..8],
-            &server_pubkey[..8],
-            &issuer_pubkey_hex[..8]
-        ));
+    if issuer_pubkey_hex != user_pubkey_hex {
+        let server_pubkey = server_pubkey()?;
+        if issuer_pubkey_hex != server_pubkey {
+            return Err(anyhow!(
+                "Invalid UCAN issuer: must be signed by user ({}) or server ({}), got {}",
+                &user_pubkey_hex[..8],
+                &server_pubkey[..8],
+                &issuer_pubkey_hex[..8]
+            ));
+        }
     }
 
     Ok((user_pubkey_hex, redirect_origin, bunker_pubkey, ucan))
@@ -159,8 +160,19 @@ mod tests {
     use nostr_sdk::Keys;
     use ucan::builder::UcanBuilder;
 
+    fn ensure_server_nsec() -> Keys {
+        if std::env::var("SERVER_NSEC").is_err() {
+            let fake = "0".repeat(63) + "1";
+            std::env::set_var("SERVER_NSEC", &fake);
+        }
+        let nsec = std::env::var("SERVER_NSEC").unwrap();
+        Keys::parse(&nsec).expect("SERVER_NSEC must be valid")
+    }
+
     #[tokio::test]
     async fn test_ucan_generation_and_validation() {
+        let _server_keys = ensure_server_nsec();
+
         // Generate test keys
         let keys = Keys::generate();
         let pubkey = keys.public_key();
@@ -230,6 +242,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_ucan_tenant_validation() {
+        let _server_keys = ensure_server_nsec();
+
         let keys = Keys::generate();
         let pubkey = keys.public_key();
         let user_did = nostr_pubkey_to_did(&pubkey);
