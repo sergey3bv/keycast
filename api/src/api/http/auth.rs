@@ -1327,13 +1327,7 @@ pub async fn verify_email(
             let redis =
                 required_redis.expect("headless flow must validate Redis before storing code");
             let key = format!("oauth_poll:{}", device_code);
-            if let Err(e) = redis::cmd("SETEX")
-                .arg(&key)
-                .arg(600) // 10 minute TTL
-                .arg(&new_code)
-                .query_async::<()>(&mut redis.clone())
-                .await
-            {
+            if let Err(e) = redis.setex(&key, 600, &new_code).await {
                 tracing::error!(
                     event = "headless_poll_delivery_failed",
                     tenant_id = tenant_id,
