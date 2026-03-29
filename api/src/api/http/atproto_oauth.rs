@@ -570,7 +570,9 @@ fn expected_client_assertion_audiences() -> Vec<String> {
     vec![authorization_server_origin()]
 }
 
-fn compact_jwt_parts(jwt: &str) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, String), AuthError> {
+type CompactJwtParts = (Vec<u8>, Vec<u8>, Vec<u8>, String);
+
+fn compact_jwt_parts(jwt: &str) -> Result<CompactJwtParts, AuthError> {
     let segments: Vec<&str> = jwt.split('.').collect();
     if segments.len() != 3 {
         return Err(AuthError::BadRequest(
