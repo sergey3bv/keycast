@@ -273,10 +273,36 @@ fn validate_environment() -> Result<(), String> {
         errors.push("GCP_PROJECT_ID must be set when USE_GCP_KMS=true");
     }
 
+    // Tenant isolation configuration
+    let has_allowed_domains = env::var("ALLOWED_TENANT_DOMAINS").is_ok();
+    let has_auto_provisioning = env::var("ENABLE_TENANT_AUTO_PROVISIONING")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if !has_allowed_domains && !has_auto_provisioning {
+        tracing::warn!(
+            "Neither ALLOWED_TENANT_DOMAINS nor ENABLE_TENANT_AUTO_PROVISIONING is configured. \
+             All requests from unknown domains will be rejected. \
+             Set ALLOWED_TENANT_DOMAINS for production or ENABLE_TENANT_AUTO_PROVISIONING=true for development."
+        );
+    }
+
+    if has_auto_provisioning && !has_allowed_domains {
+        tracing::warn!(
+            "ENABLE_TENANT_AUTO_PROVISIONING=true without ALLOWED_TENANT_DOMAINS. \
+             Any valid domain can auto-create a tenant. This should only be used in development."
+        );
+    }
+
     // Docker deployment requires additional vars
     if env::var("POSTGRES_PASSWORD").is_err() {
         // Only required for docker-compose, so just warn
         tracing::warn!("POSTGRES_PASSWORD not set (required for docker-compose deployments)");
+    }
+
+    // Validate email configuration (fail-closed in production)
+    if let Err(e) = keycast_api::email_service::create_email_sender() {
+        errors.push(Box::leak(e.into_boxed_str()));
     }
 
     if !errors.is_empty() {

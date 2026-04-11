@@ -141,7 +141,7 @@ pub async fn nostr_rpc(
     // Get cached handler using BLAKE3(token) as cache key
     // On cache hit: skips UCAN verification entirely (~25% CPU savings)
     // On cache miss: verifies UCAN, loads from DB, caches result
-    let handler = match get_handler(&auth_state, pool, auth_header, tenant_id).await {
+    let handler = match get_handler(&auth_state, pool, auth_header, tenant_id, &headers).await {
         Ok(h) => h,
         Err(e) => {
             METRICS.inc_http_rpc_auth_error();
@@ -244,14 +244,15 @@ async fn load_handler_on_demand(
     auth_state: &AuthState,
     pool: &sqlx::PgPool,
     bunker_pubkey_hex: &str,
+    tenant_id: i64,
 ) -> Result<Arc<HttpRpcHandler>, RpcError> {
     let key_manager = auth_state.state.key_manager.as_ref();
 
-    // Query oauth_authorization for this bunker_pubkey
+    // Query oauth_authorization for this bunker_pubkey, scoped to tenant
     // Includes: expires_at, revoked_at (for validity), policy_id (for permissions)
     let oauth_auth_repo = OAuthAuthorizationRepository::new(pool.clone());
     let auth_data = oauth_auth_repo
-        .find_by_bunker_pubkey(bunker_pubkey_hex)
+        .find_by_bunker_pubkey_for_tenant(bunker_pubkey_hex, tenant_id)
         .await
         .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?;
 
@@ -275,10 +276,10 @@ async fn load_handler_on_demand(
         vec![]
     };
 
-    // Get user's encrypted secret key
+    // Get user's encrypted secret key, scoped to tenant
     let personal_keys_repo = PersonalKeysRepository::new(pool.clone());
     let encrypted_secret: Vec<u8> = personal_keys_repo
-        .find_encrypted_key(&user_pubkey)
+        .find_encrypted_key_for_tenant(&user_pubkey, tenant_id)
         .await
         .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?
         .ok_or_else(|| RpcError::Internal("Personal keys not found".to_string()))?;
@@ -326,6 +327,20 @@ async fn load_handler_on_demand(
     Ok(handler)
 }
 
+/// Construct the absolute htu (HTTP Target URI) from request headers per RFC 9449.
+/// Uses x-forwarded-proto for scheme and Host header for host.
+fn construct_htu(headers: &HeaderMap) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    format!("{}://{}/api/nostr", scheme, host)
+}
+
 /// Compute BLAKE3 hash of token for cache lookup
 /// BLAKE3 is ~500ns for 500-byte token vs ~1-2ms for Schnorr verification (2000-4000x faster)
 fn compute_token_cache_key(auth_header: &str) -> Option<CacheKey> {
@@ -365,10 +380,10 @@ async fn load_preloaded_user_handler(
         return Err(RpcError::Auth(AuthError::InvalidToken));
     }
 
-    // Get user's encrypted secret key directly from personal_keys
+    // Get user's encrypted secret key, scoped to tenant
     let personal_keys_repo = PersonalKeysRepository::new(pool.clone());
     let encrypted_secret: Vec<u8> = personal_keys_repo
-        .find_encrypted_key(user_pubkey_hex)
+        .find_encrypted_key_for_tenant(user_pubkey_hex, tenant_id)
         .await
         .map_err(|e| RpcError::Internal(format!("Database error: {}", e)))?
         .ok_or_else(|| {
@@ -430,6 +445,7 @@ async fn get_handler(
     pool: &sqlx::PgPool,
     auth_header: &str,
     tenant_id: i64,
+    headers: &HeaderMap,
 ) -> Result<Arc<HttpRpcHandler>, RpcError> {
     // Compute BLAKE3 hash for cache lookup (~500ns)
     let blake3_key =
@@ -447,7 +463,39 @@ async fn get_handler(
                 .await;
             return Err(RpcError::Auth(AuthError::InvalidToken));
         }
-        // Cache hit! Skip UCAN verification entirely
+
+        // Even on cache hit, we must enforce DPoP binding if the token has cnf.jkt
+        // Parse the UCAN to check for DPoP binding (lightweight compared to full verification)
+        if let Ok((_user_pubkey, _redirect_origin, _bunker_pubkey, ucan)) =
+            crate::ucan_auth::validate_ucan_token(auth_header, tenant_id).await
+        {
+            if let Some(expected_jkt) = crate::ucan_auth::extract_cnf_jkt_from_ucan(&ucan) {
+                let htu = construct_htu(headers);
+                match crate::ucan_auth::verify_dpop_proof(
+                    headers,
+                    "POST",
+                    &htu,
+                    Some(&expected_jkt),
+                ) {
+                    Ok(Some(_)) => {
+                        tracing::debug!("RPC: DPoP binding verified on cache hit");
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            "RPC: DPoP-bound token used without DPoP proof on cache hit (jkt={})",
+                            &expected_jkt[..8.min(expected_jkt.len())]
+                        );
+                        return Err(RpcError::Auth(AuthError::InvalidToken));
+                    }
+                    Err(e) => {
+                        tracing::warn!("RPC: DPoP verification failed on cache hit: {}", e);
+                        return Err(RpcError::Auth(AuthError::InvalidToken));
+                    }
+                }
+            }
+        }
+
+        // Cache hit! Skip full UCAN verification
         METRICS.inc_http_rpc_cache_hit();
         tracing::trace!("RPC: Cache hit (BLAKE3)");
         return Ok(handler);
@@ -458,14 +506,37 @@ async fn get_handler(
 
     // Verify UCAN and extract bunker_pubkey (Schnorr signature verification ~1-2ms)
     let (user_pubkey, _redirect_origin, bunker_pubkey, ucan) =
-        crate::ucan_auth::validate_ucan_token(auth_header, 0)
+        crate::ucan_auth::validate_ucan_token(auth_header, tenant_id)
             .await
             .map_err(|_| RpcError::Auth(AuthError::InvalidToken))?;
 
+    // Enforce DPoP binding if the UCAN contains cnf.jkt
+    // The DPoP proof must match the bound key for resource access
+    if let Some(expected_jkt) = crate::ucan_auth::extract_cnf_jkt_from_ucan(&ucan) {
+        // RFC 9449 requires htu to be the absolute URI (scheme + host + path)
+        let htu = construct_htu(headers);
+        match crate::ucan_auth::verify_dpop_proof(headers, "POST", &htu, Some(&expected_jkt)) {
+            Ok(Some(_)) => {
+                tracing::debug!("RPC: DPoP binding verified for cnf.jkt");
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "RPC: DPoP-bound token used without DPoP proof (jkt={})",
+                    &expected_jkt[..8.min(expected_jkt.len())]
+                );
+                return Err(RpcError::Auth(AuthError::InvalidToken));
+            }
+            Err(e) => {
+                tracing::warn!("RPC: DPoP verification failed: {}", e);
+                return Err(RpcError::Auth(AuthError::InvalidToken));
+            }
+        }
+    }
+
     // Determine which authentication mode to use
     let handler = if let Some(bunker_key_hex) = bunker_pubkey {
-        // MODE 1: OAuth token with bunker_pubkey - load from oauth_authorizations
-        let h = load_handler_on_demand(auth_state, pool, &bunker_key_hex).await?;
+        // MODE 1: OAuth token with bunker_pubkey - load from oauth_authorizations (tenant-scoped)
+        let h = load_handler_on_demand(auth_state, pool, &bunker_key_hex, tenant_id).await?;
         tracing::debug!(
             "RPC: Loaded OAuth handler for bunker {}",
             &bunker_key_hex[..8]
