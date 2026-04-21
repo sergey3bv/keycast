@@ -34,6 +34,8 @@ pub const EMAIL_VERIFICATION_EXPIRY_HOURS: i64 = 24;
 const PASSWORD_RESET_EXPIRY_HOURS: i64 = 1;
 const DEFAULT_NIP05_DOMAIN: &str = "divine.video";
 const MAX_NIP05_USERNAME_LENGTH: usize = 64;
+const USERNAME_CONFLICT_MESSAGE: &str =
+    "Username is not available. Please choose another username.";
 const USERS_EMAIL_TENANT_CONSTRAINT: &str = "idx_users_email_tenant";
 pub(crate) const INVALID_EMAIL_CODE: &str = "INVALID_EMAIL";
 pub(crate) const INVALID_EMAIL_MESSAGE: &str = "Please enter a valid email address.";
@@ -176,6 +178,23 @@ pub(crate) fn normalize_registration_email(email: &str) -> Result<String, &'stat
     }
 
     Ok(normalized)
+}
+
+fn map_divine_name_availability_reason(reason: Option<&str>) -> &'static str {
+    let Some(raw_reason) = reason else {
+        return "Username is not available on divine.video";
+    };
+
+    let normalized = raw_reason.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "taken" | "already_taken" | "already-taken" | "already_claimed" | "already-claimed" => {
+            "Username is already taken on divine.video"
+        }
+        "reserved" | "restricted" => "Username is reserved on divine.video",
+        "invalid" => "Username is invalid on divine.video",
+        "blocked" | "forbidden" | "prohibited" => "Username is not allowed on divine.video",
+        _ => "Username is not available on divine.video",
+    }
 }
 
 /// Generate UCAN token signed by user's key (self-signed)
@@ -2404,16 +2423,15 @@ pub async fn update_profile(
             match crate::divine_names::check_availability(&username).await {
                 Ok((available, reason)) => {
                     if !available {
-                        let error_msg =
-                            reason.unwrap_or_else(|| "Username is not available".to_string());
+                        let error_msg = map_divine_name_availability_reason(reason.as_deref());
                         tracing::info!(
-                            "Username '{}' not available on divine-name-server: {}",
+                            "Username '{}' not available on divine-name-server (reason={:?}, mapped_error={})",
                             username,
+                            reason,
                             error_msg
                         );
                         return Err(AuthError::Conflict(
-                            "Username is not available. Please choose another username."
-                                .to_string(),
+                            USERNAME_CONFLICT_MESSAGE.to_string(),
                         ));
                     }
                 }
@@ -2436,7 +2454,7 @@ pub async fn update_profile(
             .await?
         {
             return Err(AuthError::Conflict(
-                "Username is not available. Please choose another username.".to_string(),
+                USERNAME_CONFLICT_MESSAGE.to_string(),
             ));
         }
 
@@ -2487,7 +2505,7 @@ pub async fn update_profile(
                 keycast_core::repositories::RepositoryError::Duplicate
             ) {
                 return Err(AuthError::Conflict(
-                    "Username is not available. Please choose another username.".to_string(),
+                    USERNAME_CONFLICT_MESSAGE.to_string(),
                 ));
             }
             return Err(error.into());
@@ -3779,7 +3797,7 @@ mod tests {
     #[tokio::test]
     async fn test_username_conflict_response_uses_canonical_message() {
         let response = super::AuthError::Conflict(
-            "Username is not available. Please choose another username.".to_string(),
+            super::USERNAME_CONFLICT_MESSAGE.to_string(),
         )
         .into_response();
         assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
@@ -4649,25 +4667,61 @@ mod tests {
     #[test]
     fn test_normalize_nip05_username_rejects_invalid_chars() {
         let result = super::normalize_nip05_username("alice+name");
-        assert!(
-            result.is_err(),
-            "plus sign is not allowed in NIP-05 local-part"
-        );
+        assert!(matches!(result, Err(super::AuthError::BadRequest(_))));
     }
 
     #[test]
     fn test_normalize_nip05_username_rejects_non_ascii() {
         let result = super::normalize_nip05_username("álîce");
-        assert!(
-            result.is_err(),
-            "non-ascii usernames should be rejected for NIP-05 local-part compliance"
-        );
+        assert!(matches!(result, Err(super::AuthError::BadRequest(_))));
     }
 
     #[test]
     fn test_normalize_nip05_username_rejects_hyphen_edges() {
-        assert!(super::normalize_nip05_username("-alice").is_err());
-        assert!(super::normalize_nip05_username("alice-").is_err());
+        assert!(matches!(
+            super::normalize_nip05_username("-alice"),
+            Err(super::AuthError::BadRequest(_))
+        ));
+        assert!(matches!(
+            super::normalize_nip05_username("alice-"),
+            Err(super::AuthError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn test_map_divine_name_availability_reason_allowlisted_taken_values() {
+        assert_eq!(
+            super::map_divine_name_availability_reason(Some("already_claimed")),
+            "Username is already taken on divine.video"
+        );
+        assert_eq!(
+            super::map_divine_name_availability_reason(Some("taken")),
+            "Username is already taken on divine.video"
+        );
+    }
+
+    #[test]
+    fn test_map_divine_name_availability_reason_unknown_reason_is_generic() {
+        assert_eq!(
+            super::map_divine_name_availability_reason(Some("debug: backend host xyz.internal")),
+            "Username is not available on divine.video"
+        );
+    }
+
+    #[test]
+    fn test_map_divine_name_availability_reason_none_is_generic() {
+        assert_eq!(
+            super::map_divine_name_availability_reason(None),
+            "Username is not available on divine.video"
+        );
+    }
+
+    #[test]
+    fn test_map_divine_name_availability_reason_hostile_input_is_not_reflected() {
+        assert_eq!(
+            super::map_divine_name_availability_reason(Some("<script>alert(1)</script>")),
+            "Username is not available on divine.video"
+        );
     }
 
     #[test]
