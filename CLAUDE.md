@@ -205,7 +205,7 @@ Optional:
 - `AWS_REGION`: AWS KMS region for `KMS_PROVIDER=aws` (default: `us-east-1`)
 - `USE_VALKEY_IAM`: Enable GCP IAM authentication for Memorystore Valkey (default: `false`). When enabled, uses Workload Identity to obtain access tokens for Redis authentication. Tokens are cached and refreshed automatically before expiry.
 - `BUNKER_RELAYS`: Comma-separated relay URLs for NIP-46 communication (required, no default)
-- `NIP05_DOMAIN`: When the tenant host is `localhost` or `127.0.0.1` only, overrides the domain used in profile `nip05` (with `DOMAIN` as second choice); does **not** override the tenant domain for real hosts—profile and `/.well-known/nostr.json` must stay on the same host
+- `tenants.settings.nip05_domain` (database): Optional per-tenant override for profile `nip05` domain; falls back to `tenants.domain` when unset. Backfill this per tenant before changing routing domains to avoid silent NIP-05 identifier cutovers.
 - `RUST_LOG`: Log level configuration (default: `info`)
 - `SQLX_POOL_SIZE`: Database connection pool size (should match Cloud Run concurrency, default: `50`)
 - `VITE_ALLOWED_PUBKEYS`: Comma-separated pubkeys for whitelist access (web frontend)

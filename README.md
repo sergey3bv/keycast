@@ -216,6 +216,9 @@ See [DEVELOPMENT.md](./docs/DEVELOPMENT.md) for local development setup.
 | `BUNKER_RELAYS` | *(required)* | NIP-46 relay URLs (comma-separated) |
 | `ALLOWED_TENANT_DOMAINS` | *(none)* | If set, restricts auto-provisioning to these domains |
 
+NIP-05 domain selection is tenant-scoped: profile responses use `tenants.settings.nip05_domain` when set, otherwise fall back to `tenants.domain`.
+Before changing routing domains, backfill `tenants.settings.nip05_domain` for existing tenants to avoid identifier cutovers.
+
 #### Performance
 
 | Variable | Default | Description |

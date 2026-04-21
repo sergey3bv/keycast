@@ -32,7 +32,7 @@ use sqlx::PgPool;
 const DEFAULT_TOKEN_EXPIRY_HOURS: i64 = 24;
 pub const EMAIL_VERIFICATION_EXPIRY_HOURS: i64 = 24;
 const PASSWORD_RESET_EXPIRY_HOURS: i64 = 1;
-const DEFAULT_NIP05_DOMAIN: &str = "divine.video";
+const MAX_NIP05_USERNAME_LENGTH: usize = 64;
 
 /// Get token expiry in seconds. Uses `TOKEN_EXPIRY_SECONDS` env var if set,
 /// otherwise defaults to 24 hours (86400 seconds).
@@ -54,20 +54,63 @@ pub fn generate_secure_token() -> String {
 
 /// Returns the domain segment of NIP-05 identifiers (`user@domain`).
 ///
-/// `/.well-known/nostr.json` is served for the request's tenant, and the tenant is derived from
-/// the Host header—so `nip05` in `/user/profile` must use that same domain. Letting `NIP05_DOMAIN`
-/// or `DOMAIN` override a real tenant would make verification fail (profile claims one host while
-/// discovery lives on another). Those env vars apply only when the tenant host is `localhost` or
-/// `127.0.0.1` (local dev), with `DEFAULT_NIP05_DOMAIN` as the final fallback.
-fn resolve_nip05_domain(tenant_domain: &str) -> String {
-    if tenant_domain == "localhost" || tenant_domain == "127.0.0.1" {
-        return std::env::var("NIP05_DOMAIN")
-            .ok()
-            .or_else(|| std::env::var("DOMAIN").ok())
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_NIP05_DOMAIN.to_string());
+/// For tenants that need a different NIP-05 namespace than their routing host, settings can
+/// specify `nip05_domain`. Falls back to `tenant.domain` when unset, blank, or malformed.
+fn is_valid_nip05_domain(domain: &str) -> bool {
+    !domain.is_empty()
+        && !domain.contains('@')
+        && !domain.contains('/')
+        && !domain.chars().any(char::is_whitespace)
+}
+
+fn resolve_nip05_domain(tenant: &crate::api::tenant::Tenant) -> String {
+    let settings = match tenant.get_settings() {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::warn!(
+                tenant_id = tenant.id,
+                tenant_domain = %tenant.domain,
+                error = %error,
+                "Failed to parse tenant settings; falling back to tenant domain for NIP-05"
+            );
+            return tenant.domain.clone();
+        }
+    };
+
+    let Some(raw_override) = settings.nip05_domain else {
+        return tenant.domain.clone();
+    };
+
+    let override_domain = raw_override.trim();
+    if override_domain.is_empty() {
+        tracing::warn!(
+            tenant_id = tenant.id,
+            tenant_domain = %tenant.domain,
+            "Ignoring blank nip05_domain override; falling back to tenant domain"
+        );
+        return tenant.domain.clone();
     }
-    tenant_domain.to_string()
+
+    if !is_valid_nip05_domain(override_domain) {
+        tracing::warn!(
+            tenant_id = tenant.id,
+            tenant_domain = %tenant.domain,
+            nip05_domain = %override_domain,
+            "Ignoring invalid nip05_domain override; falling back to tenant domain"
+        );
+        return tenant.domain.clone();
+    }
+
+    if override_domain != tenant.domain {
+        tracing::warn!(
+            tenant_id = tenant.id,
+            tenant_domain = %tenant.domain,
+            nip05_domain = %override_domain,
+            "Using NIP-05 domain override different from tenant routing domain; ensure /.well-known/nostr.json is discoverable for this host"
+        );
+    }
+
+    override_domain.to_string()
 }
 
 fn normalize_nip05_username(raw_username: &str) -> Result<String, AuthError> {
@@ -90,6 +133,13 @@ fn normalize_nip05_username(raw_username: &str) -> Result<String, AuthError> {
         return Err(AuthError::Internal(
             "Username cannot start or end with a hyphen".to_string(),
         ));
+    }
+
+    if username.len() > MAX_NIP05_USERNAME_LENGTH {
+        return Err(AuthError::Internal(format!(
+            "Username must be at most {} characters",
+            MAX_NIP05_USERNAME_LENGTH
+        )));
     }
 
     Ok(username)
@@ -2137,7 +2187,7 @@ pub async fn get_profile(
         .get_username(&user_pubkey, tenant_id)
         .await?
         .flatten();
-    let nip05_domain = resolve_nip05_domain(&tenant.0.domain);
+    let nip05_domain = resolve_nip05_domain(&tenant.0);
     let nip05 = username
         .as_ref()
         .map(|username| format!("{}@{}", username, nip05_domain));
@@ -4138,10 +4188,132 @@ mod tests {
     }
 
     #[test]
-    fn resolve_nip05_domain_uses_tenant_for_public_hosts() {
-        assert_eq!(
-            super::resolve_nip05_domain("login.example.com"),
-            "login.example.com"
+    fn test_normalize_nip05_username_accepts_max_length_boundary() {
+        let username = "a".repeat(super::MAX_NIP05_USERNAME_LENGTH);
+        let normalized = super::normalize_nip05_username(&username)
+            .expect("username with max allowed length should normalize");
+        assert_eq!(normalized, username);
+    }
+
+    #[test]
+    fn test_normalize_nip05_username_rejects_length_above_boundary() {
+        let username = "a".repeat(super::MAX_NIP05_USERNAME_LENGTH + 1);
+        let result = super::normalize_nip05_username(&username);
+        assert!(
+            result.is_err(),
+            "username longer than max boundary should be rejected"
         );
+    }
+
+    #[test]
+    fn resolve_nip05_domain_returns_tenant_override() {
+        use chrono::Utc;
+
+        let tenant = crate::api::tenant::Tenant {
+            id: 1,
+            domain: "login.divine.video".to_string(),
+            name: "Divine".to_string(),
+            settings: Some(r#"{"nip05_domain":"divine.video"}"#.to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        assert_eq!(super::resolve_nip05_domain(&tenant), "divine.video");
+    }
+
+    #[test]
+    fn resolve_nip05_domain_falls_back_to_tenant_domain_when_missing() {
+        use chrono::Utc;
+
+        let tenant = crate::api::tenant::Tenant {
+            id: 1,
+            domain: "login.example.com".to_string(),
+            name: "Example".to_string(),
+            settings: Some(r#"{"relay":"wss://relay.example.com"}"#.to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        assert_eq!(super::resolve_nip05_domain(&tenant), "login.example.com");
+    }
+
+    #[test]
+    fn resolve_nip05_domain_falls_back_to_tenant_domain_on_invalid_settings() {
+        use chrono::Utc;
+
+        let tenant = crate::api::tenant::Tenant {
+            id: 1,
+            domain: "login.example.com".to_string(),
+            name: "Example".to_string(),
+            settings: Some("{invalid-json}".to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        assert_eq!(super::resolve_nip05_domain(&tenant), "login.example.com");
+    }
+
+    #[test]
+    fn resolve_nip05_domain_falls_back_to_tenant_domain_when_blank_override() {
+        use chrono::Utc;
+
+        let tenant = crate::api::tenant::Tenant {
+            id: 1,
+            domain: "login.example.com".to_string(),
+            name: "Example".to_string(),
+            settings: Some("{\"nip05_domain\":\"   \"}".to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        assert_eq!(super::resolve_nip05_domain(&tenant), "login.example.com");
+    }
+
+    #[test]
+    fn resolve_nip05_domain_falls_back_to_tenant_domain_when_override_contains_at() {
+        use chrono::Utc;
+
+        let tenant = crate::api::tenant::Tenant {
+            id: 1,
+            domain: "login.example.com".to_string(),
+            name: "Example".to_string(),
+            settings: Some(r#"{"nip05_domain":"@example.com"}"#.to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        assert_eq!(super::resolve_nip05_domain(&tenant), "login.example.com");
+    }
+
+    #[test]
+    fn resolve_nip05_domain_falls_back_to_tenant_domain_when_override_contains_slash() {
+        use chrono::Utc;
+
+        let tenant = crate::api::tenant::Tenant {
+            id: 1,
+            domain: "login.example.com".to_string(),
+            name: "Example".to_string(),
+            settings: Some(r#"{"nip05_domain":"example.com/evil"}"#.to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        assert_eq!(super::resolve_nip05_domain(&tenant), "login.example.com");
+    }
+
+    #[test]
+    fn resolve_nip05_domain_falls_back_to_tenant_domain_when_override_contains_whitespace() {
+        use chrono::Utc;
+
+        let tenant = crate::api::tenant::Tenant {
+            id: 1,
+            domain: "login.example.com".to_string(),
+            name: "Example".to_string(),
+            settings: Some(r#"{"nip05_domain":"example .com"}"#.to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        assert_eq!(super::resolve_nip05_domain(&tenant), "login.example.com");
     }
 }

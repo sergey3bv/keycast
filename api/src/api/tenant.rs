@@ -40,6 +40,7 @@ pub struct Tenant {
 pub struct TenantSettings {
     pub relay: Option<String>,
     pub email_from: Option<String>,
+    pub nip05_domain: Option<String>,
     // Add more settings as needed
 }
 
@@ -51,6 +52,7 @@ impl Tenant {
             None => Ok(TenantSettings {
                 relay: None,
                 email_from: None,
+                nip05_domain: None,
             }),
         }
     }
@@ -321,6 +323,7 @@ fn get_default_settings(domain: &str) -> String {
     let settings = TenantSettings {
         relay: Some(default_relay.clone()),
         email_from: Some(format!("noreply@{}", domain)),
+        nip05_domain: None,
     };
 
     serde_json::to_string(&settings).unwrap_or_else(|_| {
@@ -424,6 +427,25 @@ mod tests {
         let settings = tenant.get_settings().unwrap();
         assert_eq!(settings.relay, Some("wss://test.relay".to_string()));
         assert_eq!(settings.email_from, Some("noreply@test.com".to_string()));
+        assert_eq!(settings.nip05_domain, None);
+    }
+
+    #[test]
+    fn test_tenant_settings_parsing_with_nip05_domain() {
+        use chrono::Utc;
+        let tenant = Tenant {
+            id: 1,
+            domain: "login.divine.video".to_string(),
+            name: "Divine".to_string(),
+            settings: Some(
+                r#"{"relay":"wss://test.relay","email_from":"noreply@login.divine.video","nip05_domain":"divine.video"}"#.to_string(),
+            ),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let settings = tenant.get_settings().unwrap();
+        assert_eq!(settings.nip05_domain, Some("divine.video".to_string()));
     }
 
     #[test]

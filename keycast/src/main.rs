@@ -1037,6 +1037,31 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         });
 
         for tenant in tenants {
+            match tenant.get_settings() {
+                Ok(settings) => {
+                    if settings
+                        .nip05_domain
+                        .as_deref()
+                        .map(str::trim)
+                        .is_none_or(str::is_empty)
+                    {
+                        tracing::warn!(
+                            tenant_id = tenant.id,
+                            tenant_domain = %tenant.domain,
+                            "Tenant has no nip05_domain override; profiles will use tenant.domain. Backfill tenants.settings.nip05_domain before changing routing domains."
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        tenant_id = tenant.id,
+                        tenant_domain = %tenant.domain,
+                        error = %error,
+                        "Failed to parse tenant settings while preloading tenant cache"
+                    );
+                }
+            }
+
             let domain = tenant.domain.clone();
             tenant_cache_for_preload
                 .insert(domain.clone(), Arc::new(tenant))

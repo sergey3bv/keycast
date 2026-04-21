@@ -12,6 +12,9 @@ test.describe("NIP-05 profile badge", () => {
     const { cookie } = await registerAndVerify(request, email, password);
     const sessionValue = parseCookieValue(cookie);
     const sessionCookie = `keycast_session=${sessionValue}`;
+    const baseURL = process.env.API_URL || "http://localhost:3000";
+    const url = new URL(baseURL);
+    const nip05Domain = url.hostname;
 
     const updateRes = await request.post("/api/user/profile", {
       headers: { Cookie: sessionCookie },
@@ -25,10 +28,8 @@ test.describe("NIP-05 profile badge", () => {
     expect(profileRes.status()).toBe(200);
     const profile = await profileRes.json();
     expect(profile.username).toBe("alice.name_123");
-    expect(profile.nip05).toBe("alice.name_123@divine.video");
+    expect(profile.nip05).toBe(`alice.name_123@${nip05Domain}`);
 
-    const baseURL = process.env.API_URL || "http://localhost:3000";
-    const url = new URL(baseURL);
     await context.addCookies([
       {
         name: "keycast_session",
@@ -42,6 +43,6 @@ test.describe("NIP-05 profile badge", () => {
 
     await page.goto("/");
     await expect(page.locator("text=NIP-05 Verified")).toBeVisible();
-    await expect(page.locator("text=alice.name_123@divine.video")).toBeVisible();
+    await expect(page.locator(`text=alice.name_123@${nip05Domain}`)).toBeVisible();
   });
 });
