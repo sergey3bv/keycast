@@ -12,7 +12,7 @@ Keycast is a Nostr key custody service. Users store their cryptographic keys her
 | Component | What it does | Why it exists |
 |-----------|--------------|---------------|
 | **PostgreSQL** | Stores encrypted user keys | Keys encrypted at rest (AES-256-GCM) |
-| **Cloud KMS** | Holds the master encryption key | Hardware-backed, keys never exported |
+| **KMS provider (`KMS_PROVIDER`)** | Holds the master encryption key | Hardware-backed when using cloud KMS backends |
 | **Redis** | Cluster coordination only | Hashring for distributing NIP-46 relay requests across instances |
 | **Instance Cache** | Per-instance memory cache for decrypted keys | Avoids repeated KMS decryption; why session affinity matters |
 
@@ -71,7 +71,7 @@ Connection pooling: Managed PgBouncer (max_pool_size: 200, max_client_connection
 Key ring: global/keycast-keys
 Key: master-key
 Purpose: ENCRYPT_DECRYPT
-Note: Code uses GCP-specific libraries (GcpKeyManager) to access this.
+Note: Production currently uses `KMS_PROVIDER=gcp`. The runtime also supports `KMS_PROVIDER=aws` (build with `--features aws`) and `KMS_PROVIDER=file`.
 ```
 
 ### Redis (Memorystore)
@@ -123,12 +123,25 @@ This allows 5x higher concurrency without blocking request threads on bcrypt.
 
 | Variable | Value |
 |----------|-------|
-| `USE_GCP_KMS` | `true` |
+| `KMS_PROVIDER` | `gcp` |
+| `USE_GCP_KMS` | `true` (legacy compatibility) |
 | `GCP_PROJECT_ID` | `openvine-co` |
+| `AWS_KMS_KEY_ID` | unset (only for `KMS_PROVIDER=aws`) |
+| `AWS_REGION` | `us-east-1` (only for `KMS_PROVIDER=aws`) |
 | `ALLOWED_ORIGINS` | `https://login.divine.video,https://divine.video,https://*.openvine-app.pages.dev` |
 | `RUST_LOG` | `info` |
 | `SQLX_POOL_SIZE` | `50` |
 | `SQLX_STATEMENT_CACHE` | `100` |
+
+### KMS Migration (`USE_GCP_KMS` -> `KMS_PROVIDER`)
+
+- Legacy behavior: when `KMS_PROVIDER` is unset, `USE_GCP_KMS=true` selects `gcp`, otherwise `file`.
+- Recommended: set `KMS_PROVIDER` explicitly (`file`, `gcp`, `aws`) in all environments.
+- Precedence: if both are set and disagree, `KMS_PROVIDER` is source of truth.
+- Rollout order:
+  1. Set `KMS_PROVIDER` to the provider your environment is currently using.
+  2. Deploy and verify startup/config validation logs.
+  3. Remove `USE_GCP_KMS` after verification.
 
 ### Security Variables (added 2026-04-04)
 
@@ -186,6 +199,13 @@ Required roles:
 
 Redis access via VPC (no IAM needed for Memorystore BASIC).
 
+### AWS KMS IAM Minimum Policy (when `KMS_PROVIDER=aws`)
+
+Grant the runtime IAM principal access to the configured KMS key with:
+- `kms:Encrypt`
+- `kms:Decrypt`
+- `kms:DescribeKey`
+
 ---
 
 ## Backup & Recovery
@@ -240,7 +260,7 @@ GKE/ArgoCD deploys roll back by reverting the pinned image tag in `divine-iac-co
 | Dependency | At Startup | During Runtime |
 |------------|------------|----------------|
 | **Redis unreachable** | Hard failure, app exits | Exponential backoff retry (heartbeat), 1s reconnect loop (Pub/Sub). Hashring uses stale data until reconnected. App continues but may misroute NIP-46 requests. |
-| **KMS unavailable** | Hard failure if `USE_GCP_KMS=true` | Cached keys still work. New decryptions retry 3x with exponential backoff (100ms, 200ms, 400ms), then fail. |
+| **KMS unavailable** | Hard failure if `KMS_PROVIDER` is `gcp` or `aws` | Cached keys still work. New decryptions retry 3x with exponential backoff (100ms, 200ms, 400ms), then fail. |
 | **PostgreSQL down** | 5 retries with exponential backoff (1s, 2s, 4s, 8s), then exits | Immediate 500 error per request. No circuit breaker. Pool auto-reconnects when DB returns. |
 
 **Key insight:** The app degrades gracefully for Redis/KMS partial failures but has no circuit breaker for database issues.
@@ -476,10 +496,14 @@ Minimum resource requirements per instance:
 - **Memory:** 2-4 GiB (current: 4 GiB for testing)
 
 ### Encryption Dependency
-The application code (`GcpKeyManager`) currently has a hard dependency on **Google Cloud KMS** for the master key.
-- **Migration Note:** If moving compute off GCP, you must either:
-    1. Continue using GCP KMS (ensure credentials/connectivity allow it).
-    2. Rewrite the `KeyManager` implementation to use a different provider (AWS KMS, Vault, etc.).
+The runtime supports these key manager backends:
+1. `KMS_PROVIDER=file` (local master key file via `MASTER_KEY_PATH`)
+2. `KMS_PROVIDER=gcp` (Google Cloud KMS via `GCP_PROJECT_ID`)
+3. `KMS_PROVIDER=aws` (AWS KMS via `AWS_KMS_KEY_ID` and optional `AWS_REGION`, build with `--features aws`)
+
+Backward compatibility:
+- If `KMS_PROVIDER` is unset, `USE_GCP_KMS=true` selects `gcp`; otherwise `file`.
+- If both are set and disagree, `KMS_PROVIDER` wins.
 
 ---
 

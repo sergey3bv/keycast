@@ -94,8 +94,26 @@ bun run deps:up && bun run db:migrate && bun run dev
 **Runtime (environment variables):**
 - `ALLOWED_ORIGINS` - CORS origins
 - `APP_URL` - Application base URL
-- `USE_GCP_KMS` - Use GCP Key Management
+- `KMS_PROVIDER` - Key manager backend (`file`, `gcp`, `aws`)
+- `MASTER_KEY_PATH` - Required when `KMS_PROVIDER=file`
+- `GCP_PROJECT_ID` - Required when `KMS_PROVIDER=gcp`
+- `AWS_KMS_KEY_ID` - Required when `KMS_PROVIDER=aws`
+- `AWS_REGION` - Optional AWS region (`us-east-1` default) when `KMS_PROVIDER=aws`
+- `USE_GCP_KMS` - Legacy compatibility flag when `KMS_PROVIDER` is unset
 - `SENDGRID_API_KEY` - Email service
+
+**KMS provider compatibility:**
+- If `KMS_PROVIDER` and `USE_GCP_KMS` disagree, `KMS_PROVIDER` wins.
+- Migration path: set `KMS_PROVIDER` explicitly, verify startup, then remove `USE_GCP_KMS`.
+
+### AWS KMS Local Build/Run
+
+When testing `KMS_PROVIDER=aws`, build the binary with AWS feature support:
+
+```bash
+cargo build --bin keycast --features aws
+KMS_PROVIDER=aws AWS_KMS_KEY_ID=<key-id-or-arn> AWS_REGION=us-east-1 cargo run --bin keycast --features aws
+```
 
 ## Deployment Checklist
 

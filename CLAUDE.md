@@ -114,7 +114,11 @@ All API authentication uses **UCAN tokens** (Bearer token or `keycast_session` c
 
 - PostgreSQL database with SQLx for compile-time query verification
 - AES-256-GCM row-level encryption for all private keys (encrypted at rest, decrypted only when used)
-- Supports file-based key manager (default) or GCP KMS (`USE_GCP_KMS=true`)
+- Supports `KMS_PROVIDER=file|gcp|aws`:
+  - `file` (default): local master key file
+  - `gcp`: Google Cloud KMS
+  - `aws`: AWS KMS (requires build with `--features aws`)
+- Backward compatibility: if `KMS_PROVIDER` is unset, `USE_GCP_KMS=true` selects `gcp`, otherwise `file`; if both are set and disagree, `KMS_PROVIDER` is source of truth
 - Database migrations in `database/migrations/`
 
 Key tables:
@@ -193,8 +197,12 @@ Required (set in `.env` or docker-compose):
 Optional:
 - `REDIS_URL`: Redis connection string for cluster coordination (required in production)
 - `REDIS_KEY_PREFIX`: Optional prefix for all Redis keys (e.g., `keycast` → `keycast:oauth_poll:...`). Useful for multi-app GCP Memorystore deployments.
-- `MASTER_KEY_PATH`: Path to master encryption key file (default: `./master.key`)
-- `USE_GCP_KMS`: Use Google Cloud KMS instead of file-based encryption (default: `false`)
+- `KMS_PROVIDER`: Key manager backend (`file`, `gcp`, or `aws`; default: `file`)
+- `MASTER_KEY_PATH`: Path to master encryption key file (required when `KMS_PROVIDER=file`, default: `./master.key`)
+- `USE_GCP_KMS`: Legacy compatibility flag. If `KMS_PROVIDER` is unset, `true` selects `gcp`; otherwise ignored when `KMS_PROVIDER` is set.
+- `GCP_PROJECT_ID`: Required when `KMS_PROVIDER=gcp`
+- `AWS_KMS_KEY_ID`: Required when `KMS_PROVIDER=aws` (key ID/ARN/alias)
+- `AWS_REGION`: AWS KMS region for `KMS_PROVIDER=aws` (default: `us-east-1`)
 - `USE_VALKEY_IAM`: Enable GCP IAM authentication for Memorystore Valkey (default: `false`). When enabled, uses Workload Identity to obtain access tokens for Redis authentication. Tokens are cached and refreshed automatically before expiry.
 - `BUNKER_RELAYS`: Comma-separated relay URLs for NIP-46 communication (required, no default)
 - `RUST_LOG`: Log level configuration (default: `info`)

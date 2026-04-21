@@ -138,7 +138,7 @@ curl -X POST https://login.divine.video/api/nostr \
 
 Both return the same signed events. Use HTTP RPC for lower latency; use NIP-46 bunker URL with existing nostr-tools/NDK integrations.
 
-**Key encryption**: AES-256-GCM at rest in PostgreSQL. Production uses GCP KMS (keys never leave hardware).
+**Key encryption**: AES-256-GCM at rest in PostgreSQL. Configure key management with `KMS_PROVIDER=file|gcp|aws`.
 
 ## API Reference
 
@@ -226,7 +226,31 @@ See [DEVELOPMENT.md](./docs/DEVELOPMENT.md) for local development setup.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `USE_GCP_KMS` | *(none)* | Use GCP KMS instead of file-based key |
+| `KMS_PROVIDER` | `file` | Key manager backend: `file`, `gcp`, or `aws` |
+| `MASTER_KEY_PATH` | `./master.key` | Required when `KMS_PROVIDER=file` |
+| `GCP_PROJECT_ID` | *(none)* | Required when `KMS_PROVIDER=gcp` |
+| `AWS_KMS_KEY_ID` | *(none)* | Required when `KMS_PROVIDER=aws` (key ID/ARN/alias) |
+| `AWS_REGION` | `us-east-1` | AWS KMS region when `KMS_PROVIDER=aws` |
+| `USE_GCP_KMS` | *(legacy)* | Backward compatibility only; if `KMS_PROVIDER` is also set, `KMS_PROVIDER` wins |
+
+#### KMS Provider Migration (`USE_GCP_KMS` -> `KMS_PROVIDER`)
+
+- Legacy behavior: when `KMS_PROVIDER` is unset, `USE_GCP_KMS=true` selects `gcp`, otherwise `file`.
+- Recommended behavior: set `KMS_PROVIDER` explicitly in every environment.
+- If both variables are set and disagree, runtime uses `KMS_PROVIDER` as source of truth.
+- Safe rollout:
+  1. Set `KMS_PROVIDER` to your current effective provider.
+  2. Deploy and verify startup/config validation succeeds.
+  3. Remove legacy `USE_GCP_KMS` once validated.
+
+#### AWS KMS Notes
+
+- Build with AWS support when using `KMS_PROVIDER=aws`:
+  - `cargo build --release --bin keycast --features aws`
+- Minimum IAM permissions for the configured KMS key:
+  - `kms:Encrypt`
+  - `kms:Decrypt`
+  - `kms:DescribeKey`
 
 ## History & Team Key Management
 

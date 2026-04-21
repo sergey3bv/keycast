@@ -63,7 +63,10 @@
 **Impact:** Silent failures, wrong configuration in production
 **Plan:**
 - Create startup validation function
-- Check all required vars: DATABASE_URL, ALLOWED_ORIGINS, MASTER_KEY_PATH (or USE_GCP_KMS)
+- Check all required vars: DATABASE_URL, ALLOWED_ORIGINS, and KMS vars by provider (`KMS_PROVIDER=file|gcp|aws`):
+  - `file` -> `MASTER_KEY_PATH`
+  - `gcp` -> `GCP_PROJECT_ID`
+  - `aws` -> `AWS_KMS_KEY_ID` (and usually `AWS_REGION`)
 - Fail with clear error if missing
 **Effort:** 2-3 hours
 
