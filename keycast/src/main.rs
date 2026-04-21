@@ -244,33 +244,41 @@ async fn cache_control_middleware(request: Request<Body>, next: Next) -> Respons
 
 /// Validate required environment variables at startup
 fn validate_environment() -> Result<(), String> {
-    let mut errors = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
 
     // Required variables
     if env::var("DATABASE_URL").is_err() {
-        errors.push("DATABASE_URL must be set (PostgreSQL connection string)");
+        errors.push("DATABASE_URL must be set (PostgreSQL connection string)".to_string());
     }
 
     if env::var("ALLOWED_ORIGINS").is_err() {
-        errors.push("ALLOWED_ORIGINS must be set (comma-separated CORS origins)");
+        errors.push("ALLOWED_ORIGINS must be set (comma-separated CORS origins)".to_string());
     }
 
     if env::var("SERVER_NSEC").is_err() {
-        errors.push("SERVER_NSEC must be set (server's Nostr secret key for signing UCANs)");
+        errors.push(
+            "SERVER_NSEC must be set (server's Nostr secret key for signing UCANs)".to_string(),
+        );
     }
 
     if env::var("REDIS_URL").is_err() {
-        errors.push("REDIS_URL must be set (Redis/Memorystore URL for cluster coordination)");
+        errors.push(
+            "REDIS_URL must be set (Redis/Memorystore URL for cluster coordination)".to_string(),
+        );
     }
 
     // Master key validation (either file or GCP KMS)
     let use_gcp_kms = env::var("USE_GCP_KMS").unwrap_or_else(|_| "false".to_string()) == "true";
     if !use_gcp_kms && env::var("MASTER_KEY_PATH").is_err() {
-        errors.push("MASTER_KEY_PATH must be set when USE_GCP_KMS=false");
+        errors.push("MASTER_KEY_PATH must be set when USE_GCP_KMS=false".to_string());
     }
 
     if use_gcp_kms && env::var("GCP_PROJECT_ID").is_err() {
-        errors.push("GCP_PROJECT_ID must be set when USE_GCP_KMS=true");
+        errors.push("GCP_PROJECT_ID must be set when USE_GCP_KMS=true".to_string());
+    }
+
+    if let Err(err) = keycast_api::email_service::validate_email_sender_config() {
+        errors.push(format!("Invalid email provider configuration: {}", err));
     }
 
     // Tenant isolation configuration
@@ -302,7 +310,7 @@ fn validate_environment() -> Result<(), String> {
 
     // Validate email configuration (fail-closed in production)
     if let Err(e) = keycast_api::email_service::create_email_sender() {
-        errors.push(Box::leak(e.into_boxed_str()));
+        errors.push(e);
     }
 
     if !errors.is_empty() {
