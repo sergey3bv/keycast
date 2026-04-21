@@ -18,7 +18,7 @@ fn test_tenant(tenant_id: i64, domain: &str) -> TenantExtractor {
         id: tenant_id,
         domain: domain.to_string(),
         name: "Test".to_string(),
-        settings: None,
+        settings: Some(r#"{"relay":"wss://relay.example.com"}"#.to_string()),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }))
@@ -85,5 +85,42 @@ async fn nostr_discovery_returns_empty_names_for_unknown_user() {
         payload["names"].as_object().map(|names| names.len()),
         Some(0),
         "unknown usernames should return an empty names map"
+    );
+}
+
+#[tokio::test]
+async fn nostr_discovery_without_name_returns_nip46_and_empty_names() {
+    let pool = common::setup_test_db().await;
+    let tenant_id = 1_i64;
+
+    let response = nostr_discovery_public(
+        test_tenant(tenant_id, "login.divine.video"),
+        State(pool),
+        Query(HashMap::new()),
+        HeaderMap::new(),
+    )
+    .await
+    .into_response();
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: Value = serde_json::from_slice(&body).expect("response must be valid JSON");
+
+    assert!(payload["names"].is_object());
+    assert_eq!(
+        payload["names"].as_object().map(|names| names.len()),
+        Some(0),
+        "no-query discovery should return an empty names map"
+    );
+    assert!(
+        payload["nip46"]["relay"]
+            .as_str()
+            .is_some_and(|relay| !relay.is_empty()),
+        "discovery should include nip46.relay"
+    );
+    assert!(
+        payload["nip46"]["nostrconnect_url"]
+            .as_str()
+            .is_some_and(|url| url.contains("/api/connect/<nostrconnect>")),
+        "discovery should include nip46.nostrconnect_url template"
     );
 }
