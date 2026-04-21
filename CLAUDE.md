@@ -203,6 +203,7 @@ Optional:
 - `GCP_PROJECT_ID`: Required when `KMS_PROVIDER=gcp`
 - `AWS_KMS_KEY_ID`: Required when `KMS_PROVIDER=aws` (key ID/ARN/alias)
 - `AWS_REGION`: AWS KMS region for `KMS_PROVIDER=aws` (default: `us-east-1`)
+- Build with `cargo build --features aws --bin keycast` to enable AWS integrations in the unified binary (including `EMAIL_PROVIDER=ses`; without this feature, explicit SES config fails at startup)
 - `USE_VALKEY_IAM`: Enable GCP IAM authentication for Memorystore Valkey (default: `false`). When enabled, uses Workload Identity to obtain access tokens for Redis authentication. Tokens are cached and refreshed automatically before expiry.
 - `BUNKER_RELAYS`: Comma-separated relay URLs for NIP-46 communication (required, no default)
 - `NIP05_DOMAIN`: When the tenant host is `localhost` or `127.0.0.1` only, overrides the domain used in profile `nip05` (with `DOMAIN` as second choice); does **not** override the tenant domain for real hosts—profile and `/.well-known/nostr.json` must stay on the same host
