@@ -65,10 +65,13 @@ pub fn generate_secure_token() -> String {
 /// `127.0.0.1` (local dev), with `DEFAULT_NIP05_DOMAIN` as the final fallback.
 fn resolve_nip05_domain(tenant_domain: &str) -> String {
     if tenant_domain == "localhost" || tenant_domain == "127.0.0.1" {
-        return std::env::var("NIP05_DOMAIN")
-            .ok()
-            .or_else(|| std::env::var("DOMAIN").ok())
-            .filter(|value| !value.trim().is_empty())
+        let non_empty_env = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        };
+        return non_empty_env("NIP05_DOMAIN")
+            .or_else(|| non_empty_env("DOMAIN"))
             .unwrap_or_else(|| DEFAULT_NIP05_DOMAIN.to_string());
     }
     tenant_domain.to_string()
@@ -3859,6 +3862,7 @@ mod tests {
     #[cfg(feature = "integration-tests")]
     use moka::future::Cache;
     use nostr_sdk::{Keys, Kind, Timestamp, UnsignedEvent};
+    use serial_test::serial;
     #[cfg(feature = "integration-tests")]
     use sqlx::PgPool;
     #[cfg(feature = "integration-tests")]
@@ -3930,6 +3934,35 @@ mod tests {
             .await
             .expect("response body should be readable");
         serde_json::from_slice(&body).expect("response body should be JSON")
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, original }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(original) = &self.original {
+                std::env::set_var(self.key, original);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
     }
 
     /// Helper to create test database connection
@@ -4637,6 +4670,76 @@ mod tests {
         // NOTE: Content length validation not implemented yet (would need new permission type)
         // Current permissions: allowed_kinds, content_filter (word blocking), encrypt_to_self
         println!("✅ Content length validation tested");
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_nip05_domain_prefers_nip05_domain_env() {
+        let _nip05_domain_guard = EnvVarGuard::set("NIP05_DOMAIN", "nip05.example");
+        let _domain_guard = EnvVarGuard::set("DOMAIN", "domain.example");
+
+        let resolved_localhost = super::resolve_nip05_domain("localhost");
+        let resolved_loopback = super::resolve_nip05_domain("127.0.0.1");
+        assert_eq!(resolved_localhost, "nip05.example");
+        assert_eq!(resolved_loopback, "nip05.example");
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_nip05_domain_falls_back_to_domain_env() {
+        let _nip05_domain_guard = EnvVarGuard::remove("NIP05_DOMAIN");
+        let _domain_guard = EnvVarGuard::set("DOMAIN", "domain.example");
+
+        let resolved_localhost = super::resolve_nip05_domain("localhost");
+        let resolved_loopback = super::resolve_nip05_domain("127.0.0.1");
+        assert_eq!(resolved_localhost, "domain.example");
+        assert_eq!(resolved_loopback, "domain.example");
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_nip05_domain_uses_default_for_localhost() {
+        let _nip05_domain_guard = EnvVarGuard::remove("NIP05_DOMAIN");
+        let _domain_guard = EnvVarGuard::remove("DOMAIN");
+
+        let resolved_localhost = super::resolve_nip05_domain("localhost");
+        let resolved_loopback = super::resolve_nip05_domain("127.0.0.1");
+        assert_eq!(resolved_localhost, super::DEFAULT_NIP05_DOMAIN);
+        assert_eq!(resolved_loopback, super::DEFAULT_NIP05_DOMAIN);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_nip05_domain_passthroughs_tenant_domain() {
+        let _nip05_domain_guard = EnvVarGuard::remove("NIP05_DOMAIN");
+        let _domain_guard = EnvVarGuard::remove("DOMAIN");
+
+        let resolved = super::resolve_nip05_domain("tenant.example");
+        assert_eq!(resolved, "tenant.example");
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_nip05_domain_ignores_empty_env_values() {
+        let _nip05_domain_guard = EnvVarGuard::set("NIP05_DOMAIN", "   ");
+        let _domain_guard = EnvVarGuard::set("DOMAIN", "");
+
+        let resolved_localhost = super::resolve_nip05_domain("localhost");
+        let resolved_loopback = super::resolve_nip05_domain("127.0.0.1");
+        assert_eq!(resolved_localhost, super::DEFAULT_NIP05_DOMAIN);
+        assert_eq!(resolved_loopback, super::DEFAULT_NIP05_DOMAIN);
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_nip05_domain_uses_domain_when_nip05_domain_is_empty() {
+        let _nip05_domain_guard = EnvVarGuard::set("NIP05_DOMAIN", "  ");
+        let _domain_guard = EnvVarGuard::set("DOMAIN", "domain.example");
+
+        let resolved_localhost = super::resolve_nip05_domain("localhost");
+        let resolved_loopback = super::resolve_nip05_domain("127.0.0.1");
+        assert_eq!(resolved_localhost, "domain.example");
+        assert_eq!(resolved_loopback, "domain.example");
     }
 
     #[test]
