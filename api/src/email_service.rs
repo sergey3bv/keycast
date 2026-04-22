@@ -9,6 +9,8 @@ use aws_sdk_sesv2::types::{
 };
 #[cfg(feature = "aws")]
 use aws_sdk_sesv2::Client as SesClient;
+#[cfg(feature = "aws")]
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::Serialize;
 use std::env;
 use std::sync::{Arc, Mutex};
@@ -412,7 +414,7 @@ impl SendGridEmailSender {
         text_content: &str,
     ) -> Result<(), String> {
         // Check if emails are disabled (useful for load testing)
-        if env::var("DISABLE_EMAILS").is_ok() {
+        if emails_disabled() {
             tracing::info!(
                 "Emails disabled via DISABLE_EMAILS env var, skipping email to {}",
                 to_email
@@ -579,7 +581,7 @@ impl SesEmailSender {
         html_content: &str,
         text_content: &str,
     ) -> Result<(), String> {
-        if env::var("DISABLE_EMAILS").is_ok() {
+        if emails_disabled() {
             tracing::info!(
                 "Emails disabled via DISABLE_EMAILS env var, skipping email to {}",
                 to_email
@@ -588,7 +590,7 @@ impl SesEmailSender {
         }
 
         let client = self.get_client().await?;
-        let from = format!("{} <{}>", self.from_name, self.from_email);
+        let from = build_ses_from_address(&self.from_name, &self.from_email);
         let destination = SesDestination::builder().to_addresses(to_email).build();
         let subject_content = SesContent::builder()
             .data(subject)
@@ -735,6 +737,142 @@ fn has_sendgrid_key(sendgrid_api_key_env: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+fn emails_disabled() -> bool {
+    env::var("DISABLE_EMAILS").is_ok()
+}
+
+#[cfg(feature = "aws")]
+fn is_atext_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric()
+        || matches!(
+            ch,
+            '!' | '#'
+                | '$'
+                | '%'
+                | '&'
+                | '\''
+                | '*'
+                | '+'
+                | '-'
+                | '/'
+                | '='
+                | '?'
+                | '^'
+                | '_'
+                | '`'
+                | '{'
+                | '|'
+                | '}'
+                | '~'
+        )
+}
+
+#[cfg(feature = "aws")]
+const MAX_SANITIZED_DISPLAY_NAME_OCTETS: usize = 200;
+
+#[cfg(feature = "aws")]
+fn sanitize_display_name(display_name: &str) -> String {
+    let mut sanitized = String::new();
+    let mut used_octets = 0usize;
+
+    for ch in display_name.chars() {
+        let normalized_ch = if ch.is_ascii_control() { ' ' } else { ch };
+        let normalized_octets = normalized_ch.len_utf8();
+
+        if used_octets + normalized_octets > MAX_SANITIZED_DISPLAY_NAME_OCTETS {
+            break;
+        }
+
+        sanitized.push(normalized_ch);
+        used_octets += normalized_octets;
+    }
+
+    sanitized.trim().to_string()
+}
+
+#[cfg(feature = "aws")]
+fn can_use_unquoted_display_name(display_name: &str) -> bool {
+    !display_name.is_empty()
+        && display_name
+            .split(' ')
+            .all(|part| !part.is_empty() && part.chars().all(is_atext_char))
+}
+
+#[cfg(feature = "aws")]
+fn format_ses_display_name(display_name: &str) -> Option<String> {
+    const RFC_2047_MAX_WORD_OCTETS: usize = 75;
+    const RFC_2047_BWORD_WRAPPER_OCTETS: usize = 12;
+    const RFC_2047_MAX_B64_PAYLOAD_OCTETS: usize = 60;
+    const RFC_2047_MAX_UTF8_CHUNK_OCTETS: usize = 45;
+
+    let normalized = sanitize_display_name(display_name);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if !normalized.is_ascii() {
+        let mut encoded_words = Vec::new();
+        let mut chunk = String::new();
+        let mut chunk_octets = 0usize;
+
+        for ch in normalized.chars() {
+            let ch_octets = ch.len_utf8();
+            if chunk_octets + ch_octets > RFC_2047_MAX_UTF8_CHUNK_OCTETS && !chunk.is_empty() {
+                let encoded_payload = BASE64_STANDARD.encode(chunk.as_bytes());
+                debug_assert_eq!(encoded_payload.len() % 4, 0);
+                debug_assert!(encoded_payload.len() <= RFC_2047_MAX_B64_PAYLOAD_OCTETS);
+                debug_assert!(
+                    encoded_payload.len() + RFC_2047_BWORD_WRAPPER_OCTETS
+                        <= RFC_2047_MAX_WORD_OCTETS
+                );
+                encoded_words.push(format!("=?UTF-8?B?{}?=", encoded_payload));
+                chunk.clear();
+                chunk_octets = 0;
+            }
+
+            chunk.push(ch);
+            chunk_octets += ch_octets;
+        }
+
+        if !chunk.is_empty() {
+            let encoded_payload = BASE64_STANDARD.encode(chunk.as_bytes());
+            debug_assert_eq!(encoded_payload.len() % 4, 0);
+            debug_assert!(encoded_payload.len() <= RFC_2047_MAX_B64_PAYLOAD_OCTETS);
+            debug_assert!(
+                encoded_payload.len() + RFC_2047_BWORD_WRAPPER_OCTETS <= RFC_2047_MAX_WORD_OCTETS
+            );
+            encoded_words.push(format!("=?UTF-8?B?{}?=", encoded_payload));
+        }
+
+        return Some(encoded_words.join(" "));
+    }
+
+    if can_use_unquoted_display_name(&normalized) {
+        return Some(normalized);
+    }
+
+    let mut escaped = String::with_capacity(normalized.len());
+    for ch in normalized.chars() {
+        match ch {
+            '"' | '\\' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+
+    Some(format!("\"{}\"", escaped))
+}
+
+#[cfg(feature = "aws")]
+fn build_ses_from_address(from_name: &str, from_email: &str) -> String {
+    match format_ses_display_name(from_name) {
+        Some(display_name) => format!("{} <{}>", display_name, from_email),
+        None => from_email.to_string(),
+    }
+}
+
 fn decide_provider(
     email_provider_env: Option<&str>,
     sendgrid_api_key_env: Option<&str>,
@@ -813,11 +951,9 @@ pub fn create_email_sender() -> Result<Arc<dyn EmailSender>, String> {
             let env_mode = env::var("RUST_ENV")
                 .or_else(|_| env::var("NODE_ENV"))
                 .unwrap_or_else(|_| "development".to_string());
-            let emails_disabled = env::var("DISABLE_EMAILS")
-                .ok()
-                .is_some_and(|value| value == "true");
+            let emails_disabled = emails_disabled();
             if env_mode == "production" && !emails_disabled {
-                return Err("No email provider configured for production (set SENDGRID_API_KEY, EMAIL_PROVIDER=ses with aws build support, or DISABLE_EMAILS=true)".to_string());
+                return Err("No email provider configured for production (set SENDGRID_API_KEY, EMAIL_PROVIDER=ses with aws build support, or set DISABLE_EMAILS)".to_string());
             }
 
             if !provider_is_explicit {
@@ -873,6 +1009,22 @@ mod tests {
 
     // Serial test lock to prevent env var races between tests
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(feature = "aws")]
+    fn decode_rfc2047_b_words(value: &str) -> String {
+        let mut decoded = Vec::new();
+        for encoded_word in value.split(' ') {
+            let encoded_payload = encoded_word
+                .strip_prefix("=?UTF-8?B?")
+                .and_then(|word| word.strip_suffix("?="))
+                .expect("encoded-word should use UTF-8 base64 format");
+            let bytes = BASE64_STANDARD
+                .decode(encoded_payload)
+                .expect("encoded payload should be valid base64");
+            decoded.extend_from_slice(&bytes);
+        }
+        String::from_utf8(decoded).expect("decoded encoded-words should be valid UTF-8")
+    }
 
     /// Helper to run a closure with specific env vars set, restoring originals afterward
     fn with_env_vars<F, R>(vars: &[(&str, Option<&str>)], f: F) -> R
@@ -1105,8 +1257,109 @@ mod tests {
             create_email_sender,
         );
         assert!(
-            result.is_err(),
-            "Empty DISABLE_EMAILS should not bypass production check"
+            result.is_ok(),
+            "Any DISABLE_EMAILS presence should bypass production check"
+        );
+    }
+
+    #[cfg(feature = "aws")]
+    #[test]
+    fn ses_display_name_keeps_simple_ascii_unquoted() {
+        assert_eq!(
+            format_ses_display_name("Divine Team"),
+            Some("Divine Team".to_string())
+        );
+    }
+
+    #[cfg(feature = "aws")]
+    #[test]
+    fn ses_display_name_quotes_special_characters() {
+        assert_eq!(
+            format_ses_display_name("Divine, Inc."),
+            Some("\"Divine, Inc.\"".to_string())
+        );
+    }
+
+    #[cfg(feature = "aws")]
+    #[test]
+    fn ses_display_name_escapes_quotes_and_backslashes() {
+        assert_eq!(
+            format_ses_display_name("Team \"A\" \\ Ops"),
+            Some("\"Team \\\"A\\\" \\\\ Ops\"".to_string())
+        );
+    }
+
+    #[cfg(feature = "aws")]
+    #[test]
+    fn ses_display_name_encodes_non_ascii_as_encoded_word() {
+        let formatted =
+            format_ses_display_name("diVine привет").expect("display name should exist");
+        assert_eq!(decode_rfc2047_b_words(&formatted), "diVine привет");
+    }
+
+    #[cfg(feature = "aws")]
+    #[test]
+    fn ses_display_name_sanitizes_all_c0_controls_and_del() {
+        assert_eq!(
+            format_ses_display_name("Foo\u{0000}\u{0001}\u{000B}\u{001F}\u{007F}Bar"),
+            Some("\"Foo     Bar\"".to_string())
+        );
+    }
+
+    #[cfg(feature = "aws")]
+    #[test]
+    fn ses_display_name_chunks_long_non_ascii_to_rfc2047_limit() {
+        let name = "🙂".repeat(20);
+        let formatted = format_ses_display_name(&name).expect("display name should exist");
+        let encoded_words: Vec<&str> = formatted.split(' ').collect();
+
+        assert!(
+            encoded_words.len() > 1,
+            "long non-ASCII names should be chunked"
+        );
+        for encoded_word in &encoded_words {
+            assert!(encoded_word.starts_with("=?UTF-8?B?"));
+            assert!(encoded_word.ends_with("?="));
+            assert!(
+                encoded_word.len() <= 75,
+                "encoded-word must be <= 75 octets: {}",
+                encoded_word.len()
+            );
+        }
+        assert_eq!(decode_rfc2047_b_words(&formatted), name);
+    }
+
+    #[cfg(feature = "aws")]
+    #[test]
+    fn ses_display_name_caps_long_ascii_names() {
+        let formatted =
+            format_ses_display_name(&"A".repeat(400)).expect("display name should exist");
+        let expected = "A".repeat(MAX_SANITIZED_DISPLAY_NAME_OCTETS);
+
+        assert_eq!(formatted, expected);
+        assert_eq!(formatted.len(), MAX_SANITIZED_DISPLAY_NAME_OCTETS);
+    }
+
+    #[cfg(feature = "aws")]
+    #[test]
+    fn ses_display_name_caps_long_non_ascii_names() {
+        let formatted =
+            format_ses_display_name(&"🙂".repeat(100)).expect("display name should exist");
+        let decoded = decode_rfc2047_b_words(&formatted);
+
+        assert_eq!(
+            decoded,
+            "🙂".repeat(MAX_SANITIZED_DISPLAY_NAME_OCTETS / "🙂".len())
+        );
+        assert!(decoded.len() <= MAX_SANITIZED_DISPLAY_NAME_OCTETS);
+    }
+
+    #[cfg(feature = "aws")]
+    #[test]
+    fn ses_from_address_falls_back_to_email_when_name_empty() {
+        assert_eq!(
+            build_ses_from_address(" \r\n\t ", "noreply@divine.video"),
+            "noreply@divine.video"
         );
     }
 }
