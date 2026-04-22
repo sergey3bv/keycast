@@ -60,6 +60,9 @@ pub struct HttpRpcHandler {
 
     /// Cache key: authorization handle (used for OAuth re-auth only)
     authorization_handle: CacheKey,
+
+    /// Optional DPoP JWK thumbprint bound via UCAN cnf.jkt
+    dpop_cnf_jkt: Option<String>,
 }
 
 impl HttpRpcHandler {
@@ -74,6 +77,7 @@ impl HttpRpcHandler {
         is_oauth: bool,
         bunker_pubkey: CacheKey,
         authorization_handle: CacheKey,
+        dpop_cnf_jkt: Option<String>,
     ) -> Self {
         let user_pubkey = signing.public_key();
         Self {
@@ -86,6 +90,7 @@ impl HttpRpcHandler {
             is_oauth,
             bunker_pubkey,
             authorization_handle,
+            dpop_cnf_jkt,
         }
     }
 
@@ -207,6 +212,11 @@ impl HttpRpcHandler {
     /// Check if this is an OAuth authorization
     pub fn is_oauth(&self) -> bool {
         self.is_oauth
+    }
+
+    /// Get expected DPoP JWK thumbprint if token is DPoP-bound.
+    pub fn expected_dpop_jkt(&self) -> Option<&str> {
+        self.dpop_cnf_jkt.as_deref()
     }
 
     /// Sign an event after checking validity and permissions
@@ -380,6 +390,7 @@ mod tests {
             true,
             bunker_key,
             auth_handle,
+            None,
         )
     }
 
@@ -471,5 +482,24 @@ mod tests {
         let cached = cache.get(&key).await;
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().authorization_id(), 1);
+    }
+
+    #[test]
+    fn test_expected_dpop_jkt_accessor() {
+        let keys = Keys::generate();
+        let signing = Arc::new(SigningSession::new(keys));
+        let handler = HttpRpcHandler::new(
+            signing,
+            1,
+            None,
+            None,
+            vec![],
+            true,
+            [0u8; 32],
+            [1u8; 32],
+            Some("thumbprint-123".to_string()),
+        );
+
+        assert_eq!(handler.expected_dpop_jkt(), Some("thumbprint-123"));
     }
 }

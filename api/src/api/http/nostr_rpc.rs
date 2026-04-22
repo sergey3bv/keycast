@@ -245,6 +245,7 @@ async fn load_handler_on_demand(
     pool: &sqlx::PgPool,
     bunker_pubkey_hex: &str,
     tenant_id: i64,
+    dpop_cnf_jkt: Option<String>,
 ) -> Result<Arc<HttpRpcHandler>, RpcError> {
     let key_manager = auth_state.state.key_manager.as_ref();
 
@@ -319,6 +320,7 @@ async fn load_handler_on_demand(
         true, // OAuth authorization
         bunker_key,
         auth_handle,
+        dpop_cnf_jkt,
     ));
 
     // Note: Caching is done by caller with BLAKE3(token) key, not here
@@ -348,6 +350,34 @@ fn compute_token_cache_key(auth_header: &str) -> Option<CacheKey> {
     Some(*blake3::hash(token.as_bytes()).as_bytes())
 }
 
+fn enforce_cached_dpop_binding(
+    handler: &HttpRpcHandler,
+    headers: &HeaderMap,
+    htu: &str,
+) -> Result<(), RpcError> {
+    let Some(expected_jkt) = handler.expected_dpop_jkt() else {
+        return Ok(());
+    };
+
+    match crate::ucan_auth::verify_dpop_proof(headers, "POST", htu, Some(expected_jkt)) {
+        Ok(Some(_)) => {
+            tracing::debug!("RPC: DPoP binding verified on cache hit");
+            Ok(())
+        }
+        Ok(None) => {
+            tracing::warn!(
+                "RPC: DPoP-bound token used without DPoP proof on cache hit (jkt={})",
+                &expected_jkt[..8.min(expected_jkt.len())]
+            );
+            Err(RpcError::Auth(AuthError::InvalidToken))
+        }
+        Err(e) => {
+            tracing::warn!("RPC: DPoP verification failed on cache hit: {}", e);
+            Err(RpcError::Auth(AuthError::InvalidToken))
+        }
+    }
+}
+
 /// Check if issuer matches server pubkey (server-signed UCAN)
 fn is_server_signed(ucan: &ucan::Ucan) -> bool {
     crate::ucan_auth::is_server_signed(ucan)
@@ -361,6 +391,7 @@ async fn load_preloaded_user_handler(
     pool: &sqlx::PgPool,
     user_pubkey_hex: &str,
     tenant_id: i64,
+    dpop_cnf_jkt: Option<String>,
 ) -> Result<Arc<HttpRpcHandler>, RpcError> {
     let key_manager = auth_state.state.key_manager.as_ref();
 
@@ -418,6 +449,7 @@ async fn load_preloaded_user_handler(
         false,  // Not OAuth (preloaded user mode)
         cache_key,
         cache_key, // Use same key for auth_handle
+        dpop_cnf_jkt,
     ));
 
     tracing::info!(
@@ -464,36 +496,9 @@ async fn get_handler(
             return Err(RpcError::Auth(AuthError::InvalidToken));
         }
 
-        // Even on cache hit, we must enforce DPoP binding if the token has cnf.jkt
-        // Parse the UCAN to check for DPoP binding (lightweight compared to full verification)
-        if let Ok((_user_pubkey, _redirect_origin, _bunker_pubkey, ucan)) =
-            crate::ucan_auth::validate_ucan_token(auth_header, tenant_id).await
-        {
-            if let Some(expected_jkt) = crate::ucan_auth::extract_cnf_jkt_from_ucan(&ucan) {
-                let htu = construct_htu(headers);
-                match crate::ucan_auth::verify_dpop_proof(
-                    headers,
-                    "POST",
-                    &htu,
-                    Some(&expected_jkt),
-                ) {
-                    Ok(Some(_)) => {
-                        tracing::debug!("RPC: DPoP binding verified on cache hit");
-                    }
-                    Ok(None) => {
-                        tracing::warn!(
-                            "RPC: DPoP-bound token used without DPoP proof on cache hit (jkt={})",
-                            &expected_jkt[..8.min(expected_jkt.len())]
-                        );
-                        return Err(RpcError::Auth(AuthError::InvalidToken));
-                    }
-                    Err(e) => {
-                        tracing::warn!("RPC: DPoP verification failed on cache hit: {}", e);
-                        return Err(RpcError::Auth(AuthError::InvalidToken));
-                    }
-                }
-            }
-        }
+        // On cache hit, enforce DPoP binding from cached UCAN cnf.jkt.
+        let htu = construct_htu(headers);
+        enforce_cached_dpop_binding(&handler, headers, &htu)?;
 
         // Cache hit! Skip full UCAN verification
         METRICS.inc_http_rpc_cache_hit();
@@ -510,12 +515,13 @@ async fn get_handler(
             .await
             .map_err(|_| RpcError::Auth(AuthError::InvalidToken))?;
 
-    // Enforce DPoP binding if the UCAN contains cnf.jkt
-    // The DPoP proof must match the bound key for resource access
-    if let Some(expected_jkt) = crate::ucan_auth::extract_cnf_jkt_from_ucan(&ucan) {
+    let dpop_cnf_jkt = crate::ucan_auth::extract_cnf_jkt_from_ucan(&ucan);
+
+    // Enforce DPoP binding if the UCAN contains cnf.jkt.
+    if let Some(expected_jkt) = dpop_cnf_jkt.as_deref() {
         // RFC 9449 requires htu to be the absolute URI (scheme + host + path)
         let htu = construct_htu(headers);
-        match crate::ucan_auth::verify_dpop_proof(headers, "POST", &htu, Some(&expected_jkt)) {
+        match crate::ucan_auth::verify_dpop_proof(headers, "POST", &htu, Some(expected_jkt)) {
             Ok(Some(_)) => {
                 tracing::debug!("RPC: DPoP binding verified for cnf.jkt");
             }
@@ -536,7 +542,14 @@ async fn get_handler(
     // Determine which authentication mode to use
     let handler = if let Some(bunker_key_hex) = bunker_pubkey {
         // MODE 1: OAuth token with bunker_pubkey - load from oauth_authorizations (tenant-scoped)
-        let h = load_handler_on_demand(auth_state, pool, &bunker_key_hex, tenant_id).await?;
+        let h = load_handler_on_demand(
+            auth_state,
+            pool,
+            &bunker_key_hex,
+            tenant_id,
+            dpop_cnf_jkt.clone(),
+        )
+        .await?;
         tracing::debug!(
             "RPC: Loaded OAuth handler for bunker {}",
             &bunker_key_hex[..8]
@@ -545,7 +558,14 @@ async fn get_handler(
     } else if is_server_signed(&ucan) {
         // MODE 2: Preloaded user - server-signed UCAN without bunker_pubkey
         // These are Vine-imported users who haven't claimed their accounts yet
-        let h = load_preloaded_user_handler(auth_state, pool, &user_pubkey, tenant_id).await?;
+        let h = load_preloaded_user_handler(
+            auth_state,
+            pool,
+            &user_pubkey,
+            tenant_id,
+            dpop_cnf_jkt.clone(),
+        )
+        .await?;
         tracing::debug!(
             "RPC: Loaded preloaded user handler for pubkey {}",
             &user_pubkey[..8]
@@ -657,6 +677,79 @@ fn spawn_log_activity(pool: PgPool, is_oauth: bool, authorization_id: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use p256::ecdsa::signature::Signer;
+    use p256::ecdsa::{Signature as P256Signature, SigningKey};
+    use rand::rngs::OsRng;
+
+    fn create_test_handler_with_dpop(expected_jkt: Option<String>) -> HttpRpcHandler {
+        let keys = Keys::generate();
+        let session = Arc::new(SigningSession::new(keys));
+        HttpRpcHandler::new(
+            session,
+            1,
+            None,
+            None,
+            vec![],
+            true,
+            [0u8; 32],
+            [1u8; 32],
+            expected_jkt,
+        )
+    }
+
+    fn create_dpop_proof(signing_key: &SigningKey, method: &str, htu: &str, jti: &str) -> String {
+        let verifying_key = signing_key.verifying_key();
+        let point = verifying_key.to_encoded_point(false);
+        let x = URL_SAFE_NO_PAD.encode(point.x().expect("x coordinate"));
+        let y = URL_SAFE_NO_PAD.encode(point.y().expect("y coordinate"));
+        let iat = chrono::Utc::now().timestamp();
+
+        let header = serde_json::json!({
+            "typ": "dpop+jwt",
+            "alg": "ES256",
+            "jwk": {
+                "kty": "EC",
+                "crv": "P-256",
+                "x": x,
+                "y": y
+            }
+        });
+        let payload = serde_json::json!({
+            "htm": method,
+            "htu": htu,
+            "iat": iat,
+            "jti": jti
+        });
+
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("header json"));
+        let payload_b64 =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("payload json"));
+        let signing_input = format!("{}.{}", header_b64, payload_b64);
+        let signature: P256Signature = signing_key.sign(signing_input.as_bytes());
+        let (r_bytes, s_bytes) = signature.split_bytes();
+        let mut sig_raw = Vec::with_capacity(64);
+        sig_raw.extend_from_slice(&r_bytes);
+        sig_raw.extend_from_slice(&s_bytes);
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig_raw);
+
+        format!("{}.{}.{}", header_b64, payload_b64, sig_b64)
+    }
+
+    fn thumbprint_for_signing_key(signing_key: &SigningKey) -> String {
+        let verifying_key = signing_key.verifying_key();
+        let point = verifying_key.to_encoded_point(false);
+        let jwk_map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_value(serde_json::json!({
+                "kty": "EC",
+                "crv": "P-256",
+                "x": URL_SAFE_NO_PAD.encode(point.x().expect("x coordinate")),
+                "y": URL_SAFE_NO_PAD.encode(point.y().expect("y coordinate"))
+            }))
+            .expect("jwk map");
+
+        crate::ucan_auth::dpop::jwk_thumbprint(&jwk_map).expect("jwk thumbprint")
+    }
 
     #[test]
     fn test_parse_unsigned_event_object() {
@@ -732,5 +825,48 @@ mod tests {
         assert!(response.result.is_none());
         assert!(response.error.is_some());
         assert_eq!(response.error.unwrap(), "test error");
+    }
+
+    #[test]
+    fn test_cache_hit_dpop_bound_missing_proof_rejected() {
+        let handler = create_test_handler_with_dpop(Some("expected-thumbprint".to_string()));
+        let headers = HeaderMap::new();
+
+        let result =
+            enforce_cached_dpop_binding(&handler, &headers, "https://example.com/api/nostr");
+        assert!(matches!(
+            result,
+            Err(RpcError::Auth(AuthError::InvalidToken))
+        ));
+    }
+
+    #[test]
+    fn test_cache_hit_dpop_unbound_missing_proof_allowed() {
+        let handler = create_test_handler_with_dpop(None);
+        let headers = HeaderMap::new();
+
+        let result =
+            enforce_cached_dpop_binding(&handler, &headers, "https://example.com/api/nostr");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_cache_hit_dpop_bound_valid_proof_allowed() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let expected_jkt = thumbprint_for_signing_key(&signing_key);
+        let handler = create_test_handler_with_dpop(Some(expected_jkt));
+        let htu = "https://example.com/api/nostr";
+        let proof = create_dpop_proof(
+            &signing_key,
+            "POST",
+            htu,
+            &format!("cache-hit-jti-{}", uuid::Uuid::new_v4()),
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("DPoP", proof.parse().expect("valid header value"));
+
+        let result = enforce_cached_dpop_binding(&handler, &headers, htu);
+        assert!(result.is_ok());
     }
 }

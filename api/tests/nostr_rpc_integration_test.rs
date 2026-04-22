@@ -267,6 +267,7 @@ async fn load_handler_from_db(
         true,   // OAuth authorization
         bunker_key,
         auth_handle,
+        None,
     )))
 }
 
