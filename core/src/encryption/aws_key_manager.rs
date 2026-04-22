@@ -18,8 +18,9 @@ pub struct AwsKeyManager {
 
 impl AwsKeyManager {
     pub async fn new() -> Result<Self, KeyManagerError> {
-        let key_id = env::var("AWS_KMS_KEY_ID")
-            .map_err(|_| KeyManagerError::ConfigurationError("AWS_KMS_KEY_ID not set".to_string()))?;
+        let key_id = env::var("AWS_KMS_KEY_ID").map_err(|_| {
+            KeyManagerError::ConfigurationError("AWS_KMS_KEY_ID not set".to_string())
+        })?;
         let region = env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
         Self::from_config(&key_id, &region).await

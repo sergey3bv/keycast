@@ -16,11 +16,11 @@ use keycast_api::handlers::http_rpc_handler::new_http_handler_cache;
 use keycast_api::state::TenantCache;
 use keycast_core::authorization_channel;
 use keycast_core::database::Database;
+#[cfg(feature = "aws")]
+use keycast_core::encryption::aws_key_manager::AwsKeyManager;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::gcp_key_manager::GcpKeyManager;
 use keycast_core::encryption::KeyManager;
-#[cfg(feature = "aws")]
-use keycast_core::encryption::aws_key_manager::AwsKeyManager;
 use keycast_signer::{RelayQueue, UnifiedSigner};
 use moka::future::Cache;
 use nostr_sdk::Keys;
@@ -357,9 +357,7 @@ fn validate_environment() -> Result<(), String> {
             }
             #[cfg(not(feature = "aws"))]
             {
-                errors.push(
-                    "KMS_PROVIDER=aws requires building keycast with --features aws",
-                );
+                errors.push("KMS_PROVIDER=aws requires building keycast with --features aws");
             }
         }
     }
@@ -555,8 +553,8 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     );
 
     // Setup key managers (one for signer, one for API - they're cheap to create)
-    let kms_provider = resolve_kms_provider()
-        .map_err(|e| format!("Invalid KMS provider configuration: {}", e))?;
+    let kms_provider =
+        resolve_kms_provider().map_err(|e| format!("Invalid KMS provider configuration: {}", e))?;
     tracing::info!(
         "Using {} KMS provider for encryption",
         kms_provider_label(kms_provider)
