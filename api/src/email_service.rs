@@ -535,7 +535,7 @@ impl SesEmailSender {
             .or_else(|_| env::var("APP_URL"))
             .unwrap_or_else(|_| "http://localhost:5173".to_string());
 
-        tracing::info!("Email service initialized with AWS SES");
+        tracing::info!("Email service configured to use AWS SES");
 
         Self {
             client: OnceCell::const_new(),
