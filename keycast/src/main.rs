@@ -308,11 +308,6 @@ fn validate_environment() -> Result<(), String> {
         tracing::warn!("POSTGRES_PASSWORD not set (required for docker-compose deployments)");
     }
 
-    // Validate email configuration (fail-closed in production)
-    if let Err(e) = keycast_api::email_service::create_email_sender() {
-        errors.push(e);
-    }
-
     if !errors.is_empty() {
         return Err(format!(
             "Missing required environment variables:\n  - {}\n\nSee .env.example for configuration guide.",
@@ -955,6 +950,35 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_env_vars<F, R>(vars: &[(&str, Option<&str>)], f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut originals = Vec::new();
+        for (key, val) in vars {
+            originals.push((*key, std::env::var(key).ok()));
+            match val {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+
+        let result = f();
+
+        for (key, original) in originals {
+            match original {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+
+        result
+    }
 
     #[test]
     #[serial]
@@ -1088,5 +1112,53 @@ mod tests {
             "https://evil.pages.dev",
             "https://login.divine.video,https://*.openvine-app.pages.dev"
         ));
+    }
+
+    #[test]
+    #[serial]
+    fn test_validate_environment_fails_for_production_without_email_provider() {
+        let result = with_env_vars(
+            &[
+                ("DATABASE_URL", Some("postgres://localhost/keycast")),
+                ("ALLOWED_ORIGINS", Some("http://localhost:5173")),
+                ("SERVER_NSEC", Some("nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqj6x6r9")),
+                ("REDIS_URL", Some("redis://localhost:6379")),
+                ("USE_GCP_KMS", Some("false")),
+                ("MASTER_KEY_PATH", Some("./master.key")),
+                ("SENDGRID_API_KEY", None),
+                ("EMAIL_PROVIDER", None),
+                ("RUST_ENV", Some("production")),
+                ("NODE_ENV", None),
+                ("DISABLE_EMAILS", None),
+            ],
+            validate_environment,
+        );
+
+        let err = result.expect_err("expected startup validation to fail");
+        assert!(err.contains("Invalid email provider configuration"));
+        assert!(err.contains("No email provider configured for production"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_validate_environment_allows_production_when_emails_disabled() {
+        let result = with_env_vars(
+            &[
+                ("DATABASE_URL", Some("postgres://localhost/keycast")),
+                ("ALLOWED_ORIGINS", Some("http://localhost:5173")),
+                ("SERVER_NSEC", Some("nsec1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqj6x6r9")),
+                ("REDIS_URL", Some("redis://localhost:6379")),
+                ("USE_GCP_KMS", Some("false")),
+                ("MASTER_KEY_PATH", Some("./master.key")),
+                ("SENDGRID_API_KEY", None),
+                ("EMAIL_PROVIDER", None),
+                ("RUST_ENV", Some("production")),
+                ("NODE_ENV", None),
+                ("DISABLE_EMAILS", Some("true")),
+            ],
+            validate_environment,
+        );
+
+        assert!(result.is_ok());
     }
 }

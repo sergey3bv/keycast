@@ -752,16 +752,36 @@ fn decide_provider(
     }
 }
 
+fn validate_runtime_email_policy(provider: ProviderDecision) -> Result<(), String> {
+    if provider != ProviderDecision::Dev {
+        return Ok(());
+    }
+
+    let env_mode = env::var("RUST_ENV")
+        .or_else(|_| env::var("NODE_ENV"))
+        .unwrap_or_else(|_| "development".to_string());
+    let emails_disabled = env::var("DISABLE_EMAILS")
+        .ok()
+        .is_some_and(|value| value == "true");
+
+    if env_mode == "production" && !emails_disabled {
+        return Err("No email provider configured for production (set SENDGRID_API_KEY, EMAIL_PROVIDER=ses with aws build support, or DISABLE_EMAILS=true)".to_string());
+    }
+
+    Ok(())
+}
+
 pub fn validate_email_sender_config() -> Result<(), String> {
     let email_provider_env = env::var("EMAIL_PROVIDER").ok();
     let sendgrid_api_key_env = env::var("SENDGRID_API_KEY").ok();
 
-    decide_provider(
+    let provider = decide_provider(
         email_provider_env.as_deref(),
         sendgrid_api_key_env.as_deref(),
     )
-    .map(|_| ())
-    .map_err(|err| err.to_message())
+    .map_err(|err| err.to_message())?;
+
+    validate_runtime_email_policy(provider)
 }
 
 /// Create the appropriate email sender based on environment
@@ -790,15 +810,7 @@ pub fn create_email_sender() -> Result<Arc<dyn EmailSender>, String> {
         #[cfg(feature = "aws")]
         ProviderDecision::Ses => Ok(Arc::new(SesEmailSender::new())),
         ProviderDecision::Dev => {
-            let env_mode = env::var("RUST_ENV")
-                .or_else(|_| env::var("NODE_ENV"))
-                .unwrap_or_else(|_| "development".to_string());
-            let emails_disabled = env::var("DISABLE_EMAILS")
-                .ok()
-                .is_some_and(|value| value == "true");
-            if env_mode == "production" && !emails_disabled {
-                return Err("No email provider configured for production (set SENDGRID_API_KEY, EMAIL_PROVIDER=ses with aws build support, or DISABLE_EMAILS=true)".to_string());
-            }
+            validate_runtime_email_policy(ProviderDecision::Dev)?;
 
             if !provider_is_explicit {
                 tracing::warn!("SENDGRID_API_KEY not set - using development email sender");
@@ -1082,5 +1094,65 @@ mod tests {
             result.is_err(),
             "Empty DISABLE_EMAILS should not bypass production check"
         );
+    }
+
+    #[test]
+    fn validation_production_without_provider_fails() {
+        let result = with_env_vars(
+            &[
+                ("SENDGRID_API_KEY", None),
+                ("EMAIL_PROVIDER", None),
+                ("RUST_ENV", Some("production")),
+                ("NODE_ENV", None),
+                ("DISABLE_EMAILS", None),
+            ],
+            validate_email_sender_config,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validation_production_with_disable_emails_ok() {
+        let result = with_env_vars(
+            &[
+                ("SENDGRID_API_KEY", None),
+                ("EMAIL_PROVIDER", None),
+                ("RUST_ENV", Some("production")),
+                ("NODE_ENV", None),
+                ("DISABLE_EMAILS", Some("true")),
+            ],
+            validate_email_sender_config,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validation_development_without_provider_ok() {
+        let result = with_env_vars(
+            &[
+                ("SENDGRID_API_KEY", None),
+                ("EMAIL_PROVIDER", None),
+                ("RUST_ENV", None),
+                ("NODE_ENV", None),
+                ("DISABLE_EMAILS", None),
+            ],
+            validate_email_sender_config,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_invalid_provider() {
+        let result = with_env_vars(
+            &[
+                ("SENDGRID_API_KEY", None),
+                ("EMAIL_PROVIDER", Some("invalid")),
+                ("RUST_ENV", Some("development")),
+                ("NODE_ENV", None),
+                ("DISABLE_EMAILS", None),
+            ],
+            validate_email_sender_config,
+        );
+        assert!(result.is_err());
     }
 }
