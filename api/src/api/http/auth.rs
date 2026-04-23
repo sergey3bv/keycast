@@ -1037,7 +1037,7 @@ pub async fn logout() -> Result<impl axum::response::IntoResponse, AuthError> {
 #[derive(Debug, Deserialize)]
 pub struct CreateBunkerRequest {
     pub app_name: String,            // Required: friendly display name
-    pub origin: Option<String>,      // Optional: the app's origin URL (must be HTTPS if provided)
+    pub origin: Option<String>, // Optional: the app's origin URL (HTTPS, or http://localhost / *.localhost / 127.0.0.1 / [::1] for local dev)
     pub policy_slug: Option<String>, // Optional: null = full access
 }
 
@@ -1059,8 +1059,15 @@ fn validate_origin(origin: &str) -> Result<(), AuthError> {
         .host_str()
         .ok_or_else(|| AuthError::BadRequest("Origin must have a host".to_string()))?;
 
-    // Allow http:// only for localhost (development)
-    let is_localhost = host == "localhost" || host == "127.0.0.1";
+    // Allow http:// only for localhost (development). Accepts IPv4, IPv6, and
+    // RFC 6761 `.localhost` subdomains so multiple local dev services can
+    // coexist on distinct hostnames. The subdomain match requires a non-empty
+    // label before `.localhost`. Kept in sync with `extract_origin` in oauth.rs.
+    let is_localhost = host == "localhost"
+        || host == "127.0.0.1"
+        || host == "[::1]"
+        || host == "::1"
+        || (host.ends_with(".localhost") && host.len() > ".localhost".len());
     if url.scheme() != "https" && !is_localhost {
         return Err(AuthError::BadRequest("Origin must be HTTPS".to_string()));
     }
@@ -1082,7 +1089,7 @@ pub async fn create_bunker(
     let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
     let pool = &auth_state.state.db;
 
-    // Validate origin if provided (must be HTTPS)
+    // Validate origin if provided (HTTPS, or http:// for localhost variants)
     if let Some(ref origin) = req.origin {
         validate_origin(origin)?;
     }
@@ -3474,6 +3481,40 @@ pub async fn delete_account(
 
 #[cfg(test)]
 mod tests {
+    use super::validate_origin;
+
+    #[test]
+    fn test_validate_origin_https() {
+        assert!(validate_origin("https://example.com").is_ok());
+        assert!(validate_origin("https://example.com:8080").is_ok());
+    }
+
+    #[test]
+    fn test_validate_origin_http_localhost() {
+        assert!(validate_origin("http://localhost").is_ok());
+        assert!(validate_origin("http://localhost:3000").is_ok());
+        assert!(validate_origin("http://127.0.0.1:3000").is_ok());
+        // IPv6 loopback, matching extract_origin in oauth.rs
+        assert!(validate_origin("http://[::1]").is_ok());
+        assert!(validate_origin("http://[::1]:3000").is_ok());
+    }
+
+    #[test]
+    fn test_validate_origin_http_localhost_subdomain() {
+        // RFC 6761 reserves *.localhost as loopback.
+        assert!(validate_origin("http://admin.localhost:8787").is_ok());
+        assert!(validate_origin("http://api.localhost").is_ok());
+        assert!(validate_origin("http://admin.app.localhost:8080").is_ok());
+    }
+
+    #[test]
+    fn test_validate_origin_http_non_localhost_rejected() {
+        assert!(validate_origin("http://example.com").is_err());
+        // Hosts that merely contain "localhost" must not be treated as loopback.
+        assert!(validate_origin("http://xxxlocalhost").is_err());
+        assert!(validate_origin("http://localhost.evil.com").is_err());
+    }
+
     #[cfg(feature = "integration-tests")]
     use super::{verify_email, VerifyEmailRequest};
     #[cfg(feature = "integration-tests")]
