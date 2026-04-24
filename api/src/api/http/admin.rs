@@ -531,12 +531,22 @@ pub async fn create_claim_token(
         return Err(ApiError::conflict("User has already claimed their account"));
     }
 
-    // Generate claim token
+    // Generate claim token. Invalidates prior valid tokens for the user in
+    // the same transaction so Regenerate replaces cleanly and doesn't leave
+    // stale credentials in circulation.
     let token = generate_claim_token();
     let claim_token_repo = ClaimTokenRepository::new(pool.clone());
-    let claim_token = claim_token_repo
-        .create(&token, &user_pubkey, Some(&auth.pubkey), tenant_id)
+    let (claim_token, invalidated_prior) = claim_token_repo
+        .create_with_prior_invalidation(&token, &user_pubkey, Some(&auth.pubkey), tenant_id)
         .await?;
+
+    if invalidated_prior > 0 {
+        tracing::info!(
+            "Claim token regenerate: {} prior token(s) invalidated for vine_id={}",
+            invalidated_prior,
+            req.vine_id,
+        );
+    }
 
     // Build claim URL
     let app_url = std::env::var("APP_URL").unwrap_or_else(|_| "http://localhost:3000".to_string());
@@ -761,6 +771,69 @@ pub async fn batch_create_claim_tokens(
         tokens,
         skipped,
         errors,
+    }))
+}
+
+// ============================================================================
+// POST /api/admin/claim-tokens/invalidate - Invalidate claim token without replacement
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct InvalidateClaimTokenRequest {
+    pub vine_id: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvalidateClaimTokenResponse {
+    pub invalidated_count: u64,
+    pub invalidated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Invalidate all valid claim tokens for a preloaded user without issuing a
+/// replacement. Requires support admin. Idempotent: returns count=0 when
+/// nothing is currently valid.
+pub async fn invalidate_claim_token(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    auth: UcanAuth,
+    Json(req): Json<InvalidateClaimTokenRequest>,
+) -> ApiResult<Json<InvalidateClaimTokenResponse>> {
+    let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
+
+    if !is_support_admin(&auth).await {
+        tracing::warn!("Claim token invalidate denied (not support admin)");
+        return Err(ApiError::forbidden("Admin access required"));
+    }
+
+    let user_repo = UserRepository::new(pool.clone());
+    let user_pubkey = user_repo
+        .find_pubkey_by_vine_id(&req.vine_id, tenant_id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::not_found(format!("User with vine_id {} not found", req.vine_id))
+        })?;
+
+    let claim_token_repo = ClaimTokenRepository::new(pool.clone());
+    let count = claim_token_repo
+        .invalidate_valid_for_user(&user_pubkey, tenant_id, &auth.pubkey, req.reason.as_deref())
+        .await?;
+
+    tracing::info!(
+        "Claim token invalidated: vine_id={} count={} reason={:?}",
+        req.vine_id,
+        count,
+        req.reason,
+    );
+
+    Ok(Json(InvalidateClaimTokenResponse {
+        invalidated_count: count,
+        invalidated_at: if count > 0 {
+            Some(chrono::Utc::now())
+        } else {
+            None
+        },
     }))
 }
 
