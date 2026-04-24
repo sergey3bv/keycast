@@ -10,6 +10,7 @@ use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
 use keycast_signer::Nip46Handler;
 use nostr_sdk::prelude::*;
+use secrecy::ExposeSecret;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -891,6 +892,105 @@ async fn test_15_null_expiry_team_authorization_loads() {
     );
 }
 
-// TODO: Add tests for encrypt/decrypt validation
+#[tokio::test]
+async fn test_16_decrypt_only_policy_denies_encrypt_allows_decrypt() {
+    let pool = setup_test_db().await;
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    // decrypt_only: can_decrypt=true, can_encrypt=false
+    let (policy_id, team_id) =
+        create_policy_with_permissions(&pool, 1, vec![("decrypt_only", json!({}))]).await;
+
+    let (auth, bunker_keys, user_keys) =
+        create_test_authorization(&pool, 1, team_id, policy_id, &key_manager).await;
+
+    let handler = Nip46Handler::new_for_test(
+        bunker_keys,
+        user_keys.clone(),
+        auth.secret_hash.clone(),
+        auth.id,
+        1,
+        false,
+        pool.clone(),
+    );
+
+    let recipient_keys = Keys::generate();
+    let encrypt_result = handler
+        .nip44_encrypt_direct(&recipient_keys.public_key(), "encrypted payload")
+        .await;
+    assert!(
+        matches!(
+            encrypt_result,
+            Err(keycast_signer::SignerError::PermissionDenied(_))
+        ),
+        "decrypt_only policy should deny encrypt operations"
+    );
+
+    let sender_keys = Keys::generate();
+    let ciphertext = nip44::encrypt(
+        sender_keys.secret_key(),
+        &user_keys.public_key(),
+        "message from sender",
+        nip44::Version::V2,
+    )
+    .expect("Failed to create test ciphertext");
+
+    let decrypt_result = handler
+        .nip44_decrypt_direct(&sender_keys.public_key(), &ciphertext)
+        .await;
+    assert!(
+        decrypt_result.is_ok(),
+        "decrypt_only policy should allow decrypt operations"
+    );
+    assert_eq!(
+        decrypt_result.unwrap().expose_secret(),
+        "message from sender",
+        "Decrypt result should match original plaintext"
+    );
+}
+
+#[tokio::test]
+async fn test_17_encrypt_to_self_policy_denies_decrypt_from_others() {
+    let pool = setup_test_db().await;
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    // encrypt_to_self requires sender_pubkey == recipient_pubkey
+    let (policy_id, team_id) =
+        create_policy_with_permissions(&pool, 1, vec![("encrypt_to_self", json!({}))]).await;
+
+    let (auth, bunker_keys, user_keys) =
+        create_test_authorization(&pool, 1, team_id, policy_id, &key_manager).await;
+
+    let handler = Nip46Handler::new_for_test(
+        bunker_keys,
+        user_keys.clone(),
+        auth.secret_hash.clone(),
+        auth.id,
+        1,
+        false,
+        pool.clone(),
+    );
+
+    let sender_keys = Keys::generate();
+    let ciphertext = nip44::encrypt(
+        sender_keys.secret_key(),
+        &user_keys.public_key(),
+        "message from other user",
+        nip44::Version::V2,
+    )
+    .expect("Failed to create test ciphertext");
+
+    let decrypt_result = handler
+        .nip44_decrypt_direct(&sender_keys.public_key(), &ciphertext)
+        .await;
+    assert!(
+        matches!(
+            decrypt_result,
+            Err(keycast_signer::SignerError::PermissionDenied(_))
+        ),
+        "encrypt_to_self should deny decrypt requests from other pubkeys"
+    );
+}
+
 // TODO: Add test for invalid policy_id handling
 // TODO: Add test for permission loading failure
