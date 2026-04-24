@@ -1,4 +1,11 @@
-import { createHash, randomBytes } from "node:crypto";
+import {
+  createHash,
+  createSign,
+  generateKeyPairSync,
+  KeyObject,
+  randomBytes,
+  randomUUID,
+} from "node:crypto";
 import { APIRequestContext } from "@playwright/test";
 
 export interface PKCEChallenge {
@@ -51,6 +58,276 @@ export async function exchangeCode(
 export interface AuthorizeResponse {
   code: string;
   redirect_uri: string;
+}
+
+export interface DpopKeyMaterial {
+  privateKey: KeyObject;
+  jwk: {
+    kty: string;
+    crv: string;
+    x: string;
+    y: string;
+  };
+  jkt: string;
+}
+
+export interface AtprotoParResponse {
+  request_uri: string;
+  expires_in: number;
+}
+
+export interface AtprotoTokenResponse {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  refresh_token: string;
+  scope: string;
+  sub: string;
+}
+
+function apiOrigin(): string {
+  return new URL(process.env.API_URL || "http://localhost:3000").origin;
+}
+
+function canonicalDpopThumbprintInput(jwk: DpopKeyMaterial["jwk"]): string {
+  return `{"crv":"${jwk.crv}","kty":"${jwk.kty}","x":"${jwk.x}","y":"${jwk.y}"}`;
+}
+
+function base64UrlJson(value: unknown): string {
+  return Buffer.from(JSON.stringify(value)).toString("base64url");
+}
+
+function derToJose(signatureDer: Buffer, joseSize: number): string {
+  let offset = 0;
+  if (signatureDer[offset++] !== 0x30) {
+    throw new Error("Invalid DER signature (missing sequence)");
+  }
+
+  const sequenceLength = signatureDer[offset++];
+  if (sequenceLength + 2 !== signatureDer.length) {
+    throw new Error("Invalid DER signature length");
+  }
+
+  if (signatureDer[offset++] !== 0x02) {
+    throw new Error("Invalid DER signature (missing r)");
+  }
+  const rLength = signatureDer[offset++];
+  const r = signatureDer.slice(offset, offset + rLength);
+  offset += rLength;
+
+  if (signatureDer[offset++] !== 0x02) {
+    throw new Error("Invalid DER signature (missing s)");
+  }
+  const sLength = signatureDer[offset++];
+  const s = signatureDer.slice(offset, offset + sLength);
+
+  const componentSize = joseSize / 2;
+  const paddedR = Buffer.concat([Buffer.alloc(componentSize), r]).slice(
+    -componentSize,
+  );
+  const paddedS = Buffer.concat([Buffer.alloc(componentSize), s]).slice(
+    -componentSize,
+  );
+
+  return Buffer.concat([paddedR, paddedS]).toString("base64url");
+}
+
+export function generateDpopKeyMaterial(): DpopKeyMaterial {
+  const { privateKey, publicKey } = generateKeyPairSync("ec", {
+    namedCurve: "prime256v1",
+  });
+  const exported = publicKey.export({ format: "jwk" }) as {
+    kty?: string;
+    crv?: string;
+    x?: string;
+    y?: string;
+  };
+
+  if (
+    exported.kty !== "EC" ||
+    exported.crv !== "P-256" ||
+    !exported.x ||
+    !exported.y
+  ) {
+    throw new Error("Unexpected EC key export for DPoP");
+  }
+
+  const jwk = {
+    kty: exported.kty,
+    crv: exported.crv,
+    x: exported.x,
+    y: exported.y,
+  };
+  const jkt = createHash("sha256")
+    .update(canonicalDpopThumbprintInput(jwk))
+    .digest("base64url");
+
+  return { privateKey, jwk, jkt };
+}
+
+export function createDpopProof(
+  material: DpopKeyMaterial,
+  opts: {
+    method: "POST" | "GET";
+    htu: string;
+    nonce?: string;
+    ath?: string;
+    iat?: number;
+    jti?: string;
+  },
+): string {
+  const header = {
+    typ: "dpop+jwt",
+    alg: "ES256",
+    jwk: material.jwk,
+  };
+  const payload: Record<string, string | number> = {
+    jti: opts.jti || `dpop-${randomUUID()}`,
+    htm: opts.method,
+    htu: opts.htu,
+    iat: opts.iat ?? Math.floor(Date.now() / 1000),
+  };
+  if (opts.nonce) payload.nonce = opts.nonce;
+  if (opts.ath) payload.ath = opts.ath;
+
+  const encodedHeader = base64UrlJson(header);
+  const encodedPayload = base64UrlJson(payload);
+  const signingInput = `${encodedHeader}.${encodedPayload}`;
+
+  const signer = createSign("SHA256");
+  signer.update(signingInput);
+  signer.end();
+  const derSignature = signer.sign(material.privateKey);
+  const joseSignature = derToJose(derSignature, 64);
+
+  return `${signingInput}.${joseSignature}`;
+}
+
+export async function atprotoPar(
+  request: APIRequestContext,
+  opts: {
+    dpopKey: DpopKeyMaterial;
+    clientId: string;
+    redirectUri: string;
+    scope?: string;
+    state?: string;
+    codeChallenge: string;
+    codeChallengeMethod?: "S256";
+    host?: string;
+    proofJti?: string;
+  },
+): Promise<{ body: AtprotoParResponse; nonce: string }> {
+  const htu = `${apiOrigin()}/api/atproto/oauth/par`;
+  const proof = createDpopProof(opts.dpopKey, {
+    method: "POST",
+    htu,
+    jti: opts.proofJti,
+  });
+
+  const body = new URLSearchParams({
+    client_id: opts.clientId,
+    redirect_uri: opts.redirectUri,
+    scope: opts.scope || "atproto",
+    state: opts.state || `state-${Date.now()}`,
+    code_challenge: opts.codeChallenge,
+    code_challenge_method: opts.codeChallengeMethod || "S256",
+  });
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    DPoP: proof,
+  };
+  if (opts.host) headers.Host = opts.host;
+
+  const res = await request.post("/api/atproto/oauth/par", {
+    headers,
+    data: body.toString(),
+  });
+  if (!res.ok()) {
+    throw new Error(`PAR failed (${res.status()}): ${await res.text()}`);
+  }
+
+  const nonce = res.headers()["dpop-nonce"];
+  if (!nonce) {
+    throw new Error("Missing DPoP-Nonce on PAR response");
+  }
+
+  return { body: await res.json(), nonce };
+}
+
+export async function atprotoAuthorize(
+  request: APIRequestContext,
+  opts: { cookie: string; requestUri: string; host?: string },
+): Promise<{ location: string; code: string }> {
+  const headers: Record<string, string> = { Cookie: opts.cookie };
+  if (opts.host) headers.Host = opts.host;
+
+  const res = await request.get(
+    `/api/atproto/oauth/authorize?request_uri=${encodeURIComponent(opts.requestUri)}`,
+    { headers, maxRedirects: 0 },
+  );
+  if (res.status() !== 303 && res.status() !== 302) {
+    throw new Error(`ATProto authorize failed (${res.status()}): ${await res.text()}`);
+  }
+
+  const location = res.headers()["location"] || "";
+  const url = new URL(location);
+  const code = url.searchParams.get("code");
+  if (!code) {
+    throw new Error(`Missing code in authorize redirect: ${location}`);
+  }
+  return { location, code };
+}
+
+export async function atprotoExchangeCode(
+  request: APIRequestContext,
+  opts: {
+    dpopKey: DpopKeyMaterial;
+    nonce: string;
+    code: string;
+    clientId: string;
+    redirectUri: string;
+    codeVerifier: string;
+    host?: string;
+    proofJti?: string;
+  },
+): Promise<{ body: AtprotoTokenResponse; nonce: string }> {
+  const htu = `${apiOrigin()}/api/atproto/oauth/token`;
+  const proof = createDpopProof(opts.dpopKey, {
+    method: "POST",
+    htu,
+    nonce: opts.nonce,
+    jti: opts.proofJti,
+  });
+
+  const body = new URLSearchParams({
+    grant_type: "authorization_code",
+    code: opts.code,
+    client_id: opts.clientId,
+    redirect_uri: opts.redirectUri,
+    code_verifier: opts.codeVerifier,
+  });
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    DPoP: proof,
+  };
+  if (opts.host) headers.Host = opts.host;
+
+  const res = await request.post("/api/atproto/oauth/token", {
+    headers,
+    data: body.toString(),
+  });
+  if (!res.ok()) {
+    throw new Error(`ATProto token failed (${res.status()}): ${await res.text()}`);
+  }
+
+  const nextNonce = res.headers()["dpop-nonce"];
+  if (!nextNonce) {
+    throw new Error("Missing DPoP-Nonce on ATProto token response");
+  }
+
+  return { body: await res.json(), nonce: nextNonce };
 }
 
 export async function apiAuthorize(

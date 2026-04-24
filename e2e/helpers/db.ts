@@ -78,3 +78,64 @@ export async function getVerificationToken(email: string): Promise<string> {
 
   throw new Error(`Could not find verification token for ${email}`);
 }
+
+export async function markUserAtprotoReady(
+  pubkey: string,
+  did: string,
+  tenantId?: number,
+): Promise<void> {
+  await withDb(async (db) => {
+    if (tenantId === undefined) {
+      await db.query(
+        `UPDATE users
+         SET atproto_enabled = true,
+             atproto_state = 'ready',
+             atproto_did = $1,
+             updated_at = NOW()
+         WHERE pubkey = $2`,
+        [did, pubkey],
+      );
+      return;
+    }
+
+    await db.query(
+      `UPDATE users
+       SET atproto_enabled = true,
+           atproto_state = 'ready',
+           atproto_did = $1,
+           updated_at = NOW()
+       WHERE pubkey = $2
+         AND tenant_id = $3`,
+      [did, pubkey, tenantId],
+    );
+  });
+}
+
+export async function addRegisteredClient(
+  clientId: string,
+  redirectUris: string[],
+  tenantId = 1,
+): Promise<void> {
+  await withDb(async (db) => {
+    await db.query(
+      `INSERT INTO registered_clients (client_id, allowed_redirect_uris, tenant_id, created_at, updated_at)
+       VALUES ($1, $2::text[], $3, NOW(), NOW())
+       ON CONFLICT (client_id, tenant_id)
+       DO UPDATE SET allowed_redirect_uris = EXCLUDED.allowed_redirect_uris,
+                     updated_at = NOW()`,
+      [clientId, redirectUris, tenantId],
+    );
+  });
+}
+
+export async function deleteRegisteredClient(
+  clientId: string,
+  tenantId = 1,
+): Promise<void> {
+  await withDb(async (db) => {
+    await db.query(
+      "DELETE FROM registered_clients WHERE client_id = $1 AND tenant_id = $2",
+      [clientId, tenantId],
+    );
+  });
+}

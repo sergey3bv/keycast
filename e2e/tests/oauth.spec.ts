@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { test, expect } from "@playwright/test";
 import { registerAndVerify, parseCookieValue } from "../helpers/auth";
 import {
@@ -21,90 +20,8 @@ async function setupUser(request: any) {
 
 async function setupBrowserUser(request: any) {
   const email = `e2e-oauth-${Date.now()}-${Math.random().toString(36).slice(2, 6)}@test.local`;
-  const registerRes = await request.post("/api/auth/register", {
-    data: { email, password: PASSWORD },
-  });
-  if (!registerRes.ok()) {
-    const body = await registerRes.text();
-    throw new Error(`Registration failed (${registerRes.status()}): ${body}`);
-  }
-
-  let token = "";
-  for (let attempt = 0; attempt < 10; attempt++) {
-    token = execFileSync(
-      "docker",
-      [
-        "exec",
-        "keycast-postgres",
-        "psql",
-        "-U",
-        "postgres",
-        "-d",
-        "keycast_chooser",
-        "-t",
-        "-A",
-        "-c",
-        `SELECT email_verification_token FROM users WHERE email = '${email}'`,
-      ],
-      { encoding: "utf8" },
-    ).trim();
-
-    if (token) {
-      break;
-    }
-
-    await new Promise((r) => setTimeout(r, 300));
-  }
-
-  if (!token) {
-    throw new Error(`Could not find verification token for ${email}`);
-  }
-
-  const apiUrl = process.env.API_URL || "http://localhost:3000";
-  let setCookie: string | null = null;
-
-  for (let attempt = 0; attempt < 10; attempt++) {
-    const response = execFileSync(
-      "curl",
-      [
-        "-sS",
-        "-D",
-        "-",
-        "-H",
-        "Content-Type: application/json",
-        "-H",
-        `Origin: ${apiUrl}`,
-        "-X",
-        "POST",
-        `${apiUrl}/api/auth/verify-email`,
-        "--data",
-        JSON.stringify({ token }),
-      ],
-      { encoding: "utf8" },
-    );
-
-    const headerEnd = response.indexOf("\r\n\r\n");
-    const headers = headerEnd === -1 ? response : response.slice(0, headerEnd);
-    const body = headerEnd === -1 ? "" : response.slice(headerEnd + 4);
-
-    const cookieMatch = headers.match(/^set-cookie:\s*(.+)$/im);
-    if (cookieMatch?.[1]?.includes("keycast_session=")) {
-      setCookie = cookieMatch[1];
-      break;
-    }
-
-    if (!body.includes('"status":"processing"')) {
-      throw new Error(`Email verification did not return a session cookie: ${body}`);
-    }
-
-    await new Promise((r) => setTimeout(r, 500));
-  }
-
-  if (!setCookie || !setCookie.includes("keycast_session=")) {
-    throw new Error("No keycast_session cookie in verify-email response");
-  }
-
-  return { email, cookie: `keycast_session=${parseCookieValue(setCookie)}` };
+  const { cookie } = await registerAndVerify(request, email, PASSWORD);
+  return { email, cookie: `keycast_session=${parseCookieValue(cookie)}` };
 }
 
 test.describe("OAuth consent flow", () => {
