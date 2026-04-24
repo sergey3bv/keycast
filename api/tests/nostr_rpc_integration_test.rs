@@ -5,16 +5,35 @@
 
 mod common;
 
+use axum::{extract::State, http::HeaderMap, Json};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Duration, Utc};
+use keycast_api::api::{
+    http::{
+        auth::AuthError,
+        nostr_rpc::{nostr_rpc, NostrRpcRequest, NostrRpcResponse, RpcError},
+        routes::AuthState,
+    },
+    tenant::{Tenant, TenantExtractor},
+};
+use keycast_api::bcrypt_queue::BcryptQueue;
 use keycast_api::handlers::http_rpc_handler::{new_http_handler_cache, HttpRpcHandler};
+use keycast_api::state::KeycastState;
+use keycast_api::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::KeyManager;
+use keycast_core::secret_pool::SecretPool;
 use keycast_core::signing_session::{parse_cache_key, SigningSession};
+use moka::future::Cache;
 use nostr_sdk::prelude::*;
-use serde_json::json;
+use p256::ecdsa::signature::Signer;
+use p256::ecdsa::{Signature as P256Signature, SigningKey};
+use rand::rngs::OsRng;
+use serde_json::{json, Value};
 use serial_test::serial;
 use sqlx::PgPool;
 use std::sync::Arc;
+use ucan::builder::UcanBuilder;
 use uuid::Uuid;
 
 // ============================================================================
@@ -79,6 +98,38 @@ async fn create_test_tenant(pool: &PgPool) -> i64 {
     .fetch_one(pool)
     .await
     .expect("Failed to create test tenant")
+}
+
+fn create_test_tenant_extractor(tenant_id: i64) -> TenantExtractor {
+    TenantExtractor(Arc::new(Tenant {
+        id: tenant_id,
+        domain: "login.divine.video".to_string(),
+        name: "Integration Test Tenant".to_string(),
+        settings: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }))
+}
+
+fn create_test_auth_state(pool: PgPool, key_manager: Arc<Box<dyn KeyManager>>) -> AuthState {
+    let bcrypt_queue = BcryptQueue::new();
+    let secret_pool = SecretPool::new(1);
+    let tenant_cache = Cache::builder().max_capacity(10).build();
+
+    AuthState {
+        state: Arc::new(KeycastState {
+            db: pool,
+            key_manager,
+            signer_handlers: None,
+            http_handler_cache: new_http_handler_cache(),
+            server_keys: Keys::generate(),
+            tenant_cache,
+            bcrypt_sender: bcrypt_queue.sender(),
+            redis: None,
+            secret_pool: secret_pool.receiver(),
+        }),
+        auth_tx: None,
+    }
 }
 
 fn create_test_user() -> (Keys, String) {
@@ -160,6 +211,155 @@ async fn create_test_oauth_authorization(
     .expect("Failed to create oauth authorization");
 
     (auth_id, bunker_pubkey)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_test_oauth_authorization_with_bunker(
+    pool: &PgPool,
+    tenant_id: i64,
+    user_pubkey: &str,
+    redirect_origin: &str,
+    bunker_pubkey: &str,
+    policy_id: Option<i32>,
+    expires_at: Option<chrono::DateTime<Utc>>,
+    revoked_at: Option<chrono::DateTime<Utc>>,
+) -> i32 {
+    let auth_handle = hex::encode(rand::random::<[u8; 32]>());
+
+    sqlx::query_scalar(
+        "INSERT INTO oauth_authorizations
+         (user_pubkey, redirect_origin, bunker_public_key, secret_hash, relays, policy_id, tenant_id, expires_at, revoked_at, authorization_handle, handle_expires_at, created_at, updated_at)
+         VALUES ($1, $2, $3, 'test_hash', $4, $5, $6, $7, $8, $9, NOW() + INTERVAL '30 days', NOW(), NOW())
+         RETURNING id",
+    )
+    .bind(user_pubkey)
+    .bind(redirect_origin)
+    .bind(bunker_pubkey)
+    .bind(json!(["wss://relay.example.com"]).to_string())
+    .bind(policy_id)
+    .bind(tenant_id)
+    .bind(expires_at)
+    .bind(revoked_at)
+    .bind(&auth_handle)
+    .fetch_one(pool)
+    .await
+    .expect("Failed to create oauth authorization with custom bunker pubkey")
+}
+
+async fn build_dpop_bound_ucan(
+    user_keys: &Keys,
+    tenant_id: i64,
+    email: &str,
+    redirect_origin: &str,
+    bunker_pubkey: &str,
+    dpop_jkt: &str,
+) -> String {
+    let user_did = nostr_pubkey_to_did(&user_keys.public_key());
+    let key_material = NostrKeyMaterial::from_keys(user_keys.clone());
+    let facts = json!({
+        "tenant_id": tenant_id,
+        "email": email,
+        "redirect_origin": redirect_origin,
+        "bunker_pubkey": bunker_pubkey,
+        "cnf": {
+            "jkt": dpop_jkt
+        }
+    });
+
+    let ucan = UcanBuilder::default()
+        .issued_by(&key_material)
+        .for_audience(&user_did)
+        .with_lifetime(3600)
+        .with_fact(facts)
+        .build()
+        .expect("Failed to build DPoP-bound UCAN")
+        .sign()
+        .await
+        .expect("Failed to sign DPoP-bound UCAN");
+
+    ucan.encode().expect("Failed to encode DPoP-bound UCAN")
+}
+
+fn dpop_thumbprint(signing_key: &SigningKey) -> String {
+    let verifying_key = signing_key.verifying_key();
+    let point = verifying_key.to_encoded_point(false);
+    let jwk_map: serde_json::Map<String, serde_json::Value> = serde_json::from_value(json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "x": URL_SAFE_NO_PAD.encode(point.x().expect("x coordinate")),
+        "y": URL_SAFE_NO_PAD.encode(point.y().expect("y coordinate")),
+    }))
+    .expect("valid JWK map");
+
+    keycast_api::ucan_auth::dpop::jwk_thumbprint(&jwk_map).expect("jwk thumbprint")
+}
+
+fn create_dpop_proof(signing_key: &SigningKey, method: &str, htu: &str, jti: &str) -> String {
+    let verifying_key = signing_key.verifying_key();
+    let point = verifying_key.to_encoded_point(false);
+    let x = URL_SAFE_NO_PAD.encode(point.x().expect("x coordinate"));
+    let y = URL_SAFE_NO_PAD.encode(point.y().expect("y coordinate"));
+    let iat = Utc::now().timestamp();
+
+    let header = json!({
+        "typ": "dpop+jwt",
+        "alg": "ES256",
+        "jwk": {
+            "kty": "EC",
+            "crv": "P-256",
+            "x": x,
+            "y": y
+        }
+    });
+    let payload = json!({
+        "htm": method,
+        "htu": htu,
+        "iat": iat,
+        "jti": jti
+    });
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("header json"));
+    let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("payload json"));
+    let signing_input = format!("{}.{}", header_b64, payload_b64);
+    let signature: P256Signature = signing_key.sign(signing_input.as_bytes());
+    let (r_bytes, s_bytes) = signature.split_bytes();
+    let mut sig_raw = Vec::with_capacity(64);
+    sig_raw.extend_from_slice(&r_bytes);
+    sig_raw.extend_from_slice(&s_bytes);
+    let sig_b64 = URL_SAFE_NO_PAD.encode(sig_raw);
+
+    format!("{}.{}.{}", header_b64, payload_b64, sig_b64)
+}
+
+fn get_public_key_request() -> NostrRpcRequest {
+    NostrRpcRequest {
+        method: "get_public_key".to_string(),
+        params: vec![],
+    }
+}
+
+async fn invoke_nostr_rpc(
+    tenant: TenantExtractor,
+    auth_state: AuthState,
+    auth_header: &str,
+    dpop_proof: Option<&str>,
+    request: NostrRpcRequest,
+) -> Result<NostrRpcResponse, RpcError> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "Authorization",
+        auth_header
+            .parse()
+            .expect("Authorization header should be valid"),
+    );
+    headers.insert("host", "login.divine.video".parse().expect("valid host"));
+    headers.insert("x-forwarded-proto", "https".parse().expect("valid proto"));
+    if let Some(proof) = dpop_proof {
+        headers.insert("DPoP", proof.parse().expect("valid DPoP header"));
+    }
+
+    let Json(response) = nostr_rpc(tenant, State(auth_state), headers, Json(request)).await?;
+    Ok(response)
 }
 
 /// Create a policy with allowed_kinds restriction
@@ -566,4 +766,140 @@ async fn test_sign_event_blocked_by_policy() {
         .expect("Signing allowed event should succeed");
 
     signed.verify().expect("Signature should be valid");
+}
+
+// ============================================================================
+// Test 6: Cache-hit DPoP enforcement with DPoP-bound UCAN
+// ============================================================================
+
+#[tokio::test]
+#[serial]
+async fn test_cache_hit_dpop_bound_ucan_enforced_end_to_end() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (user_keys, pubkey) = create_test_user();
+    let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(
+        FileKeyManager::new().expect("Failed to create key manager"),
+    ));
+    let redirect_origin = format!("https://dpop-cache-hit-{}.example.com", Uuid::new_v4());
+    let bunker_pubkey = Keys::generate().public_key().to_hex();
+    let auth_state = create_test_auth_state(pool.clone(), key_manager.clone());
+    let htu = "https://login.divine.video/api/nostr";
+
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &user_keys,
+        key_manager.as_ref().as_ref(),
+    )
+    .await;
+    create_test_oauth_authorization_with_bunker(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        &bunker_pubkey,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    let valid_dpop_key = SigningKey::random(&mut OsRng);
+    let expected_jkt = dpop_thumbprint(&valid_dpop_key);
+    let token = build_dpop_bound_ucan(
+        &user_keys,
+        tenant_id,
+        "dpop-cache-hit@example.com",
+        &redirect_origin,
+        &bunker_pubkey,
+        &expected_jkt,
+    )
+    .await;
+    let auth_header = format!("Bearer {}", token);
+    let token_cache_key = *blake3::hash(token.as_bytes()).as_bytes();
+
+    // Request 1: cache miss with valid DPoP proof must succeed and populate cache.
+    let proof_1 = create_dpop_proof(
+        &valid_dpop_key,
+        "POST",
+        htu,
+        &format!("cache-miss-{}", Uuid::new_v4()),
+    );
+    let response_1 = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state.clone(),
+        &auth_header,
+        Some(&proof_1),
+        get_public_key_request(),
+    )
+    .await
+    .expect("Initial DPoP-bound request should succeed");
+    assert_eq!(response_1.result, Some(Value::String(pubkey.clone())));
+    assert!(
+        auth_state
+            .state
+            .http_handler_cache
+            .get(&token_cache_key)
+            .await
+            .is_some(),
+        "Cache should contain token-keyed handler after first request"
+    );
+
+    // Request 2: cache hit with missing DPoP proof must be rejected.
+    let err_missing = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state.clone(),
+        &auth_header,
+        None,
+        get_public_key_request(),
+    )
+    .await
+    .expect_err("Missing DPoP proof on cache hit must be rejected");
+    assert!(matches!(
+        err_missing,
+        RpcError::Auth(AuthError::InvalidToken)
+    ));
+
+    // Request 3: cache hit with invalid DPoP proof (wrong key) must be rejected.
+    let wrong_key = SigningKey::random(&mut OsRng);
+    let wrong_proof = create_dpop_proof(
+        &wrong_key,
+        "POST",
+        htu,
+        &format!("cache-hit-invalid-{}", Uuid::new_v4()),
+    );
+    let err_invalid = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state.clone(),
+        &auth_header,
+        Some(&wrong_proof),
+        get_public_key_request(),
+    )
+    .await
+    .expect_err("Invalid DPoP proof on cache hit must be rejected");
+    assert!(matches!(
+        err_invalid,
+        RpcError::Auth(AuthError::InvalidToken)
+    ));
+
+    // Request 4: cache hit with a fresh, valid DPoP proof must succeed.
+    let proof_2 = create_dpop_proof(
+        &valid_dpop_key,
+        "POST",
+        htu,
+        &format!("cache-hit-valid-{}", Uuid::new_v4()),
+    );
+    let response_4 = invoke_nostr_rpc(
+        create_test_tenant_extractor(tenant_id),
+        auth_state,
+        &auth_header,
+        Some(&proof_2),
+        get_public_key_request(),
+    )
+    .await
+    .expect("Valid DPoP proof on cache hit should succeed");
+    assert_eq!(response_4.result, Some(Value::String(pubkey)));
 }
