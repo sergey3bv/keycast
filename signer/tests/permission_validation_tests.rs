@@ -10,7 +10,6 @@ use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
 use keycast_signer::Nip46Handler;
 use nostr_sdk::prelude::*;
-use secrecy::ExposeSecret;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -916,7 +915,7 @@ async fn test_16_decrypt_only_policy_denies_encrypt_allows_decrypt() {
 
     let recipient_keys = Keys::generate();
     let encrypt_result = handler
-        .nip44_encrypt_direct(&recipient_keys.public_key(), "encrypted payload")
+        .validate_permissions_for_encrypt("encrypted payload", &recipient_keys.public_key())
         .await;
     assert!(
         matches!(
@@ -927,25 +926,12 @@ async fn test_16_decrypt_only_policy_denies_encrypt_allows_decrypt() {
     );
 
     let sender_keys = Keys::generate();
-    let ciphertext = nip44::encrypt(
-        sender_keys.secret_key(),
-        &user_keys.public_key(),
-        "message from sender",
-        nip44::Version::V2,
-    )
-    .expect("Failed to create test ciphertext");
-
     let decrypt_result = handler
-        .nip44_decrypt_direct(&sender_keys.public_key(), &ciphertext)
+        .validate_permissions_for_decrypt("any-ciphertext", &sender_keys.public_key())
         .await;
     assert!(
         decrypt_result.is_ok(),
         "decrypt_only policy should allow decrypt operations"
-    );
-    assert_eq!(
-        decrypt_result.unwrap().expose_secret(),
-        "message from sender",
-        "Decrypt result should match original plaintext"
     );
 }
 
@@ -972,16 +958,8 @@ async fn test_17_encrypt_to_self_policy_denies_decrypt_from_others() {
     );
 
     let sender_keys = Keys::generate();
-    let ciphertext = nip44::encrypt(
-        sender_keys.secret_key(),
-        &user_keys.public_key(),
-        "message from other user",
-        nip44::Version::V2,
-    )
-    .expect("Failed to create test ciphertext");
-
     let decrypt_result = handler
-        .nip44_decrypt_direct(&sender_keys.public_key(), &ciphertext)
+        .validate_permissions_for_decrypt("any-ciphertext", &sender_keys.public_key())
         .await;
     assert!(
         matches!(

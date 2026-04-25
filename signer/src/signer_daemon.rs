@@ -164,7 +164,8 @@ impl Nip46Handler {
     }
 
     /// Validate permissions before encrypting plaintext for a recipient.
-    async fn validate_permissions_for_encrypt(
+    #[doc(hidden)]
+    pub async fn validate_permissions_for_encrypt(
         &self,
         plaintext: &str,
         recipient_pubkey: &PublicKey,
@@ -208,7 +209,8 @@ impl Nip46Handler {
     }
 
     /// Validate permissions before decrypting ciphertext from a sender.
-    async fn validate_permissions_for_decrypt(
+    #[doc(hidden)]
+    pub async fn validate_permissions_for_decrypt(
         &self,
         ciphertext: &str,
         sender_pubkey: &PublicKey,
@@ -249,54 +251,6 @@ impl Nip46Handler {
         }
 
         Ok(())
-    }
-
-    /// Direct NIP-44 encryption helper for tests and in-process callers.
-    #[doc(hidden)]
-    pub async fn nip44_encrypt_direct(
-        &self,
-        recipient_pubkey: &PublicKey,
-        plaintext: &str,
-    ) -> SignerResult<String> {
-        self.validate_permissions_for_encrypt(plaintext, recipient_pubkey)
-            .await?;
-
-        let ciphertext = {
-            let secret = self.user_keys.secret_key().clone();
-            let pubkey = *recipient_pubkey;
-            let text = plaintext.to_string();
-            tokio::task::spawn_blocking(move || {
-                nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
-            })
-            .await
-            .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
-        };
-
-        Ok(ciphertext)
-    }
-
-    /// Direct NIP-44 decryption helper for tests and in-process callers.
-    #[doc(hidden)]
-    pub async fn nip44_decrypt_direct(
-        &self,
-        sender_pubkey: &PublicKey,
-        ciphertext: &str,
-    ) -> SignerResult<SecretString> {
-        self.validate_permissions_for_decrypt(ciphertext, sender_pubkey)
-            .await?;
-
-        let plaintext: SecretString = {
-            let secret = self.user_keys.secret_key().clone();
-            let pubkey = *sender_pubkey;
-            let text = ciphertext.to_string();
-            tokio::task::spawn_blocking(move || {
-                nip44::decrypt(&secret, &pubkey, &text).map(SecretString::from)
-            })
-            .await
-            .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
-        };
-
-        Ok(plaintext)
     }
 
     /// Process a NIP-46 connect request with client tracking.
@@ -1488,9 +1442,23 @@ impl UnifiedSigner {
 
                 let third_party_pubkey = PublicKey::from_hex(third_party_hex)
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
-                let ciphertext = handler
-                    .nip44_encrypt_direct(&third_party_pubkey, plaintext)
+
+                // Validate policy before encryption
+                handler
+                    .validate_permissions_for_encrypt(plaintext, &third_party_pubkey)
                     .await?;
+
+                // CPU-bound crypto wrapped in spawn_blocking
+                let ciphertext = {
+                    let secret = handler.user_keys.secret_key().clone();
+                    let pubkey = third_party_pubkey;
+                    let text = plaintext.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        nip44::encrypt(&secret, &pubkey, &text, nip44::Version::V2)
+                    })
+                    .await
+                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
+                };
 
                 // Log activity in background (non-blocking)
                 handler.spawn_update_activity();
@@ -1511,9 +1479,24 @@ impl UnifiedSigner {
 
                 let third_party_pubkey = PublicKey::from_hex(third_party_hex)
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
-                let plaintext = handler
-                    .nip44_decrypt_direct(&third_party_pubkey, ciphertext)
+
+                // Validate policy before decryption
+                handler
+                    .validate_permissions_for_decrypt(ciphertext, &third_party_pubkey)
                     .await?;
+
+                // CPU-bound crypto wrapped in spawn_blocking
+                // Returns SecretString for automatic memory zeroization on drop
+                let plaintext: SecretString = {
+                    let secret = handler.user_keys.secret_key().clone();
+                    let pubkey = third_party_pubkey;
+                    let text = ciphertext.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        nip44::decrypt(&secret, &pubkey, &text).map(SecretString::from)
+                    })
+                    .await
+                    .map_err(|e| SignerError::internal(format!("spawn_blocking failed: {}", e)))??
+                };
 
                 // Log activity in background (non-blocking)
                 handler.spawn_update_activity();
