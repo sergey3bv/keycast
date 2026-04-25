@@ -6,6 +6,7 @@ edition = "2021"
 
 [features]
 integration-tests = []
+aws = ["dep:aws-sdk-kms", "dep:aws-config"]
 
 [dependencies]
 aes-gcm = "0.10"
@@ -15,6 +16,8 @@ chrono = { workspace = true }
 dotenv = { workspace = true }
 gcp_auth = "0.12"
 google-cloud-kms = "0.6"
+aws-sdk-kms = { version = "1", optional = true }
+aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
 hex = "0.4"
 hkdf = "0.12"
 lazy_static = "1.5.0"
@@ -40,3 +43,6 @@ zeroize = { workspace = true }
 bcrypt = "0.17.1"
 crossbeam-channel = "0.5"
 subtle = "2.5"
+
+[dev-dependencies]
+serial_test = "3.2"

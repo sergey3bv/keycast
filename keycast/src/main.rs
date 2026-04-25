@@ -16,6 +16,8 @@ use keycast_api::handlers::http_rpc_handler::new_http_handler_cache;
 use keycast_api::state::TenantCache;
 use keycast_core::authorization_channel;
 use keycast_core::database::Database;
+#[cfg(feature = "aws")]
+use keycast_core::encryption::aws_key_manager::AwsKeyManager;
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::gcp_key_manager::GcpKeyManager;
 use keycast_core::encryption::KeyManager;
@@ -168,6 +170,81 @@ fn parse_origin(origin: &str) -> Option<(&str, &str)> {
     Some((scheme, host))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KmsProvider {
+    File,
+    Gcp,
+    Aws,
+}
+
+fn resolve_kms_provider() -> Result<KmsProvider, String> {
+    let use_gcp_kms = env::var("USE_GCP_KMS").ok().map(|v| v == "true");
+
+    if let Ok(provider) = env::var("KMS_PROVIDER") {
+        let resolved_provider = match provider.trim().to_ascii_lowercase().as_str() {
+            "file" => Ok(KmsProvider::File),
+            "gcp" => Ok(KmsProvider::Gcp),
+            "aws" => Ok(KmsProvider::Aws),
+            invalid => Err(format!(
+                "KMS_PROVIDER must be one of: file, gcp, aws (got '{}')",
+                invalid
+            )),
+        }?;
+
+        if let Some(use_gcp) = use_gcp_kms {
+            let legacy_provider = if use_gcp {
+                KmsProvider::Gcp
+            } else {
+                KmsProvider::File
+            };
+
+            if legacy_provider != resolved_provider {
+                tracing::warn!(
+                    kms_provider = kms_provider_label(resolved_provider),
+                    use_gcp_kms = use_gcp,
+                    legacy_provider = kms_provider_label(legacy_provider),
+                    "KMS_PROVIDER and USE_GCP_KMS disagree; using KMS_PROVIDER as source of truth"
+                );
+            }
+        }
+
+        return Ok(resolved_provider);
+    }
+
+    if use_gcp_kms.unwrap_or(false) {
+        Ok(KmsProvider::Gcp)
+    } else {
+        Ok(KmsProvider::File)
+    }
+}
+
+fn kms_provider_label(provider: KmsProvider) -> &'static str {
+    match provider {
+        KmsProvider::File => "file",
+        KmsProvider::Gcp => "gcp",
+        KmsProvider::Aws => "aws",
+    }
+}
+
+async fn build_key_manager(
+    kms_provider: KmsProvider,
+) -> Result<Box<dyn KeyManager>, Box<dyn std::error::Error>> {
+    match kms_provider {
+        KmsProvider::File => Ok(Box::new(FileKeyManager::new()?)),
+        KmsProvider::Gcp => Ok(Box::new(GcpKeyManager::new().await?)),
+        KmsProvider::Aws => {
+            #[cfg(feature = "aws")]
+            {
+                Ok(Box::new(AwsKeyManager::new().await?))
+            }
+            #[cfg(not(feature = "aws"))]
+            {
+                Err("KMS_PROVIDER=aws but keycast was built without --features aws".into())
+            }
+        }
+    }
+}
+
 /// Serve Apple App Site Association file with correct content type
 async fn apple_app_site_association(
     axum::extract::State(web_build_dir): axum::extract::State<String>,
@@ -262,14 +339,27 @@ fn validate_environment() -> Result<(), String> {
         errors.push("REDIS_URL must be set (Redis/Memorystore URL for cluster coordination)");
     }
 
-    // Master key validation (either file or GCP KMS)
-    let use_gcp_kms = env::var("USE_GCP_KMS").unwrap_or_else(|_| "false".to_string()) == "true";
-    if !use_gcp_kms && env::var("MASTER_KEY_PATH").is_err() {
-        errors.push("MASTER_KEY_PATH must be set when USE_GCP_KMS=false");
-    }
-
-    if use_gcp_kms && env::var("GCP_PROJECT_ID").is_err() {
-        errors.push("GCP_PROJECT_ID must be set when USE_GCP_KMS=true");
+    let kms_provider = resolve_kms_provider()?;
+    match kms_provider {
+        KmsProvider::File => {
+            if env::var("MASTER_KEY_PATH").is_err() {
+                errors.push("MASTER_KEY_PATH must be set when KMS_PROVIDER=file");
+            }
+        }
+        KmsProvider::Gcp => {
+            if env::var("GCP_PROJECT_ID").is_err() {
+                errors.push("GCP_PROJECT_ID must be set when KMS_PROVIDER=gcp");
+            }
+        }
+        KmsProvider::Aws => {
+            if env::var("AWS_KMS_KEY_ID").is_err() {
+                errors.push("AWS_KMS_KEY_ID must be set when KMS_PROVIDER=aws");
+            }
+            #[cfg(not(feature = "aws"))]
+            {
+                errors.push("KMS_PROVIDER=aws requires building keycast with --features aws");
+            }
+        }
     }
 
     // Tenant isolation configuration
@@ -463,21 +553,15 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     );
 
     // Setup key managers (one for signer, one for API - they're cheap to create)
-    let use_gcp_kms = env::var("USE_GCP_KMS").unwrap_or_else(|_| "false".to_string()) == "true";
+    let kms_provider =
+        resolve_kms_provider().map_err(|e| format!("Invalid KMS provider configuration: {}", e))?;
+    tracing::info!(
+        "Using {} KMS provider for encryption",
+        kms_provider_label(kms_provider)
+    );
 
-    let signer_key_manager: Box<dyn KeyManager> = if use_gcp_kms {
-        tracing::info!("Using Google Cloud KMS for encryption");
-        Box::new(GcpKeyManager::new().await?)
-    } else {
-        tracing::info!("Using file-based encryption");
-        Box::new(FileKeyManager::new()?)
-    };
-
-    let api_key_manager: Box<dyn KeyManager> = if use_gcp_kms {
-        Box::new(GcpKeyManager::new().await?)
-    } else {
-        Box::new(FileKeyManager::new()?)
-    };
+    let signer_key_manager: Box<dyn KeyManager> = build_key_manager(kms_provider).await?;
+    let api_key_manager: Box<dyn KeyManager> = build_key_manager(kms_provider).await?;
 
     // Load server keys for signing UCANs (wrap in Zeroizing for auto-zeroization)
     let server_nsec = Zeroizing::new(env::var("SERVER_NSEC")?); // Validated above
@@ -954,6 +1038,65 @@ mod tests {
     use keycast_api::api::http::auth_observability::request_id_middleware;
     use serial_test::serial;
     use tower::ServiceExt;
+
+    #[test]
+    #[serial]
+    fn test_resolve_kms_provider_legacy_file_default() {
+        std::env::remove_var("KMS_PROVIDER");
+        std::env::set_var("USE_GCP_KMS", "false");
+
+        let provider = resolve_kms_provider().expect("Failed to resolve kms provider");
+        assert_eq!(provider, KmsProvider::File);
+
+        std::env::remove_var("USE_GCP_KMS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_kms_provider_legacy_gcp_fallback() {
+        std::env::remove_var("KMS_PROVIDER");
+        std::env::set_var("USE_GCP_KMS", "true");
+
+        let provider = resolve_kms_provider().expect("Failed to resolve kms provider");
+        assert_eq!(provider, KmsProvider::Gcp);
+
+        std::env::remove_var("USE_GCP_KMS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_kms_provider_explicit_aws() {
+        std::env::set_var("KMS_PROVIDER", "aws");
+        std::env::set_var("USE_GCP_KMS", "false");
+
+        let provider = resolve_kms_provider().expect("Failed to resolve kms provider");
+        assert_eq!(provider, KmsProvider::Aws);
+
+        std::env::remove_var("KMS_PROVIDER");
+        std::env::remove_var("USE_GCP_KMS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_kms_provider_prefers_explicit_over_legacy() {
+        std::env::set_var("KMS_PROVIDER", "file");
+        std::env::set_var("USE_GCP_KMS", "true");
+
+        let provider = resolve_kms_provider().expect("Failed to resolve kms provider");
+        assert_eq!(provider, KmsProvider::File);
+
+        std::env::remove_var("KMS_PROVIDER");
+        std::env::remove_var("USE_GCP_KMS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_resolve_kms_provider_rejects_invalid_value() {
+        std::env::set_var("KMS_PROVIDER", "invalid");
+        let result = resolve_kms_provider();
+        assert!(result.is_err());
+        std::env::remove_var("KMS_PROVIDER");
+    }
 
     #[test]
     #[serial]
