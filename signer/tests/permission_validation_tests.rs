@@ -1066,10 +1066,7 @@ async fn test_19_content_filter_blocks_encrypt_of_blocked_plaintext() {
     let (policy_id, team_id) = create_policy_with_permissions(
         &pool,
         1,
-        vec![(
-            "content_filter",
-            json!({ "blocked_words": ["forbidden"] }),
-        )],
+        vec![("content_filter", json!({ "blocked_words": ["forbidden"] }))],
     )
     .await;
 
