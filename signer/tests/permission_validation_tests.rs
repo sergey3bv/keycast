@@ -891,6 +891,222 @@ async fn test_15_null_expiry_team_authorization_loads() {
     );
 }
 
-// TODO: Add tests for encrypt/decrypt validation
+#[tokio::test]
+async fn test_16_decrypt_only_policy_denies_encrypt_allows_decrypt() {
+    let pool = setup_test_db().await;
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    // decrypt_only: can_decrypt=true, can_encrypt=false
+    let (policy_id, team_id) =
+        create_policy_with_permissions(&pool, 1, vec![("decrypt_only", json!({}))]).await;
+
+    let (auth, bunker_keys, user_keys) =
+        create_test_authorization(&pool, 1, team_id, policy_id, &key_manager).await;
+
+    let handler = Nip46Handler::new_for_test(
+        bunker_keys,
+        user_keys.clone(),
+        auth.secret_hash.clone(),
+        auth.id,
+        1,
+        false,
+        pool.clone(),
+    );
+
+    let recipient_keys = Keys::generate();
+    let encrypt_result = handler
+        .validate_permissions_for_encrypt("encrypted payload", &recipient_keys.public_key())
+        .await;
+    assert!(
+        matches!(
+            encrypt_result,
+            Err(keycast_signer::SignerError::PermissionDenied(_))
+        ),
+        "decrypt_only policy should deny encrypt operations"
+    );
+
+    let sender_keys = Keys::generate();
+    let decrypt_result = handler
+        .validate_permissions_for_decrypt("any-ciphertext", &sender_keys.public_key())
+        .await;
+    assert!(
+        decrypt_result.is_ok(),
+        "decrypt_only policy should allow decrypt operations"
+    );
+}
+
+/// OAuth-authorization branch of validate_permissions_for_*.
+/// Mirrors test_16 but exercises the `is_oauth=true` path that loads via OAuthAuthorization::find.
+#[tokio::test]
+async fn test_16b_oauth_decrypt_only_policy_denies_encrypt_allows_decrypt() {
+    let pool = setup_test_db().await;
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    let (policy_id, _team_id) =
+        create_policy_with_permissions(&pool, 1, vec![("decrypt_only", json!({}))]).await;
+
+    let (oauth_auth, user_keys) =
+        create_oauth_authorization(&pool, 1, Some(policy_id), &key_manager).await;
+
+    let handler = Nip46Handler::new_for_test(
+        user_keys.clone(),
+        user_keys.clone(),
+        oauth_auth.secret_hash.clone(),
+        oauth_auth.id,
+        1,
+        true,
+        pool.clone(),
+    );
+
+    let recipient_keys = Keys::generate();
+    let encrypt_result = handler
+        .validate_permissions_for_encrypt("encrypted payload", &recipient_keys.public_key())
+        .await;
+    assert!(
+        matches!(
+            encrypt_result,
+            Err(keycast_signer::SignerError::PermissionDenied(_))
+        ),
+        "OAuth decrypt_only policy should deny encrypt operations"
+    );
+
+    let sender_keys = Keys::generate();
+    let decrypt_result = handler
+        .validate_permissions_for_decrypt("any-ciphertext", &sender_keys.public_key())
+        .await;
+    assert!(
+        decrypt_result.is_ok(),
+        "OAuth decrypt_only policy should allow decrypt operations"
+    );
+}
+
+#[tokio::test]
+async fn test_17_encrypt_to_self_policy_denies_decrypt_from_others() {
+    let pool = setup_test_db().await;
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    // encrypt_to_self requires sender_pubkey == recipient_pubkey
+    let (policy_id, team_id) =
+        create_policy_with_permissions(&pool, 1, vec![("encrypt_to_self", json!({}))]).await;
+
+    let (auth, bunker_keys, user_keys) =
+        create_test_authorization(&pool, 1, team_id, policy_id, &key_manager).await;
+
+    let handler = Nip46Handler::new_for_test(
+        bunker_keys,
+        user_keys.clone(),
+        auth.secret_hash.clone(),
+        auth.id,
+        1,
+        false,
+        pool.clone(),
+    );
+
+    let sender_keys = Keys::generate();
+    let decrypt_result = handler
+        .validate_permissions_for_decrypt("any-ciphertext", &sender_keys.public_key())
+        .await;
+    assert!(
+        matches!(
+            decrypt_result,
+            Err(keycast_signer::SignerError::PermissionDenied(_))
+        ),
+        "encrypt_to_self should deny decrypt requests from other pubkeys"
+    );
+}
+
+/// Backward-compat: when a policy has no permissions linked, encrypt/decrypt validation must
+/// allow the operation. Locks in the `permissions.is_empty() → Ok(())` fallback branch.
+#[tokio::test]
+async fn test_18_no_permissions_allows_encrypt_and_decrypt() {
+    let pool = setup_test_db().await;
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    // Policy with zero linked permissions.
+    let (policy_id, team_id) = create_policy_with_permissions(&pool, 1, vec![]).await;
+
+    let (auth, bunker_keys, user_keys) =
+        create_test_authorization(&pool, 1, team_id, policy_id, &key_manager).await;
+
+    let handler = Nip46Handler::new_for_test(
+        bunker_keys,
+        user_keys.clone(),
+        auth.secret_hash.clone(),
+        auth.id,
+        1,
+        false,
+        pool.clone(),
+    );
+
+    let counterparty = Keys::generate();
+    assert!(
+        handler
+            .validate_permissions_for_encrypt("anything", &counterparty.public_key())
+            .await
+            .is_ok(),
+        "Empty permission set must not block encrypt (backward compatibility)"
+    );
+    assert!(
+        handler
+            .validate_permissions_for_decrypt("anything", &counterparty.public_key())
+            .await
+            .is_ok(),
+        "Empty permission set must not block decrypt (backward compatibility)"
+    );
+}
+
+/// Behavior change: enforcing encrypt/decrypt now applies content_filter to plaintext.
+/// Customers using content_filter for sign-time policy will see encrypts of plaintext
+/// containing blocked words denied. This test pins the behavior.
+#[tokio::test]
+async fn test_19_content_filter_blocks_encrypt_of_blocked_plaintext() {
+    let pool = setup_test_db().await;
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    let (policy_id, team_id) = create_policy_with_permissions(
+        &pool,
+        1,
+        vec![("content_filter", json!({ "blocked_words": ["forbidden"] }))],
+    )
+    .await;
+
+    let (auth, bunker_keys, user_keys) =
+        create_test_authorization(&pool, 1, team_id, policy_id, &key_manager).await;
+
+    let handler = Nip46Handler::new_for_test(
+        bunker_keys,
+        user_keys.clone(),
+        auth.secret_hash.clone(),
+        auth.id,
+        1,
+        false,
+        pool.clone(),
+    );
+
+    let recipient = Keys::generate();
+
+    let blocked = handler
+        .validate_permissions_for_encrypt(
+            "this message contains forbidden text",
+            &recipient.public_key(),
+        )
+        .await;
+    assert!(
+        matches!(
+            blocked,
+            Err(keycast_signer::SignerError::PermissionDenied(_))
+        ),
+        "content_filter must deny encrypt when plaintext contains a blocked word"
+    );
+
+    let allowed = handler
+        .validate_permissions_for_encrypt("clean message body", &recipient.public_key())
+        .await;
+    assert!(
+        allowed.is_ok(),
+        "content_filter must allow encrypt when plaintext contains no blocked words"
+    );
+}
+
 // TODO: Add test for invalid policy_id handling
 // TODO: Add test for permission loading failure

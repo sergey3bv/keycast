@@ -163,6 +163,96 @@ impl Nip46Handler {
         Ok(())
     }
 
+    /// Validate permissions before encrypting plaintext for a recipient.
+    #[doc(hidden)]
+    pub async fn validate_permissions_for_encrypt(
+        &self,
+        plaintext: &str,
+        recipient_pubkey: &PublicKey,
+    ) -> SignerResult<()> {
+        // Load permissions based on authorization type
+        let permissions = if self.is_oauth {
+            let oauth_auth =
+                OAuthAuthorization::find(&self.pool, self.tenant_id, self.authorization_id).await?;
+            oauth_auth.permissions(&self.pool, self.tenant_id).await?
+        } else {
+            let auth =
+                Authorization::find(&self.pool, self.tenant_id, self.authorization_id).await?;
+            auth.permissions(&self.pool, self.tenant_id).await?
+        };
+
+        // If no permissions configured, allow all (backward compatibility)
+        if permissions.is_empty() {
+            return Ok(());
+        }
+
+        let user_pubkey = self.user_keys.public_key();
+
+        // Convert and validate - ALL permissions must pass (AND logic)
+        for permission in &permissions {
+            let custom_permission = permission.to_custom_permission().map_err(|e| {
+                SignerError::invalid_permission(format!(
+                    "Failed to convert permission '{}': {}",
+                    permission.identifier, e
+                ))
+            })?;
+
+            if !custom_permission.can_encrypt(plaintext, &user_pubkey, recipient_pubkey) {
+                return Err(SignerError::permission_denied(format!(
+                    "Blocked by '{}' policy",
+                    custom_permission.identifier()
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate permissions before decrypting ciphertext from a sender.
+    #[doc(hidden)]
+    pub async fn validate_permissions_for_decrypt(
+        &self,
+        ciphertext: &str,
+        sender_pubkey: &PublicKey,
+    ) -> SignerResult<()> {
+        // Load permissions based on authorization type
+        let permissions = if self.is_oauth {
+            let oauth_auth =
+                OAuthAuthorization::find(&self.pool, self.tenant_id, self.authorization_id).await?;
+            oauth_auth.permissions(&self.pool, self.tenant_id).await?
+        } else {
+            let auth =
+                Authorization::find(&self.pool, self.tenant_id, self.authorization_id).await?;
+            auth.permissions(&self.pool, self.tenant_id).await?
+        };
+
+        // If no permissions configured, allow all (backward compatibility)
+        if permissions.is_empty() {
+            return Ok(());
+        }
+
+        let user_pubkey = self.user_keys.public_key();
+
+        // Convert and validate - ALL permissions must pass (AND logic)
+        for permission in &permissions {
+            let custom_permission = permission.to_custom_permission().map_err(|e| {
+                SignerError::invalid_permission(format!(
+                    "Failed to convert permission '{}': {}",
+                    permission.identifier, e
+                ))
+            })?;
+
+            if !custom_permission.can_decrypt(ciphertext, sender_pubkey, &user_pubkey) {
+                return Err(SignerError::permission_denied(format!(
+                    "Blocked by '{}' policy",
+                    custom_permission.identifier()
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Process a NIP-46 connect request with client tracking.
     ///
     /// Validates the secret and stores the client pubkey for future request validation.
@@ -1353,6 +1443,11 @@ impl UnifiedSigner {
                 let third_party_pubkey = PublicKey::from_hex(third_party_hex)
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
 
+                // Validate policy before encryption
+                handler
+                    .validate_permissions_for_encrypt(plaintext, &third_party_pubkey)
+                    .await?;
+
                 // CPU-bound crypto wrapped in spawn_blocking
                 let ciphertext = {
                     let secret = handler.user_keys.secret_key().clone();
@@ -1384,6 +1479,11 @@ impl UnifiedSigner {
 
                 let third_party_pubkey = PublicKey::from_hex(third_party_hex)
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
+
+                // Validate policy before decryption
+                handler
+                    .validate_permissions_for_decrypt(ciphertext, &third_party_pubkey)
+                    .await?;
 
                 // CPU-bound crypto wrapped in spawn_blocking
                 // Returns SecretString for automatic memory zeroization on drop
@@ -1419,6 +1519,11 @@ impl UnifiedSigner {
                 let third_party_pubkey = PublicKey::from_hex(third_party_hex)
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
 
+                // Validate policy before encryption
+                handler
+                    .validate_permissions_for_encrypt(plaintext, &third_party_pubkey)
+                    .await?;
+
                 // CPU-bound crypto wrapped in spawn_blocking
                 let ciphertext = {
                     let secret = handler.user_keys.secret_key().clone();
@@ -1450,6 +1555,11 @@ impl UnifiedSigner {
 
                 let third_party_pubkey = PublicKey::from_hex(third_party_hex)
                     .map_err(|e| SignerError::invalid_key(e.to_string()))?;
+
+                // Validate policy before decryption
+                handler
+                    .validate_permissions_for_decrypt(ciphertext, &third_party_pubkey)
+                    .await?;
 
                 // CPU-bound crypto wrapped in spawn_blocking
                 // Returns SecretString for automatic memory zeroization on drop
