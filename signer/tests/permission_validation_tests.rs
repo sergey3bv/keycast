@@ -1108,5 +1108,38 @@ async fn test_19_content_filter_blocks_encrypt_of_blocked_plaintext() {
     );
 }
 
-// TODO: Add test for invalid policy_id handling
+/// Regression: an OAuth authorization with a dangling `policy_id` (no matching row in
+/// `policies`) currently degrades to "no permissions = allow". This test pins that behavior.
+/// See divinevideo/keycast#141 for the open question of whether this should fail closed.
+#[tokio::test]
+async fn test_20_oauth_invalid_policy_id_allows_signing() {
+    let pool = setup_test_db().await;
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    // OAuth authorizations can reference a non-existent policy_id.
+    // Current behavior treats missing policy permissions as unrestricted access.
+    let invalid_policy_id = i32::MAX;
+    let (oauth_auth, user_keys) =
+        create_oauth_authorization(&pool, 1, Some(invalid_policy_id), &key_manager).await;
+
+    let handler = Nip46Handler::new_for_test(
+        user_keys.clone(),
+        user_keys.clone(),
+        oauth_auth.secret_hash.clone(),
+        oauth_auth.id,
+        1,
+        true,
+        pool.clone(),
+    );
+
+    let unsigned = EventBuilder::new(Kind::EncryptedDirectMessage, "Test message")
+        .build(user_keys.public_key());
+    let result = handler.sign_event_direct(unsigned).await;
+
+    assert!(
+        result.is_ok(),
+        "OAuth authorization with invalid policy_id should follow current permissive behavior"
+    );
+}
+
 // TODO: Add test for permission loading failure
