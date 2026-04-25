@@ -129,7 +129,12 @@ impl EmailSender for DevEmailSender {
         to_email: &str,
         reset_token: &str,
     ) -> Result<(), String> {
-        let reset_url = format!("{}/reset-password?token={}", self.base_url, reset_token);
+        let reset_url = format!(
+            "{}/reset-password?token={}&email={}",
+            self.base_url,
+            reset_token,
+            urlencoding::encode(to_email),
+        );
 
         tracing::info!("");
         tracing::info!("==================================================");
@@ -405,7 +410,12 @@ impl EmailSender for SendGridEmailSender {
         to_email: &str,
         reset_token: &str,
     ) -> Result<(), String> {
-        let reset_url = format!("{}/reset-password?token={}", self.base_url, reset_token);
+        let reset_url = format!(
+            "{}/reset-password?token={}&email={}",
+            self.base_url,
+            reset_token,
+            urlencoding::encode(to_email),
+        );
 
         let subject = format!("Reset your {} password", BRAND_NAME);
         let html_content = format!(
