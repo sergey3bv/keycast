@@ -185,12 +185,13 @@ impl UserRepository {
         username: &str,
         tenant_id: i64,
     ) -> Result<Option<String>, RepositoryError> {
-        let result: Option<(String,)> =
-            sqlx::query_as("SELECT pubkey FROM users WHERE username = $1 AND tenant_id = $2")
-                .bind(username)
-                .bind(tenant_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let result: Option<(String,)> = sqlx::query_as(
+            "SELECT pubkey FROM users WHERE LOWER(username) = LOWER($1) AND tenant_id = $2",
+        )
+        .bind(username)
+        .bind(tenant_id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(result.map(|r| r.0))
     }
 
@@ -639,7 +640,7 @@ impl UserRepository {
         tenant_id: i64,
     ) -> Result<bool, RepositoryError> {
         let result: Option<(String,)> = sqlx::query_as(
-            "SELECT pubkey FROM users WHERE username = $1 AND pubkey != $2 AND tenant_id = $3",
+            "SELECT pubkey FROM users WHERE LOWER(username) = LOWER($1) AND pubkey != $2 AND tenant_id = $3",
         )
         .bind(username)
         .bind(exclude_pubkey)
@@ -1744,10 +1745,11 @@ mod tests {
         let k3 = Keys::generate();
         let h3 = k3.public_key().to_hex();
 
-        // Three users with equivalent normalized usernames
+        // Three users with equivalent admin-search usernames. They must remain distinct under
+        // LOWER(username), because NIP-05 usernames are now case-insensitively unique per tenant.
         create_user_with_username(&pool, &h1, &format!("Lele.Pons-{}", suffix)).await;
-        create_user_with_username(&pool, &h2, &format!("lelepons-{}", suffix)).await;
-        create_user_with_username(&pool, &h3, &format!("LELEPONS-{}", suffix)).await;
+        create_user_with_username(&pool, &h2, &format!("lele_pons-{}", suffix)).await;
+        create_user_with_username(&pool, &h3, &format!("LELE-PONS-{}", suffix)).await;
 
         let results = repo
             .find_users_for_admin(&format!("lelepons-{}", suffix), 1)
