@@ -65,13 +65,19 @@ test.describe("Authentication flows", () => {
     });
     expect(registerRes.ok()).toBe(true);
 
-    // Wait for bcrypt
-    await new Promise((r) => setTimeout(r, 1500));
-
-    const loginRes = await request.post("/api/auth/login", {
-      data: { email, password },
-    });
-    expect(loginRes.status()).toBe(403);
+    // Wait for async bcrypt queue to settle enough for deterministic auth-state checks.
+    let status = 0;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const loginRes = await request.post("/api/auth/login", {
+        data: { email, password },
+      });
+      status = loginRes.status();
+      if (status === 403) {
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 300));
+    }
+    expect(status).toBe(403);
   });
 
   test("logout clears session cookie", async ({ request }) => {
