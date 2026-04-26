@@ -528,6 +528,71 @@ async fn test_8_oauth_with_policy_enforces_restrictions() {
     assert!(result.is_err(), "OAuth with policy should deny kind 4");
 }
 
+#[tokio::test]
+async fn test_8b_permission_loading_failure_returns_error() {
+    let pool = setup_test_db().await;
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    // Start with a valid policy, then attach a malformed permission config row.
+    let (policy_id, _team_id) = create_policy_with_permissions(&pool, 1, vec![]).await;
+
+    let malformed_permission_id: i32 = sqlx::query_scalar(
+        "INSERT INTO permissions (identifier, config, created_at, updated_at)
+         VALUES ($1, $2, NOW(), NOW())
+         RETURNING id",
+    )
+    .bind("allowed_kinds")
+    .bind("{\"allowed_kinds\": [1]") // malformed JSON (missing closing brace)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to create malformed permission");
+
+    sqlx::query(
+        "INSERT INTO policy_permissions (policy_id, permission_id, created_at, updated_at)
+         VALUES ($1, $2, NOW(), NOW())",
+    )
+    .bind(policy_id)
+    .bind(malformed_permission_id)
+    .execute(&pool)
+    .await
+    .expect("Failed to attach malformed permission to policy");
+
+    let (oauth_auth, user_keys) =
+        create_oauth_authorization(&pool, 1, Some(policy_id), &key_manager).await;
+
+    let handler = Nip46Handler::new_for_test(
+        user_keys.clone(),
+        user_keys.clone(),
+        oauth_auth.secret_hash.clone(),
+        oauth_auth.id,
+        1,
+        true,
+        pool.clone(),
+    );
+
+    let unsigned = EventBuilder::text_note("Hello").build(user_keys.public_key());
+    let result = handler.sign_event_direct(unsigned).await;
+
+    assert!(
+        result.is_err(),
+        "Malformed permission config should fail during permission loading"
+    );
+
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("Authorization error")
+            || err_msg.contains("Database error")
+            || err_msg.contains("config"),
+        "Error should indicate permission loading/parsing failure, got: {}",
+        err_msg
+    );
+    assert!(
+        !err_msg.contains("Blocked by"),
+        "Failure should happen during permission loading, not policy deny path: {}",
+        err_msg
+    );
+}
+
 // ============================================================================
 // EXPIRY TESTS
 // ============================================================================
@@ -1141,5 +1206,3 @@ async fn test_20_oauth_invalid_policy_id_allows_signing() {
         "OAuth authorization with invalid policy_id should follow current permissive behavior"
     );
 }
-
-// TODO: Add test for permission loading failure
