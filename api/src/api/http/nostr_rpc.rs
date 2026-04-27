@@ -350,7 +350,17 @@ fn compute_token_cache_key(auth_header: &str) -> Option<CacheKey> {
     Some(*blake3::hash(token.as_bytes()).as_bytes())
 }
 
-fn enforce_cached_dpop_binding(
+fn map_dpop_error_to_rpc_error(error: anyhow::Error, context: &str) -> RpcError {
+    if crate::ucan_auth::is_replay_cache_unavailable_error(&error) {
+        tracing::error!("RPC: DPoP verification failed ({context}): {}", error);
+        RpcError::Internal("DPoP replay protection temporarily unavailable. Please retry.".into())
+    } else {
+        tracing::warn!("RPC: DPoP verification failed ({context}): {}", error);
+        RpcError::Auth(AuthError::InvalidToken)
+    }
+}
+
+async fn enforce_cached_dpop_binding(
     handler: &HttpRpcHandler,
     headers: &HeaderMap,
     htu: &str,
@@ -359,7 +369,7 @@ fn enforce_cached_dpop_binding(
         return Ok(());
     };
 
-    match crate::ucan_auth::verify_dpop_proof(headers, "POST", htu, Some(expected_jkt)) {
+    match crate::ucan_auth::verify_dpop_proof(headers, "POST", htu, Some(expected_jkt)).await {
         Ok(Some(_)) => {
             tracing::debug!("RPC: DPoP binding verified on cache hit");
             Ok(())
@@ -371,10 +381,7 @@ fn enforce_cached_dpop_binding(
             );
             Err(RpcError::Auth(AuthError::InvalidToken))
         }
-        Err(e) => {
-            tracing::warn!("RPC: DPoP verification failed on cache hit: {}", e);
-            Err(RpcError::Auth(AuthError::InvalidToken))
-        }
+        Err(e) => Err(map_dpop_error_to_rpc_error(e, "cache hit")),
     }
 }
 
@@ -498,7 +505,7 @@ async fn get_handler(
 
         // On cache hit, enforce DPoP binding from cached UCAN cnf.jkt.
         let htu = construct_htu(headers);
-        enforce_cached_dpop_binding(&handler, headers, &htu)?;
+        enforce_cached_dpop_binding(&handler, headers, &htu).await?;
 
         // Cache hit! Skip full UCAN verification
         METRICS.inc_http_rpc_cache_hit();
@@ -521,7 +528,7 @@ async fn get_handler(
     if let Some(expected_jkt) = dpop_cnf_jkt.as_deref() {
         // RFC 9449 requires htu to be the absolute URI (scheme + host + path)
         let htu = construct_htu(headers);
-        match crate::ucan_auth::verify_dpop_proof(headers, "POST", &htu, Some(expected_jkt)) {
+        match crate::ucan_auth::verify_dpop_proof(headers, "POST", &htu, Some(expected_jkt)).await {
             Ok(Some(_)) => {
                 tracing::debug!("RPC: DPoP binding verified for cnf.jkt");
             }
@@ -533,8 +540,7 @@ async fn get_handler(
                 return Err(RpcError::Auth(AuthError::InvalidToken));
             }
             Err(e) => {
-                tracing::warn!("RPC: DPoP verification failed: {}", e);
-                return Err(RpcError::Auth(AuthError::InvalidToken));
+                return Err(map_dpop_error_to_rpc_error(e, "cache miss"));
             }
         }
     }
@@ -828,30 +834,45 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_hit_dpop_bound_missing_proof_rejected() {
+    fn test_map_dpop_error_to_rpc_error_replay_cache_unavailable_is_internal() {
+        let error = anyhow::Error::new(crate::ucan_auth::dpop::ReplayCacheUnavailableError::new(
+            "DPoP replay protection unavailable",
+        ));
+        let mapped = map_dpop_error_to_rpc_error(error, "test");
+        assert!(matches!(mapped, RpcError::Internal(_)));
+    }
+
+    #[test]
+    fn test_map_dpop_error_to_rpc_error_invalid_proof_is_auth_error() {
+        let mapped = map_dpop_error_to_rpc_error(anyhow::anyhow!("invalid dpop proof"), "test");
+        assert!(matches!(mapped, RpcError::Auth(AuthError::InvalidToken)));
+    }
+
+    #[tokio::test]
+    async fn test_cache_hit_dpop_bound_missing_proof_rejected() {
         let handler = create_test_handler_with_dpop(Some("expected-thumbprint".to_string()));
         let headers = HeaderMap::new();
 
         let result =
-            enforce_cached_dpop_binding(&handler, &headers, "https://example.com/api/nostr");
+            enforce_cached_dpop_binding(&handler, &headers, "https://example.com/api/nostr").await;
         assert!(matches!(
             result,
             Err(RpcError::Auth(AuthError::InvalidToken))
         ));
     }
 
-    #[test]
-    fn test_cache_hit_dpop_unbound_missing_proof_allowed() {
+    #[tokio::test]
+    async fn test_cache_hit_dpop_unbound_missing_proof_allowed() {
         let handler = create_test_handler_with_dpop(None);
         let headers = HeaderMap::new();
 
         let result =
-            enforce_cached_dpop_binding(&handler, &headers, "https://example.com/api/nostr");
+            enforce_cached_dpop_binding(&handler, &headers, "https://example.com/api/nostr").await;
         assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_cache_hit_dpop_bound_valid_proof_allowed() {
+    #[tokio::test]
+    async fn test_cache_hit_dpop_bound_valid_proof_allowed() {
         let signing_key = SigningKey::random(&mut OsRng);
         let expected_jkt = thumbprint_for_signing_key(&signing_key);
         let handler = create_test_handler_with_dpop(Some(expected_jkt));
@@ -866,7 +887,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("DPoP", proof.parse().expect("valid header value"));
 
-        let result = enforce_cached_dpop_binding(&handler, &headers, htu);
+        let result = enforce_cached_dpop_binding(&handler, &headers, htu).await;
         assert!(result.is_ok());
     }
 }

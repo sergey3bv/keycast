@@ -208,6 +208,7 @@ See [DEVELOPMENT.md](./docs/DEVELOPMENT.md) for local development setup.
 | `APP_URL` | `https://login.divine.video` | Fallback URL for OAuth callbacks |
 | `ALLOWED_PUBKEYS` | *(none)* | Comma-separated admin pubkeys whitelist |
 | `ALLOWED_ORIGINS` | *(none)* | CORS origins (comma-separated) |
+| `DPOP_REPLAY_FAIL_OPEN` | `false` | DPoP replay cache outage mode (`false` fail-closed when Redis is unavailable/not configured, `true` dev-only per-instance fallback) |
 
 #### Multi-tenancy
 
