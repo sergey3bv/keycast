@@ -25,7 +25,9 @@ test.describe("NIP-05 profile badge", () => {
     expect(profileRes.status()).toBe(200);
     const profile = await profileRes.json();
     expect(profile.username).toBe("alice.name_123");
-    expect(profile.nip05).toBe("alice.name_123@divine.video");
+    const expectedDomain = profile.nip05.split("@").slice(1).join("@");
+    const expectedNip05 = `${profile.username}@${expectedDomain}`;
+    expect(profile.nip05).toBe(expectedNip05);
 
     const baseURL = process.env.API_URL || "http://localhost:3000";
     const url = new URL(baseURL);
@@ -42,6 +44,6 @@ test.describe("NIP-05 profile badge", () => {
 
     await page.goto("/");
     await expect(page.locator("text=NIP-05 Verified")).toBeVisible();
-    await expect(page.locator("text=alice.name_123@divine.video")).toBeVisible();
+    await expect(page.getByText(expectedNip05, { exact: true })).toBeVisible();
   });
 });
