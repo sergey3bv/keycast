@@ -177,6 +177,34 @@ impl PrefixedRedis {
         .await
     }
 
+    /// Set a key with expiration only if it does not already exist.
+    ///
+    /// Returns `true` when the key was set and `false` when the key already exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if Redis operation fails or connection refresh fails.
+    pub async fn set_nx_ex(&self, key: &str, seconds: u64, value: &str) -> RedisResult<bool> {
+        let prefixed = self.prefixed_key(key).into_owned();
+        let value = value.to_string();
+        self.with_refresh(|mut conn| {
+            let key = prefixed.clone();
+            let value = value.clone();
+            async move {
+                redis::cmd("SET")
+                    .arg(key)
+                    .arg(value)
+                    .arg("EX")
+                    .arg(seconds)
+                    .arg("NX")
+                    .query_async::<Option<String>>(&mut conn)
+                    .await
+                    .map(|reply| reply.is_some())
+            }
+        })
+        .await
+    }
+
     /// Get a key's value.
     ///
     /// # Errors
@@ -408,5 +436,27 @@ mod tests {
 
         // Cleanup
         redis.del("no_prefix_key").await.unwrap();
+    }
+
+    /// Integration test for SET NX EX helper.
+    #[tokio::test]
+    #[ignore]
+    async fn test_prefixed_redis_set_nx_ex_integration() {
+        let client = redis::Client::open("redis://localhost:6379").unwrap();
+        let conn = client.get_multiplexed_async_connection().await.unwrap();
+        let redis = PrefixedRedis::new(conn, Some("test_prefix".to_string()));
+
+        redis.del("setnx_key").await.unwrap_or(());
+
+        let first = redis.set_nx_ex("setnx_key", 60, "v1").await.unwrap();
+        assert!(first);
+
+        let second = redis.set_nx_ex("setnx_key", 60, "v2").await.unwrap();
+        assert!(!second);
+
+        let result = redis.get("setnx_key").await.unwrap();
+        assert_eq!(result.as_deref(), Some("v1"));
+
+        redis.del("setnx_key").await.unwrap();
     }
 }

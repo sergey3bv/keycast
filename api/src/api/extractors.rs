@@ -37,7 +37,26 @@ fn extract_admin_role(ucan: &ucan::Ucan) -> Option<String> {
 
 /// Enforce DPoP binding if the UCAN has a cnf.jkt claim.
 /// Constructs the htu from the request method and path.
-fn enforce_dpop_if_bound(parts: &Parts, ucan: &ucan::Ucan) -> Result<(), AuthError> {
+fn map_dpop_error_to_auth_error(error: anyhow::Error, path: &str) -> AuthError {
+    let message = format!("DPoP binding enforcement failed: {}", error);
+    if crate::ucan_auth::is_replay_cache_unavailable_error(&error) {
+        tracing::error!("{} (path: {})", message, path);
+        AuthError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "DPoP replay protection temporarily unavailable. Please retry.".to_string(),
+        }
+    } else {
+        tracing::warn!("{} (path: {})", message, path);
+        AuthError {
+            status: StatusCode::UNAUTHORIZED,
+            message,
+        }
+    }
+}
+
+/// Enforce DPoP binding if the UCAN has a cnf.jkt claim.
+/// Constructs the htu from the request method and path.
+async fn enforce_dpop_if_bound(parts: &Parts, ucan: &ucan::Ucan) -> Result<(), AuthError> {
     let cnf_jkt = crate::ucan_auth::extract_cnf_jkt_from_ucan(ucan);
     if cnf_jkt.is_none() {
         return Ok(()); // No DPoP binding, nothing to enforce
@@ -57,14 +76,9 @@ fn enforce_dpop_if_bound(parts: &Parts, ucan: &ucan::Ucan) -> Result<(), AuthErr
     let path = parts.uri.path();
     let htu = format!("{}://{}{}", scheme, host, path);
 
-    crate::ucan_auth::enforce_dpop_binding(&parts.headers, ucan, method, &htu).map_err(|e| {
-        let msg = format!("DPoP binding enforcement failed: {}", e);
-        tracing::warn!("{} (path: {})", msg, parts.uri.path());
-        AuthError {
-            status: StatusCode::UNAUTHORIZED,
-            message: msg,
-        }
-    })
+    crate::ucan_auth::enforce_dpop_binding(&parts.headers, ucan, method, &htu)
+        .await
+        .map_err(|e| map_dpop_error_to_auth_error(e, parts.uri.path()))
 }
 
 /// Resolve tenant_id from the Host header using the tenant cache/database
@@ -143,7 +157,7 @@ where
                             })?;
 
                     // Enforce DPoP binding if UCAN contains cnf.jkt
-                    enforce_dpop_if_bound(parts, &ucan)?;
+                    enforce_dpop_if_bound(parts, &ucan).await?;
 
                     let admin_role = extract_admin_role(&ucan);
 
@@ -198,5 +212,28 @@ where
                 "Missing authentication - expected UCAN Bearer token or keycast_session cookie"
                     .to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_map_dpop_error_to_auth_error_replay_cache_unavailable_is_503() {
+        let error = anyhow::Error::new(crate::ucan_auth::dpop::ReplayCacheUnavailableError::new(
+            "DPoP replay protection unavailable",
+        ));
+        let auth_error = map_dpop_error_to_auth_error(error, "/api/test");
+        assert_eq!(auth_error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(auth_error.message.contains("temporarily unavailable"));
+    }
+
+    #[test]
+    fn test_map_dpop_error_to_auth_error_invalid_proof_is_401() {
+        let auth_error =
+            map_dpop_error_to_auth_error(anyhow::anyhow!("invalid dpop proof"), "/api/test");
+        assert_eq!(auth_error.status, StatusCode::UNAUTHORIZED);
+        assert!(auth_error.message.contains("invalid dpop proof"));
     }
 }

@@ -775,6 +775,10 @@ async fn test_sign_event_blocked_by_policy() {
 #[tokio::test]
 #[serial]
 async fn test_cache_hit_dpop_bound_ucan_enforced_end_to_end() {
+    // Integration tests run without Redis in CI, so explicitly enable
+    // degraded replay-cache fallback for this end-to-end DPoP flow.
+    std::env::set_var("DPOP_REPLAY_FAIL_OPEN", "true");
+
     let pool = setup_db().await;
     let tenant_id = create_test_tenant(&pool).await;
     let (user_keys, pubkey) = create_test_user();

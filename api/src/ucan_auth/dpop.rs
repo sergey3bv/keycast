@@ -4,22 +4,44 @@
 use anyhow::{anyhow, Result};
 use axum::http::HeaderMap;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use p256::ecdsa::{signature::Verifier, Signature as P256Signature, VerifyingKey};
 use p256::EncodedPoint;
 use serde_json::Value;
 use std::time::{Duration, Instant};
+use thiserror::Error;
 
 /// Maximum age of a DPoP proof (5 minutes)
 const DPOP_MAX_AGE_SECS: u64 = 300;
+/// Explicit override for development-only degraded mode.
+const DPOP_REPLAY_FAIL_OPEN_ENV: &str = "DPOP_REPLAY_FAIL_OPEN";
+
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct ReplayCacheUnavailableError {
+    message: String,
+}
+
+impl ReplayCacheUnavailableError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+pub fn is_replay_cache_unavailable_error(error: &anyhow::Error) -> bool {
+    error.is::<ReplayCacheUnavailableError>()
+}
 
 /// How often to clean expired JTI entries
 const JTI_CLEANUP_INTERVAL_SECS: u64 = 60;
 
 /// Global JTI (JWT ID) replay protection cache
 /// Maps JTI string -> expiry instant
-/// TODO: For multi-instance deployments, replace with Redis-backed cache
+/// Used as a fallback when Redis is unavailable.
 static JTI_CACHE: Lazy<DashMap<String, Instant>> = Lazy::new(DashMap::new);
 
 /// Track when we last ran cleanup to avoid doing it on every request
@@ -43,6 +65,125 @@ fn maybe_cleanup_jtis() {
     }
 }
 
+fn replay_cache_key(thumbprint: &str, jti: &str) -> String {
+    // Replay key is scoped to DPoP key thumbprint + jti (RFC 9449 §11.1-compatible).
+    // Deployment-level namespacing is handled by PrefixedRedis/REDIS_KEY_PREFIX.
+    format!("dpop:jti:{thumbprint}:{jti}")
+}
+
+fn parse_truthy_env(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn dpop_replay_fail_open_from_env_value(value: Option<&str>) -> bool {
+    value.map(parse_truthy_env).unwrap_or(false)
+}
+
+fn dpop_replay_fail_open_enabled() -> bool {
+    let value = std::env::var(DPOP_REPLAY_FAIL_OPEN_ENV).ok();
+    dpop_replay_fail_open_from_env_value(value.as_deref())
+}
+
+fn effective_dpop_replay_fail_open() -> bool {
+    if cfg!(test) {
+        // Unit tests run without full app state/Redis wiring, so keep fallback enabled
+        // unless tests explicitly exercise fail-closed via record_jti_usage_with_fail_open.
+        true
+    } else {
+        dpop_replay_fail_open_enabled()
+    }
+}
+
+fn handle_redis_replay_cache_error(error: &redis::RedisError, fail_open: bool) -> Result<()> {
+    if fail_open {
+        tracing::error!(
+            error = %error,
+            fail_open = true,
+            "DPoP replay cache degraded: Redis unavailable, falling back to per-instance cache"
+        );
+        Ok(())
+    } else {
+        tracing::error!(
+            error = %error,
+            fail_open = false,
+            "DPoP replay cache unavailable: rejecting request to avoid cross-instance replay risk"
+        );
+        Err(anyhow::Error::new(ReplayCacheUnavailableError::new(format!(
+            "DPoP replay protection unavailable (Redis error); request rejected. Set {}=true to allow degraded local fallback in development",
+            DPOP_REPLAY_FAIL_OPEN_ENV
+        ))))
+    }
+}
+
+fn handle_redis_replay_cache_unavailable(fail_open: bool) -> Result<()> {
+    if fail_open {
+        tracing::error!(
+            fail_open = true,
+            "DPoP replay cache degraded: Redis unavailable, falling back to per-instance cache"
+        );
+        Ok(())
+    } else {
+        tracing::error!(
+            fail_open = false,
+            "DPoP replay cache unavailable: rejecting request to avoid cross-instance replay risk"
+        );
+        Err(anyhow::Error::new(ReplayCacheUnavailableError::new(format!(
+            "DPoP replay protection unavailable (Redis not configured); request rejected. Set {}=true to allow degraded local fallback in development",
+            DPOP_REPLAY_FAIL_OPEN_ENV
+        ))))
+    }
+}
+
+async fn record_jti_usage_with_fail_open(
+    replay_key: &str,
+    iat: i64,
+    fail_open: bool,
+) -> Result<()> {
+    if let Some(redis) = crate::state::get_keycast_state()
+        .ok()
+        .and_then(|state| state.redis.clone())
+    {
+        match redis
+            // TTL must match DPoP proof freshness window (DPOP_MAX_AGE_SECS) to prevent
+            // replay acceptance after cache expiry while a proof is still considered fresh.
+            .set_nx_ex(replay_key, DPOP_MAX_AGE_SECS, &iat.to_string())
+            .await
+        {
+            Ok(true) => return Ok(()),
+            Ok(false) => return Err(anyhow!("DPoP proof JTI has already been used (replay)")),
+            Err(error) => {
+                handle_redis_replay_cache_error(&error, fail_open)?;
+            }
+        }
+    } else {
+        handle_redis_replay_cache_unavailable(fail_open)?;
+    }
+
+    maybe_cleanup_jtis();
+    let now = Instant::now();
+    let expiry = now + Duration::from_secs(DPOP_MAX_AGE_SECS);
+    match JTI_CACHE.entry(replay_key.to_string()) {
+        Entry::Occupied(mut existing) => {
+            if *existing.get() > now {
+                return Err(anyhow!("DPoP proof JTI has already been used (replay)"));
+            }
+            existing.insert(expiry);
+        }
+        Entry::Vacant(vacant) => {
+            vacant.insert(expiry);
+        }
+    }
+    Ok(())
+}
+
+async fn record_jti_usage(replay_key: &str, iat: i64) -> Result<()> {
+    let fail_open = effective_dpop_replay_fail_open();
+    record_jti_usage_with_fail_open(replay_key, iat, fail_open).await
+}
+
 /// Result of a successfully verified DPoP proof
 #[derive(Debug, Clone)]
 pub struct VerifiedDpop {
@@ -58,7 +199,7 @@ pub struct VerifiedDpop {
 /// Returns `Ok(Some(VerifiedDpop))` if valid.
 ///
 /// If `expected_jkt` is provided, the computed JWK thumbprint must match it.
-pub fn verify_dpop_proof(
+pub async fn verify_dpop_proof(
     headers: &HeaderMap,
     method: &str,
     htu: &str,
@@ -121,6 +262,7 @@ pub fn verify_dpop_proof(
     }
 
     // Verify iat (issued at) - must be within DPOP_MAX_AGE_SECS
+    // Keep this freshness bound aligned with replay-cache TTL in record_jti_usage.
     let iat = payload_json
         .get("iat")
         .and_then(Value::as_i64)
@@ -163,15 +305,6 @@ pub fn verify_dpop_proof(
         ));
     }
 
-    // Periodically clean expired JTI entries
-    maybe_cleanup_jtis();
-
-    // Check for JTI replay (inserted AFTER signature verification to prevent cache poisoning)
-    let expiry = Instant::now() + Duration::from_secs(DPOP_MAX_AGE_SECS);
-    if JTI_CACHE.insert(jti.clone(), expiry).is_some() {
-        return Err(anyhow!("DPoP proof JTI has already been used (replay)"));
-    }
-
     // Compute JWK thumbprint
     let thumbprint = jwk_thumbprint(jwk)?;
 
@@ -185,6 +318,11 @@ pub fn verify_dpop_proof(
             ));
         }
     }
+
+    // Replay check runs after signature/thumbprint validation to prevent
+    // unauthenticated cache poisoning via forged proofs.
+    let replay_key = replay_cache_key(&thumbprint, &jti);
+    record_jti_usage(&replay_key, iat).await?;
 
     Ok(Some(VerifiedDpop {
         thumbprint,
@@ -330,7 +468,7 @@ pub fn extract_cnf_jkt_from_ucan(ucan: &ucan::Ucan) -> Option<String> {
 /// with a matching JWK thumbprint. If no `cnf.jkt` is present, DPoP is not required.
 ///
 /// `method` and `url` describe the current HTTP request for htm/htu verification.
-pub fn enforce_dpop_binding(
+pub async fn enforce_dpop_binding(
     headers: &HeaderMap,
     ucan: &ucan::Ucan,
     method: &str,
@@ -341,7 +479,7 @@ pub fn enforce_dpop_binding(
         None => return Ok(()), // No DPoP binding required
     };
 
-    match verify_dpop_proof(headers, method, url, Some(&expected_jkt))? {
+    match verify_dpop_proof(headers, method, url, Some(&expected_jkt)).await? {
         Some(_verified) => Ok(()),
         None => Err(anyhow!(
             "DPoP proof required: token is bound to key {}",
@@ -422,8 +560,8 @@ mod tests {
         jwk_thumbprint(&jwk_map).unwrap()
     }
 
-    #[test]
-    fn test_valid_dpop_proof_accepted() {
+    #[tokio::test]
+    async fn test_valid_dpop_proof_accepted() {
         let signing_key = SigningKey::random(&mut OsRng);
         let now = chrono::Utc::now().timestamp();
         let proof = create_dpop_proof(
@@ -437,7 +575,8 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("DPoP", proof.parse().unwrap());
 
-        let result = verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None);
+        let result =
+            verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None).await;
 
         assert!(result.is_ok());
         let verified = result.unwrap();
@@ -450,8 +589,8 @@ mod tests {
         assert_eq!(verified.thumbprint, expected);
     }
 
-    #[test]
-    fn test_dpop_proof_with_wrong_thumbprint_rejected() {
+    #[tokio::test]
+    async fn test_dpop_proof_with_wrong_thumbprint_rejected() {
         let signing_key = SigningKey::random(&mut OsRng);
         let now = chrono::Utc::now().timestamp();
         let proof = create_dpop_proof(
@@ -474,7 +613,8 @@ mod tests {
             "POST",
             "https://example.com/api/nostr",
             Some(&wrong_thumbprint),
-        );
+        )
+        .await;
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -485,16 +625,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_no_dpop_header_returns_none() {
+    #[tokio::test]
+    async fn test_no_dpop_header_returns_none() {
         let headers = HeaderMap::new();
-        let result = verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None);
+        let result =
+            verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
 
-    #[test]
-    fn test_dpop_bound_ucan_without_proof_rejected() {
+    #[tokio::test]
+    async fn test_dpop_bound_ucan_without_proof_rejected() {
         // Simulate a UCAN with cnf.jkt but no DPoP header
         let headers = HeaderMap::new(); // No DPoP header
 
@@ -509,7 +650,8 @@ mod tests {
             "POST",
             "https://example.com/api/nostr",
             Some("some-expected-thumbprint"),
-        );
+        )
+        .await;
 
         // verify_dpop_proof returns Ok(None) when no header present
         assert!(result.is_ok());
@@ -517,8 +659,8 @@ mod tests {
         // The caller (enforce_dpop_binding) converts None + expected_jkt into an error
     }
 
-    #[test]
-    fn test_replayed_jti_rejected() {
+    #[tokio::test]
+    async fn test_replayed_jti_rejected() {
         let signing_key = SigningKey::random(&mut OsRng);
         let now = chrono::Utc::now().timestamp();
         let jti = format!("replay-test-{}", uuid::Uuid::new_v4());
@@ -535,12 +677,14 @@ mod tests {
         headers.insert("DPoP", proof.parse().unwrap());
 
         // First use should succeed
-        let result = verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None);
+        let result =
+            verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_some());
 
         // Second use with same JTI should fail
-        let result2 = verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None);
+        let result2 =
+            verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None).await;
         assert!(result2.is_err());
         let err = result2.unwrap_err().to_string();
         assert!(
@@ -550,8 +694,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_expired_dpop_proof_rejected() {
+    #[tokio::test]
+    async fn test_same_jti_with_different_keys_is_allowed() {
+        let signing_key_a = SigningKey::random(&mut OsRng);
+        let signing_key_b = SigningKey::random(&mut OsRng);
+        let now = chrono::Utc::now().timestamp();
+        let shared_jti = format!("shared-jti-{}", uuid::Uuid::new_v4());
+
+        let proof_a = create_dpop_proof(
+            &signing_key_a,
+            "POST",
+            "https://example.com/api/nostr",
+            &shared_jti,
+            now,
+        );
+        let proof_b = create_dpop_proof(
+            &signing_key_b,
+            "POST",
+            "https://example.com/api/nostr",
+            &shared_jti,
+            now,
+        );
+
+        let mut headers_a = HeaderMap::new();
+        headers_a.insert("DPoP", proof_a.parse().unwrap());
+        let mut headers_b = HeaderMap::new();
+        headers_b.insert("DPoP", proof_b.parse().unwrap());
+
+        let result_a =
+            verify_dpop_proof(&headers_a, "POST", "https://example.com/api/nostr", None).await;
+        assert!(result_a.is_ok());
+
+        let result_b =
+            verify_dpop_proof(&headers_b, "POST", "https://example.com/api/nostr", None).await;
+        assert!(
+            result_b.is_ok(),
+            "Expected different-key JTI to be accepted, got: {:?}",
+            result_b
+        );
+    }
+
+    #[tokio::test]
+    async fn test_expired_dpop_proof_rejected() {
         let signing_key = SigningKey::random(&mut OsRng);
         // Set iat to 10 minutes ago (beyond the 5-minute window)
         let old_iat = chrono::Utc::now().timestamp() - 600;
@@ -566,7 +750,8 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("DPoP", proof.parse().unwrap());
 
-        let result = verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None);
+        let result =
+            verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -576,8 +761,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_wrong_method_rejected() {
+    #[tokio::test]
+    async fn test_wrong_method_rejected() {
         let signing_key = SigningKey::random(&mut OsRng);
         let now = chrono::Utc::now().timestamp();
         let proof = create_dpop_proof(
@@ -592,7 +777,8 @@ mod tests {
         headers.insert("DPoP", proof.parse().unwrap());
 
         // But we expect POST
-        let result = verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None);
+        let result =
+            verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -602,8 +788,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_wrong_url_rejected() {
+    #[tokio::test]
+    async fn test_wrong_url_rejected() {
         let signing_key = SigningKey::random(&mut OsRng);
         let now = chrono::Utc::now().timestamp();
         let proof = create_dpop_proof(
@@ -617,7 +803,8 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("DPoP", proof.parse().unwrap());
 
-        let result = verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None);
+        let result =
+            verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None).await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
@@ -627,12 +814,152 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_invalid_jwt_format_rejected() {
+    #[tokio::test]
+    async fn test_invalid_jwt_format_rejected() {
         let mut headers = HeaderMap::new();
         headers.insert("DPoP", "not-a-jwt".parse().unwrap());
 
-        let result = verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None);
+        let result =
+            verify_dpop_proof(&headers, "POST", "https://example.com/api/nostr", None).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_truthy_env_values() {
+        assert!(parse_truthy_env("true"));
+        assert!(parse_truthy_env("TRUE"));
+        assert!(parse_truthy_env("1"));
+        assert!(parse_truthy_env("yes"));
+        assert!(parse_truthy_env("on"));
+        assert!(!parse_truthy_env("false"));
+        assert!(!parse_truthy_env("0"));
+        assert!(!parse_truthy_env("no"));
+    }
+
+    #[test]
+    fn test_dpop_replay_fail_open_defaults_to_false() {
+        assert!(!dpop_replay_fail_open_from_env_value(None));
+        assert!(dpop_replay_fail_open_from_env_value(Some("true")));
+        assert!(!dpop_replay_fail_open_from_env_value(Some("false")));
+    }
+
+    #[test]
+    fn test_redis_error_fail_closed_by_default() {
+        let error = redis::RedisError::from((redis::ErrorKind::IoError, "Connection refused"));
+        let result = handle_redis_replay_cache_error(&error, false);
+        assert!(result.is_err(), "Redis errors must fail closed by default");
+        let typed_error = result.unwrap_err();
+        assert!(is_replay_cache_unavailable_error(&typed_error));
+        let message = typed_error.to_string();
+        assert!(
+            message.contains("DPoP replay protection unavailable"),
+            "Unexpected error message: {message}"
+        );
+        assert!(
+            message.contains(DPOP_REPLAY_FAIL_OPEN_ENV),
+            "Expected env var hint in message: {message}"
+        );
+    }
+
+    #[test]
+    fn test_redis_error_with_explicit_fail_open_allows_fallback() {
+        let error = redis::RedisError::from((redis::ErrorKind::IoError, "Connection refused"));
+        let result = handle_redis_replay_cache_error(&error, true);
+        assert!(result.is_ok(), "Explicit fail-open should allow fallback");
+    }
+
+    #[test]
+    fn test_redis_unavailable_fail_closed_by_default() {
+        let result = handle_redis_replay_cache_unavailable(false);
+        assert!(
+            result.is_err(),
+            "Redis unavailable must fail closed by default"
+        );
+        let typed_error = result.unwrap_err();
+        assert!(is_replay_cache_unavailable_error(&typed_error));
+        let message = typed_error.to_string();
+        assert!(
+            message.contains("DPoP replay protection unavailable"),
+            "Unexpected error message: {message}"
+        );
+        assert!(
+            message.contains(DPOP_REPLAY_FAIL_OPEN_ENV),
+            "Expected env var hint in message: {message}"
+        );
+    }
+
+    #[test]
+    fn test_redis_unavailable_with_explicit_fail_open_allows_fallback() {
+        let result = handle_redis_replay_cache_unavailable(true);
+        assert!(result.is_ok(), "Explicit fail-open should allow fallback");
+    }
+
+    #[test]
+    fn test_replay_cache_classifier_rejects_non_replay_cache_errors() {
+        let error = anyhow!("not a replay-cache outage");
+        assert!(!is_replay_cache_unavailable_error(&error));
+    }
+
+    #[tokio::test]
+    async fn test_record_jti_usage_local_fallback_rejects_replay_atomically() {
+        let replay_key = format!("test-atomic-local-fallback-{}", uuid::Uuid::new_v4());
+        record_jti_usage_with_fail_open(&replay_key, chrono::Utc::now().timestamp(), true)
+            .await
+            .expect("first insert should succeed");
+
+        let replay =
+            record_jti_usage_with_fail_open(&replay_key, chrono::Utc::now().timestamp(), true)
+                .await;
+        assert!(
+            replay.is_err(),
+            "second insert should be rejected as replay"
+        );
+        assert!(
+            replay.unwrap_err().to_string().contains("replay"),
+            "expected replay error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_record_jti_usage_local_fallback_concurrent_only_one_succeeds() {
+        let replay_key = format!("test-concurrent-local-fallback-{}", uuid::Uuid::new_v4());
+        let iat = chrono::Utc::now().timestamp();
+        let (result_a, result_b) = tokio::join!(
+            record_jti_usage_with_fail_open(&replay_key, iat, true),
+            record_jti_usage_with_fail_open(&replay_key, iat, true),
+        );
+
+        let success_count = [result_a.is_ok(), result_b.is_ok()]
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            success_count, 1,
+            "exactly one concurrent request should win the local fallback race"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_record_jti_usage_without_redis_fails_closed_when_not_fail_open() {
+        let replay_key = format!("test-no-redis-fail-closed-{}", uuid::Uuid::new_v4());
+        let result =
+            record_jti_usage_with_fail_open(&replay_key, chrono::Utc::now().timestamp(), false)
+                .await;
+        assert!(
+            result.is_err(),
+            "when Redis is unavailable and fail-open is disabled, request must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_record_jti_usage_without_redis_allows_fallback_when_fail_open() {
+        let replay_key = format!("test-no-redis-fail-open-{}", uuid::Uuid::new_v4());
+        let first =
+            record_jti_usage_with_fail_open(&replay_key, chrono::Utc::now().timestamp(), true)
+                .await;
+        assert!(
+            first.is_ok(),
+            "when Redis is unavailable and fail-open is enabled, fallback should allow first insert"
+        );
     }
 }
