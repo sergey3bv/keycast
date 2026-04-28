@@ -24,6 +24,8 @@ pub struct OAuthCodeData {
     pub device_code: Option<String>,
     /// Whether this code was issued via headless flow (for first_party UCAN fact)
     pub is_headless: bool,
+    /// Whether the registration flow generated a new keypair server-side.
+    pub is_generated: bool,
 }
 
 /// Parameters for storing a basic OAuth code
@@ -65,6 +67,8 @@ pub struct StoreOAuthCodeWithRegistrationParams<'a> {
     pub device_code: Option<&'a str>,
     /// Whether this code is from headless flow (for first_party UCAN fact)
     pub is_headless: bool,
+    /// Whether this pending registration used auto-generated keys.
+    pub is_generated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -109,8 +113,8 @@ impl OAuthCodeRepository {
     ) -> Result<(), RepositoryError> {
         sqlx::query(
             "INSERT INTO oauth_codes (tenant_id, code, user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method, expires_at, created_at,
-             pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, state, device_code, is_headless)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+             pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret, state, device_code, is_headless, is_generated)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
         )
         .bind(params.tenant_id)
         .bind(params.code)
@@ -129,6 +133,7 @@ impl OAuthCodeRepository {
         .bind(params.state)
         .bind(params.device_code)
         .bind(params.is_headless)
+        .bind(params.is_generated)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -156,10 +161,11 @@ impl OAuthCodeRepository {
             Option<String>,
             Option<String>,
             bool,
+            bool,
         )> = sqlx::query_as(
             "SELECT user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method,
                     pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret,
-                    previous_auth_id, state, device_code, is_headless
+                    previous_auth_id, state, device_code, is_headless, is_generated
              FROM oauth_codes
              WHERE tenant_id = $1 AND code = $2 AND expires_at > $3",
         )
@@ -184,6 +190,7 @@ impl OAuthCodeRepository {
             state: row.11,
             device_code: row.12,
             is_headless: row.13,
+            is_generated: row.14,
         }))
     }
 
@@ -210,10 +217,11 @@ impl OAuthCodeRepository {
             Option<String>,
             Option<String>,
             bool,
+            bool,
         )> = sqlx::query_as(
             "SELECT user_pubkey, client_id, redirect_uri, scope, code_challenge, code_challenge_method,
                     pending_email, pending_password_hash, pending_email_verification_token, pending_encrypted_secret,
-                    previous_auth_id, state, device_code, is_headless
+                    previous_auth_id, state, device_code, is_headless, is_generated
              FROM oauth_codes
              WHERE pending_email_verification_token = $1 AND tenant_id = $2 AND expires_at > $3",
         )
@@ -238,6 +246,7 @@ impl OAuthCodeRepository {
             state: row.11,
             device_code: row.12,
             is_headless: row.13,
+            is_generated: row.14,
         }))
     }
 

@@ -19,7 +19,7 @@ use crate::nip98;
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, OAuthCodeRepository,
-    PersonalKeysRepository, PolicyRepository, UserRepository,
+    PersonalKeysRepository, PolicyRepository, RelayListPublishPendingRepository, UserRepository,
 };
 use keycast_core::traits::CustomPermission;
 use nostr_sdk::{Keys, PublicKey, ToBech32, UnsignedEvent};
@@ -660,6 +660,31 @@ async fn nostr_auth_login(
 
 /// Register a new user with email and password
 /// Note: Does NOT issue UCAN - user must verify email first
+fn should_publish_registration_relay_list(nsec: Option<&str>) -> bool {
+    nsec.is_none()
+}
+
+async fn enqueue_relay_list_publish_job(
+    pool: &PgPool,
+    tenant_id: i64,
+    user_pubkey: &str,
+    encrypted_secret: &[u8],
+) {
+    let relay_list_repo = RelayListPublishPendingRepository::new(pool.clone());
+    if let Err(e) = relay_list_repo
+        .enqueue(tenant_id, user_pubkey, encrypted_secret)
+        .await
+    {
+        tracing::warn!(
+            event = "relay_list_publish_enqueue_failed",
+            tenant_id = tenant_id,
+            user_pubkey = %user_pubkey,
+            error = %e,
+            "Failed enqueuing kind:10002 relay-list publish job"
+        );
+    }
+}
+
 pub async fn register(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<super::routes::AuthState>,
@@ -732,6 +757,7 @@ pub async fn register(
             &verification_token,
             verification_expires,
             &encrypted_secret,
+            should_publish_registration_relay_list(req.nsec.as_deref()),
         )
         .await?;
 
@@ -767,6 +793,13 @@ pub async fn register(
                 retry_after: Some(10),
             }),
         };
+    }
+
+    // Queue a discoverable NIP-65 relay list publish only for auto-generated accounts.
+    // Non-fatal side effect: registration must succeed even if queueing fails.
+    if should_publish_registration_relay_list(req.nsec.as_deref()) {
+        let publish_pubkey = public_key.to_hex();
+        enqueue_relay_list_publish_job(pool, tenant_id, &publish_pubkey, &encrypted_secret).await;
     }
 
     // Track successful registration
@@ -1392,14 +1425,15 @@ pub async fn verify_email(
             .await?;
 
             sqlx::query(
-                "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
-                 VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at, is_generated)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
             )
             .bind(&oauth_data.user_pubkey)
             .bind(encrypted_secret)
             .bind(tenant_id)
             .bind(now)
             .bind(now)
+            .bind(oauth_data.is_generated)
             .execute(&mut *tx)
             .await?;
 
@@ -1527,6 +1561,27 @@ pub async fn verify_email(
                         device_code
                     );
                 }
+            }
+        }
+
+        // Queue kind:10002 relay-list publishing for generated OAuth registrations.
+        // This is durable and retried by a background worker.
+        if oauth_data.is_generated {
+            if let Some(ref encrypted_secret) = oauth_data.pending_encrypted_secret {
+                enqueue_relay_list_publish_job(
+                    pool,
+                    tenant_id,
+                    &oauth_data.user_pubkey,
+                    encrypted_secret,
+                )
+                .await;
+            } else {
+                tracing::warn!(
+                    event = "relay_list_publish_enqueue_skipped_missing_secret",
+                    tenant_id = tenant_id,
+                    user_pubkey = %oauth_data.user_pubkey,
+                    "Skipping relay-list publish enqueue for generated registration because encrypted secret is missing"
+                );
             }
         }
 
@@ -3517,7 +3572,7 @@ pub async fn delete_account(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_origin;
+    use super::{should_publish_registration_relay_list, validate_origin};
 
     #[test]
     fn test_validate_origin_https() {
@@ -3549,6 +3604,14 @@ mod tests {
         // Hosts that merely contain "localhost" must not be treated as loopback.
         assert!(validate_origin("http://xxxlocalhost").is_err());
         assert!(validate_origin("http://localhost.evil.com").is_err());
+    }
+
+    #[test]
+    fn test_should_publish_registration_relay_list_only_for_generated_keys() {
+        assert!(should_publish_registration_relay_list(None));
+        assert!(!should_publish_registration_relay_list(Some(
+            "nsec1example"
+        )));
     }
 
     #[cfg(feature = "integration-tests")]

@@ -7,6 +7,8 @@ pub mod email_service;
 pub mod handlers;
 pub mod nip98;
 pub mod redis;
+pub mod relay_list_publish_worker;
+pub mod relay_list_publisher;
 pub mod state;
 pub mod ucan_auth;
 

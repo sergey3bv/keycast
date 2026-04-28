@@ -982,6 +982,14 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let pool_for_shutdown = database.pool.clone();
     let task_tracker = TaskTracker::new();
 
+    // Spawn durable relay-list publish worker.
+    task_tracker.spawn(
+        keycast_api::relay_list_publish_worker::run_relay_list_publish_worker(
+            api_state.clone(),
+            shutdown_signal.clone(),
+        ),
+    );
+
     // Spawn API server with graceful shutdown
     let api_handle = tokio::spawn(async move {
         let listener = match tokio::net::TcpListener::bind(dual_stack_addr).await {

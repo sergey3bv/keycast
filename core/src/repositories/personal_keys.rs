@@ -72,16 +72,29 @@ impl PersonalKeysRepository {
         encrypted_secret_key: &[u8],
         tenant_id: i64,
     ) -> Result<(), RepositoryError> {
+        self.create_with_generation(user_pubkey, encrypted_secret_key, tenant_id, false)
+            .await
+    }
+
+    /// Create personal keys for a user with explicit provenance.
+    pub async fn create_with_generation(
+        &self,
+        user_pubkey: &str,
+        encrypted_secret_key: &[u8],
+        tenant_id: i64,
+        is_generated: bool,
+    ) -> Result<(), RepositoryError> {
         let now = Utc::now();
         sqlx::query(
-            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at, is_generated)
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(user_pubkey)
         .bind(encrypted_secret_key)
         .bind(tenant_id)
         .bind(now)
         .bind(now)
+        .bind(is_generated)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -186,5 +199,91 @@ mod tests {
         // Should be gone
         let found = repo.find_encrypted_key(&user_pubkey).await.unwrap();
         assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_legacy_preloaded_backfill_marks_only_known_generated_accounts() {
+        use nostr_sdk::Keys;
+        use uuid::Uuid;
+
+        let pool = setup_pool().await;
+        let repo = PersonalKeysRepository::new(pool.clone());
+
+        let generated_pubkey = Keys::generate().public_key().to_hex();
+        let byok_pubkey = Keys::generate().public_key().to_hex();
+        let encrypted_key = vec![9_u8, 9, 9, 9];
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, vine_id, created_at, updated_at)
+             VALUES ($1, 1, $2, $3, NOW(), NOW())",
+        )
+        .bind(&generated_pubkey)
+        .bind(format!("legacy-generated-{}@example.com", Uuid::new_v4()))
+        .bind(format!("vine-{}", Uuid::new_v4()))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, email, vine_id, created_at, updated_at)
+             VALUES ($1, 1, $2, NULL, NOW(), NOW())",
+        )
+        .bind(&byok_pubkey)
+        .bind(format!("legacy-byok-{}@example.com", Uuid::new_v4()))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        repo.create(&generated_pubkey, &encrypted_key, 1)
+            .await
+            .unwrap();
+        repo.create(&byok_pubkey, &encrypted_key, 1).await.unwrap();
+
+        sqlx::query(
+            "UPDATE personal_keys pk
+             SET is_generated = TRUE
+             FROM users u
+             WHERE pk.user_pubkey = u.pubkey
+               AND pk.tenant_id = u.tenant_id
+               AND pk.is_generated = FALSE
+               AND u.vine_id IS NOT NULL",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let generated_marked: bool = sqlx::query_scalar(
+            "SELECT is_generated FROM personal_keys WHERE tenant_id = 1 AND user_pubkey = $1",
+        )
+        .bind(&generated_pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let byok_marked: bool = sqlx::query_scalar(
+            "SELECT is_generated FROM personal_keys WHERE tenant_id = 1 AND user_pubkey = $1",
+        )
+        .bind(&byok_pubkey)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            generated_marked,
+            "preloaded user should be marked generated"
+        );
+        assert!(!byok_marked, "non-preloaded user should stay unmarked");
+
+        repo.delete_by_user(&generated_pubkey).await.unwrap();
+        repo.delete_by_user(&byok_pubkey).await.unwrap();
+        sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&generated_pubkey)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&byok_pubkey)
+            .execute(&pool)
+            .await
+            .ok();
     }
 }

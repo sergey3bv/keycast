@@ -181,6 +181,7 @@ pub async fn headless_register(
         .collect();
 
     // Store pending registration in oauth_codes (deferred user creation)
+    let is_generated = req.nsec.is_none();
     let expires_at = Utc::now() + Duration::hours(EMAIL_VERIFICATION_EXPIRY_HOURS);
     let oauth_code_repo = OAuthCodeRepository::new(pool.clone());
     oauth_code_repo
@@ -201,6 +202,7 @@ pub async fn headless_register(
             state: req.state.as_deref(),
             device_code: Some(&device_code),
             is_headless: true,
+            is_generated,
         })
         .await?;
 

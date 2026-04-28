@@ -13,8 +13,9 @@ use chrono::{Duration, Utc};
 use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     CreateOAuthAuthorizationParams, OAuthAuthorizationRepository, OAuthCodeRepository,
-    PersonalKeysRepository, PolicyRepository, RefreshTokenRepository, RepositoryError,
-    StoreOAuthCodeParams, StoreOAuthCodeWithRegistrationParams, UserRepository,
+    PersonalKeysRepository, PolicyRepository, RefreshTokenRepository,
+    RelayListPublishPendingRepository, RepositoryError, StoreOAuthCodeParams,
+    StoreOAuthCodeWithRegistrationParams, UserRepository,
 };
 use keycast_core::types::refresh_token::generate_refresh_token;
 use nostr_sdk::{Keys, ToBech32};
@@ -176,6 +177,7 @@ async fn store_oauth_code_with_pending_registration(
     pending_password_hash: &str,
     pending_email_verification_token: &str,
     pending_encrypted_secret: Option<&[u8]>,
+    is_generated: bool,
     state: Option<&str>,
     device_code: Option<&str>,
 ) -> Result<(), OAuthError> {
@@ -194,6 +196,7 @@ async fn store_oauth_code_with_pending_registration(
         pending_password_hash,
         pending_email_verification_token,
         pending_encrypted_secret,
+        is_generated,
         state,
         device_code,
         is_headless: false,
@@ -2468,6 +2471,7 @@ async fn handle_authorization_code_grant(
     let pending_password_hash = auth_code.pending_password_hash;
     let pending_email_verification_token = auth_code.pending_email_verification_token;
     let pending_encrypted_secret = auth_code.pending_encrypted_secret;
+    let is_generated = auth_code.is_generated;
     let previous_auth_id = auth_code.previous_auth_id;
     let is_headless = auth_code.is_headless;
 
@@ -2574,6 +2578,7 @@ async fn handle_authorization_code_grant(
                 verification_expires,
                 &encrypted_secret,
                 code,
+                is_generated,
             )
             .await
             .map_err(|e| OAuthError::Database(sqlx::Error::Protocol(e.to_string())))?;
@@ -2583,6 +2588,22 @@ async fn handle_authorization_code_grant(
             user_pubkey,
             pending_email_val
         );
+
+        if is_generated {
+            let relay_list_repo = RelayListPublishPendingRepository::new(pool.clone());
+            if let Err(e) = relay_list_repo
+                .enqueue(tenant_id, &user_pubkey, &encrypted_secret)
+                .await
+            {
+                tracing::warn!(
+                    event = "relay_list_publish_enqueue_failed",
+                    tenant_id = tenant_id,
+                    user_pubkey = %user_pubkey,
+                    error = %e,
+                    "Failed enqueuing kind:10002 relay-list publish during token exchange registration"
+                );
+            }
+        }
 
         // Send verification email (optional - don't fail if email service unavailable)
         match crate::email_service::EmailService::new() {
@@ -3214,7 +3235,7 @@ pub async fn oauth_register(
             .map_err(|_| OAuthError::InvalidRequest("Password hashing failed".to_string()))?;
 
     // Priority: nsec (direct input) → pubkey (BYOK via code_verifier) → auto-generate
-    let (public_key, generated_keys) = if let Some(ref nsec_str) = req.nsec {
+    let (public_key, generated_keys, is_generated) = if let Some(ref nsec_str) = req.nsec {
         // Direct nsec input: parse nsec and create keys immediately
         let keys = Keys::parse(nsec_str)
             .map_err(|e| OAuthError::InvalidRequest(format!("Invalid nsec: {}", e)))?;
@@ -3223,7 +3244,7 @@ pub async fn oauth_register(
             "OAuth registration with direct nsec input for pubkey: {}",
             pubkey.to_hex()
         );
-        (pubkey, Some(keys)) // Keys provided by user
+        (pubkey, Some(keys), false) // Keys provided by user
     } else if let Some(ref pubkey_hex) = req.pubkey {
         // BYOK flow: client provides pubkey, nsec will come in code_verifier
         let pubkey = nostr_sdk::PublicKey::from_hex(pubkey_hex)
@@ -3232,7 +3253,7 @@ pub async fn oauth_register(
             "OAuth registration BYOK flow for pubkey: {}",
             pubkey.to_hex()
         );
-        (pubkey, None) // No keys generated, wait for token exchange
+        (pubkey, None, false) // No keys generated, wait for token exchange
     } else {
         // Auto-generate flow: server generates keys immediately
         let keys = Keys::generate();
@@ -3241,7 +3262,7 @@ pub async fn oauth_register(
             "OAuth registration auto-generate flow for email: {}",
             req.email
         );
-        (pubkey, Some(keys)) // Keys generated now
+        (pubkey, Some(keys), true) // Keys generated now
     };
 
     // Check if user with this pubkey already exists
@@ -3331,6 +3352,7 @@ pub async fn oauth_register(
         &password_hash,
         &verification_token,
         pending_encrypted_secret.as_deref(),
+        is_generated,
         req.state.as_deref(),
         Some(&device_code),
     )

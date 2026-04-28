@@ -305,6 +305,7 @@ impl UserRepository {
         verification_token: &str,
         verification_expires_at: DateTime<Utc>,
         encrypted_secret: &[u8],
+        is_generated: bool,
     ) -> Result<(), RepositoryError> {
         let mut tx = self.pool.begin().await?;
         let now = Utc::now();
@@ -329,14 +330,15 @@ impl UserRepository {
 
         // Insert personal key
         sqlx::query(
-            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at, is_generated)
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(pubkey)
         .bind(encrypted_secret)
         .bind(tenant_id)
         .bind(now)
         .bind(now)
+        .bind(is_generated)
         .execute(&mut *tx)
         .await?;
 
@@ -870,6 +872,7 @@ impl UserRepository {
         verification_expires_at: DateTime<Utc>,
         encrypted_secret: &[u8],
         oauth_code: &str,
+        is_generated: bool,
     ) -> Result<(), RepositoryError> {
         let mut tx = self.pool.begin().await?;
         let now = Utc::now();
@@ -893,14 +896,15 @@ impl UserRepository {
 
         // Create personal_keys row
         sqlx::query(
-            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at, is_generated)
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(pubkey)
         .bind(encrypted_secret)
         .bind(tenant_id)
         .bind(now)
         .bind(now)
+        .bind(is_generated)
         .execute(&mut *tx)
         .await?;
 

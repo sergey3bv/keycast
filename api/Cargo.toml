@@ -9,6 +9,7 @@ edition = "2021"
 # Feature flag to enable SQLite-based tests (disabled until migrated to PostgreSQL)
 sqlite-tests = []
 integration-tests = []
+aws = ["keycast_core/aws"]
 
 [dependencies]
 aes-gcm = "0.10"
