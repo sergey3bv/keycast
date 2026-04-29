@@ -9,6 +9,7 @@ use keycast_core::authorization_channel::{AuthorizationCommand, AuthorizationRec
 use keycast_core::encryption::KeyManager;
 use keycast_core::metrics::METRICS;
 use keycast_core::signing_handler::SigningHandler;
+use keycast_core::signing_session::canonicalize_event_author;
 use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
 use moka::future::Cache;
@@ -1661,7 +1662,7 @@ impl UnifiedSigner {
 impl SigningHandler for Nip46Handler {
     async fn sign_event_direct(
         &self,
-        unsigned_event: UnsignedEvent,
+        mut unsigned_event: UnsignedEvent,
     ) -> Result<Event, Box<dyn std::error::Error + Send + Sync>> {
         let kind = unsigned_event.kind.as_u16();
 
@@ -1673,6 +1674,15 @@ impl SigningHandler for Nip46Handler {
 
         // VALIDATE PERMISSIONS BEFORE SIGNING
         self.validate_permissions_for_sign(&unsigned_event).await?;
+
+        // Canonicalize the pubkey to match the signer keys, matching SigningSession::sign_event behavior.
+        // This prevents producing an event where event.pubkey disagrees with the keypair that signed it.
+        let signer_pubkey = self.user_keys.public_key();
+        canonicalize_event_author(
+            &mut unsigned_event,
+            signer_pubkey,
+            "signer_daemon.pubkey_canonicalized",
+        );
 
         // Sign the event with user keys (consumes unsigned_event)
         let signed_event = unsigned_event
@@ -1993,6 +2003,47 @@ mod tests {
         let tags_vec: Vec<Tag> = signed_event.tags.iter().cloned().collect();
         assert!(tags_vec.contains(&tag1));
         assert!(tags_vec.contains(&tag2));
+    }
+
+    // Regression: ensures the NIP-46 relay path (sign_event_direct) keeps
+    // calling canonicalize_event_author. If a future edit removes the call,
+    // this test fails because the produced signature would not verify against
+    // the (canonicalized) event.pubkey, mirroring the divine-blossom
+    // "Invalid signature" failure mode.
+    #[tokio::test]
+    async fn test_sign_event_direct_canonicalizes_mismatched_pubkey() {
+        let pool = create_test_db().await;
+        let handler = create_test_handler_with_db(pool).await;
+
+        let stale_keys = Keys::generate();
+        assert_ne!(
+            stale_keys.public_key(),
+            handler.user_keys.public_key(),
+            "test setup should pick distinct keys",
+        );
+
+        // Client supplied a stale pubkey (different from the signer's keys).
+        let unsigned_event = UnsignedEvent::new(
+            stale_keys.public_key(),
+            Timestamp::now(),
+            Kind::from(1),
+            vec![],
+            "stale-pubkey content",
+        );
+
+        let signed_event = handler
+            .sign_event_direct(unsigned_event)
+            .await
+            .expect("sign should succeed after canonicalization");
+
+        assert_eq!(
+            signed_event.pubkey,
+            handler.user_keys.public_key(),
+            "event.pubkey must be canonicalized to the signer keypair",
+        );
+        signed_event
+            .verify()
+            .expect("signature must verify after canonicalization");
     }
 
     #[tokio::test]
