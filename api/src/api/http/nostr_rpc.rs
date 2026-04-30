@@ -503,12 +503,15 @@ async fn get_handler(
             return Err(RpcError::Auth(AuthError::InvalidToken));
         }
 
+        // Cache hit! Record before DPoP checks so auth failures on the fast path
+        // still count as cache-hit traversals.
+        METRICS.inc_http_rpc_cache_hit();
+
         // On cache hit, enforce DPoP binding from cached UCAN cnf.jkt.
         let htu = construct_htu(headers);
         enforce_cached_dpop_binding(&handler, headers, &htu).await?;
 
         // Cache hit! Skip full UCAN verification
-        METRICS.inc_http_rpc_cache_hit();
         tracing::trace!("RPC: Cache hit (BLAKE3)");
         return Ok(handler);
     }

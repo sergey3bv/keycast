@@ -22,6 +22,7 @@ use keycast_api::state::KeycastState;
 use keycast_api::ucan_auth::{nostr_pubkey_to_did, NostrKeyMaterial};
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::KeyManager;
+use keycast_core::metrics::METRICS;
 use keycast_core::secret_pool::SecretPool;
 use keycast_core::signing_session::{parse_cache_key, SigningSession};
 use moka::future::Cache;
@@ -32,7 +33,7 @@ use rand::rngs::OsRng;
 use serde_json::{json, Value};
 use serial_test::serial;
 use sqlx::PgPool;
-use std::sync::Arc;
+use std::sync::{atomic::Ordering, Arc};
 use ucan::builder::UcanBuilder;
 use uuid::Uuid;
 
@@ -824,6 +825,8 @@ async fn test_cache_hit_dpop_bound_ucan_enforced_end_to_end() {
     .await;
     let auth_header = format!("Bearer {}", token);
     let token_cache_key = *blake3::hash(token.as_bytes()).as_bytes();
+    let cache_hits_before = METRICS.http_rpc_cache_hits.load(Ordering::Relaxed);
+    let cache_misses_before = METRICS.http_rpc_cache_misses.load(Ordering::Relaxed);
 
     // Request 1: cache miss with valid DPoP proof must succeed and populate cache.
     let proof_1 = create_dpop_proof(
@@ -842,6 +845,16 @@ async fn test_cache_hit_dpop_bound_ucan_enforced_end_to_end() {
     .await
     .expect("Initial DPoP-bound request should succeed");
     assert_eq!(response_1.result, Some(Value::String(pubkey.clone())));
+    assert_eq!(
+        METRICS.http_rpc_cache_hits.load(Ordering::Relaxed) - cache_hits_before,
+        0,
+        "Initial request should not count as a cache hit"
+    );
+    assert_eq!(
+        METRICS.http_rpc_cache_misses.load(Ordering::Relaxed) - cache_misses_before,
+        1,
+        "Initial request should count as a cache miss"
+    );
     assert!(
         auth_state
             .state
@@ -866,6 +879,16 @@ async fn test_cache_hit_dpop_bound_ucan_enforced_end_to_end() {
         err_missing,
         RpcError::Auth(AuthError::InvalidToken)
     ));
+    assert_eq!(
+        METRICS.http_rpc_cache_hits.load(Ordering::Relaxed) - cache_hits_before,
+        1,
+        "Missing DPoP proof request should still traverse cache-hit path"
+    );
+    assert_eq!(
+        METRICS.http_rpc_cache_misses.load(Ordering::Relaxed) - cache_misses_before,
+        1,
+        "Missing DPoP proof request should not trigger another cache miss"
+    );
 
     // Request 3: cache hit with invalid DPoP proof (wrong key) must be rejected.
     let wrong_key = SigningKey::random(&mut OsRng);
@@ -888,6 +911,16 @@ async fn test_cache_hit_dpop_bound_ucan_enforced_end_to_end() {
         err_invalid,
         RpcError::Auth(AuthError::InvalidToken)
     ));
+    assert_eq!(
+        METRICS.http_rpc_cache_hits.load(Ordering::Relaxed) - cache_hits_before,
+        2,
+        "Invalid DPoP proof request should still traverse cache-hit path"
+    );
+    assert_eq!(
+        METRICS.http_rpc_cache_misses.load(Ordering::Relaxed) - cache_misses_before,
+        1,
+        "Invalid DPoP proof request should not trigger another cache miss"
+    );
 
     // Request 4: cache hit with a fresh, valid DPoP proof must succeed.
     let proof_2 = create_dpop_proof(
@@ -906,4 +939,14 @@ async fn test_cache_hit_dpop_bound_ucan_enforced_end_to_end() {
     .await
     .expect("Valid DPoP proof on cache hit should succeed");
     assert_eq!(response_4.result, Some(Value::String(pubkey)));
+    assert_eq!(
+        METRICS.http_rpc_cache_hits.load(Ordering::Relaxed) - cache_hits_before,
+        3,
+        "Final valid DPoP proof request should use cache-hit path"
+    );
+    assert_eq!(
+        METRICS.http_rpc_cache_misses.load(Ordering::Relaxed) - cache_misses_before,
+        1,
+        "Only the first request should require cache-miss path"
+    );
 }
