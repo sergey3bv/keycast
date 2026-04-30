@@ -45,6 +45,15 @@ pub trait EmailSender: Send + Sync {
     }
 }
 
+fn build_reset_url(base_url: &str, reset_token: &str, email: &str) -> String {
+    format!(
+        "{}/reset-password?token={}&email={}",
+        base_url,
+        urlencoding::encode(reset_token),
+        urlencoding::encode(email),
+    )
+}
+
 /// Development email sender - logs URLs to console and captures emails for testing
 pub struct DevEmailSender {
     base_url: String,
@@ -129,12 +138,7 @@ impl EmailSender for DevEmailSender {
         to_email: &str,
         reset_token: &str,
     ) -> Result<(), String> {
-        let reset_url = format!(
-            "{}/reset-password?token={}&email={}",
-            self.base_url,
-            reset_token,
-            urlencoding::encode(to_email),
-        );
+        let reset_url = build_reset_url(&self.base_url, reset_token, to_email);
 
         tracing::info!("");
         tracing::info!("==================================================");
@@ -410,12 +414,7 @@ impl EmailSender for SendGridEmailSender {
         to_email: &str,
         reset_token: &str,
     ) -> Result<(), String> {
-        let reset_url = format!(
-            "{}/reset-password?token={}&email={}",
-            self.base_url,
-            reset_token,
-            urlencoding::encode(to_email),
-        );
+        let reset_url = build_reset_url(&self.base_url, reset_token, to_email);
 
         let subject = format!("Reset your {} password", BRAND_NAME);
         let html_content = format!(
@@ -694,6 +693,20 @@ mod tests {
         assert!(
             result.is_err(),
             "Empty DISABLE_EMAILS should not bypass production check"
+        );
+    }
+
+    #[test]
+    fn test_build_reset_url_encodes_email_and_token_with_contract_shape() {
+        let base_url = "https://login.divine.video";
+        let token = "abc+123/==";
+        let email = "test+alias@example.com";
+
+        let url = build_reset_url(base_url, token, email);
+
+        assert_eq!(
+            url,
+            "https://login.divine.video/reset-password?token=abc%2B123%2F%3D%3D&email=test%2Balias%40example.com"
         );
     }
 }
