@@ -14,6 +14,8 @@ import {
 import { markUserAtprotoReady } from "../helpers/db";
 import { startKeycastProcess, stopKeycastProcess } from "../helpers/keycast-process";
 
+test.describe.configure({ mode: "serial" });
+
 async function setupAtprotoReadyUser(requestCtx: any): Promise<{ cookie: string }> {
   const email = `e2e-atproto-${Date.now()}-${Math.random().toString(36).slice(2, 7)}@test.local`;
   const { cookie } = await registerAndVerify(requestCtx, email, "TestPass123!");
