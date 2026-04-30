@@ -4,6 +4,12 @@ import { spawn, ChildProcess } from "node:child_process";
 
 const DEFAULT_DATABASE_URL = "postgres://postgres:password@localhost/keycast";
 const DEFAULT_REDIS_URL = "redis://localhost:16379";
+/** TEST-ONLY: intentionally weak fallback secrets for local e2e helper usage. */
+const TEST_ONLY_DEV_SERVER_NSEC =
+  "0000000000000000000000000000000000000000000000000000000000000001";
+/** TEST-ONLY: intentionally weak fallback secrets for local e2e helper usage. */
+const TEST_ONLY_ATPROTO_JWT_KEY_HEX =
+  "8f2a55949068468ad5d670dfd0c0a33d5b9e7e1a2c0d2059f0f8f8779d4d078d";
 
 function isPortReachable(port: number): Promise<boolean> {
   return new Promise((resolve) => {
@@ -65,9 +71,7 @@ function defaultEnv(port: number): Record<string, string> {
     DATABASE_URL: process.env.DATABASE_URL || DEFAULT_DATABASE_URL,
     REDIS_URL: process.env.REDIS_URL || DEFAULT_REDIS_URL,
     MASTER_KEY_PATH: process.env.MASTER_KEY_PATH || `${workspaceRoot}/master.key`,
-    SERVER_NSEC:
-      process.env.SERVER_NSEC ||
-      "0000000000000000000000000000000000000000000000000000000000000001",
+    SERVER_NSEC: process.env.SERVER_NSEC || TEST_ONLY_DEV_SERVER_NSEC,
     BUNKER_RELAYS: process.env.BUNKER_RELAYS || "ws://localhost:8080",
     ALLOWED_ORIGINS:
       process.env.ALLOWED_ORIGINS ||
@@ -76,8 +80,7 @@ function defaultEnv(port: number): Record<string, string> {
       process.env.ALLOWED_TENANT_DOMAINS ||
       "localhost,tenant-a.localhost,tenant-b.localhost",
     ATPROTO_OAUTH_JWT_PRIVATE_KEY_HEX:
-      process.env.ATPROTO_OAUTH_JWT_PRIVATE_KEY_HEX ||
-      "8f2a55949068468ad5d670dfd0c0a33d5b9e7e1a2c0d2059f0f8f8779d4d078d",
+      process.env.ATPROTO_OAUTH_JWT_PRIVATE_KEY_HEX || TEST_ONLY_ATPROTO_JWT_KEY_HEX,
     ATPROTO_OAUTH_PDS_DID:
       process.env.ATPROTO_OAUTH_PDS_DID || "did:web:pds.divine.test",
     APP_URL: process.env.APP_URL || `http://localhost:${port}`,
