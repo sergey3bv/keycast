@@ -97,13 +97,17 @@ function base64UrlJson(value: unknown): string {
   return Buffer.from(JSON.stringify(value)).toString("base64url");
 }
 
-function derToJose(signatureDer: Buffer, joseSize: number): string {
+/// ES256 / P-256 only. Do not reuse for other algorithms.
+function derToJoseEs256(signatureDer: Buffer): string {
   let offset = 0;
   if (signatureDer[offset++] !== 0x30) {
     throw new Error("Invalid DER signature (missing sequence)");
   }
 
   const sequenceLength = signatureDer[offset++];
+  if (sequenceLength > 0x7f) {
+    throw new Error("Invalid DER signature (long-form sequence length unsupported)");
+  }
   if (sequenceLength + 2 !== signatureDer.length) {
     throw new Error("Invalid DER signature length");
   }
@@ -112,6 +116,12 @@ function derToJose(signatureDer: Buffer, joseSize: number): string {
     throw new Error("Invalid DER signature (missing r)");
   }
   const rLength = signatureDer[offset++];
+  if (rLength > 0x7f) {
+    throw new Error("Invalid DER signature (long-form r length unsupported)");
+  }
+  if (offset + rLength > signatureDer.length) {
+    throw new Error("Invalid DER signature (r out of bounds)");
+  }
   const r = signatureDer.slice(offset, offset + rLength);
   offset += rLength;
 
@@ -119,13 +129,34 @@ function derToJose(signatureDer: Buffer, joseSize: number): string {
     throw new Error("Invalid DER signature (missing s)");
   }
   const sLength = signatureDer[offset++];
+  if (sLength > 0x7f) {
+    throw new Error("Invalid DER signature (long-form s length unsupported)");
+  }
+  if (offset + sLength > signatureDer.length) {
+    throw new Error("Invalid DER signature (s out of bounds)");
+  }
   const s = signatureDer.slice(offset, offset + sLength);
+  offset += sLength;
 
-  const componentSize = joseSize / 2;
-  const paddedR = Buffer.concat([Buffer.alloc(componentSize), r]).slice(
+  if (offset !== signatureDer.length) {
+    throw new Error("Invalid DER signature (unexpected trailing bytes)");
+  }
+
+  const componentSize = 32;
+  if (
+    (r.length > componentSize + 1 || (r.length === componentSize + 1 && r[0] !== 0x00)) ||
+    (s.length > componentSize + 1 || (s.length === componentSize + 1 && s[0] !== 0x00))
+  ) {
+    throw new Error("Invalid DER signature (component too large for ES256)");
+  }
+
+  const normalizedR = r.length === componentSize + 1 ? r.slice(1) : r;
+  const normalizedS = s.length === componentSize + 1 ? s.slice(1) : s;
+
+  const paddedR = Buffer.concat([Buffer.alloc(componentSize), normalizedR]).slice(
     -componentSize,
   );
-  const paddedS = Buffer.concat([Buffer.alloc(componentSize), s]).slice(
+  const paddedS = Buffer.concat([Buffer.alloc(componentSize), normalizedS]).slice(
     -componentSize,
   );
 
@@ -198,7 +229,7 @@ export function createDpopProof(
   signer.update(signingInput);
   signer.end();
   const derSignature = signer.sign(material.privateKey);
-  const joseSignature = derToJose(derSignature, 64);
+  const joseSignature = derToJoseEs256(derSignature);
 
   return `${signingInput}.${joseSignature}`;
 }
