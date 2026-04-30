@@ -1391,8 +1391,7 @@ mod tests {
 
     /// Router-level smoke test: verifies the probe routes are mounted at the
     /// exact paths the kubelet hits. Catches typos like `/healthz/startup`
-    /// vs `/healthz/start`. Skips `/healthz/ready` because that handler
-    /// requires a live DB pool.
+    /// vs `/healthz/start`.
     #[tokio::test]
     async fn test_health_probe_routes_respond_ok() {
         let livez_state = Arc::new(LivenessState {
@@ -1411,5 +1410,35 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "route {path} not OK");
         }
+    }
+
+    /// Router-level readiness smoke test: verifies `/healthz/ready` is wired
+    /// and returns the expected 503 response body when the database is
+    /// unavailable.
+    #[tokio::test]
+    async fn test_healthz_ready_route_returns_503_when_database_unavailable() {
+        let pool = sqlx::PgPool::connect_lazy("postgres://127.0.0.1:1/keycast")
+            .expect("test must build a lazy pool with unreachable address");
+        let readyz_state = Arc::new(ReadinessState {
+            pool,
+            shutting_down: Arc::new(AtomicBool::new(false)),
+        });
+
+        let app = Router::new().route("/healthz/ready", get(move || readyz(readyz_state.clone())));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz/ready")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"Database unavailable");
     }
 }
