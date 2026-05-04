@@ -12,6 +12,7 @@ use chrono::{Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 
 use super::admin::{is_full_admin, is_support_admin};
+use super::password_policy::{validate_new_password, PasswordPolicyError};
 use crate::api::extractors::UcanAuth;
 use crate::bcrypt_queue::{BcryptJob, BcryptQueueError};
 use crate::brand::BRAND_NAME;
@@ -321,6 +322,10 @@ pub enum AuthError {
     EmailSendFailed(String),
     DuplicateKey, // Nostr pubkey already registered (BYOK case)
     BadRequest(String),
+    BadRequestWithCode {
+        message: String,
+        code: &'static str,
+    },
     Forbidden(String),   // User has no authorization for this origin
     RegistrationExpired, // Async bcrypt timed out (instance died)
     ServiceUnavailable {
@@ -332,13 +337,14 @@ pub enum AuthError {
 
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
+        let (status, message, code) = match self {
             AuthError::Database(e) => {
                 // Log the real error but return generic message to user
                 tracing::error!("Database error: {}", e);
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Service temporarily unavailable. Please try again in a few minutes.".to_string(),
+                    None,
                 )
             },
             AuthError::PasswordHash(e) => {
@@ -347,23 +353,28 @@ impl IntoResponse for AuthError {
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Service temporarily unavailable. Please try again in a few minutes.".to_string(),
+                    None,
                 )
             },
             AuthError::InvalidCredentials => (
                 StatusCode::UNAUTHORIZED,
                 "Invalid email or password. Please check your credentials and try again.".to_string(),
+                None,
             ),
             AuthError::EmailAlreadyExists => (
                 StatusCode::CONFLICT,
                 "This email is already registered. Please log in instead.".to_string(),
+                None,
             ),
             AuthError::EmailNotVerified => (
                 StatusCode::FORBIDDEN,
                 "Please verify your email address before continuing. Check your inbox for the verification link.".to_string(),
+                None,
             ),
             AuthError::UserNotFound => (
                 StatusCode::NOT_FOUND,
                 "No account found with this email. Please register first.".to_string(),
+                None,
             ),
             AuthError::Encryption(e) => {
                 // Log the real error but return generic message to user
@@ -371,6 +382,7 @@ impl IntoResponse for AuthError {
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Service temporarily unavailable. Please try again in a few minutes.".to_string(),
+                    None,
                 )
             },
             AuthError::Internal(e) => {
@@ -379,15 +391,18 @@ impl IntoResponse for AuthError {
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Service temporarily unavailable. Please try again in a few minutes.".to_string(),
+                    None,
                 )
             },
             AuthError::MissingToken => (
                 StatusCode::UNAUTHORIZED,
                 "Authentication required. Please provide a valid token.".to_string(),
+                None,
             ),
             AuthError::InvalidToken => (
                 StatusCode::UNAUTHORIZED,
                 "Invalid or expired token. Please log in again.".to_string(),
+                None,
             ),
             AuthError::EmailSendFailed(e) => {
                 // Log the real error but return generic message to user
@@ -395,27 +410,38 @@ impl IntoResponse for AuthError {
                 (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Unable to send email. Please try again in a few minutes.".to_string(),
+                    None,
                 )
             },
             AuthError::DuplicateKey => (
                 StatusCode::CONFLICT,
                 "This Nostr key is already registered. Please log in instead or use a different key.".to_string(),
+                None,
             ),
             AuthError::TokenExpired => (
                 StatusCode::UNAUTHORIZED,
                 "Verification code or token has expired. Please request a new one.".to_string(),
+                None,
             ),
             AuthError::BadRequest(msg) => (
                 StatusCode::BAD_REQUEST,
                 msg,
+                None,
+            ),
+            AuthError::BadRequestWithCode { message, code } => (
+                StatusCode::BAD_REQUEST,
+                message,
+                Some(code),
             ),
             AuthError::Forbidden(msg) => (
                 StatusCode::FORBIDDEN,
                 msg,
+                None,
             ),
             AuthError::RegistrationExpired => (
                 StatusCode::GONE,
                 "Registration expired. Please register again.".to_string(),
+                None,
             ),
             AuthError::ServiceUnavailable { message, retry_after } => {
                 // Return with Retry-After header if provided
@@ -433,6 +459,14 @@ impl IntoResponse for AuthError {
                 return response.into_response();
             }
         };
+
+        if let Some(code) = code {
+            return (
+                status,
+                Json(serde_json::json!({ "error": message, "code": code })),
+            )
+                .into_response();
+        }
 
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }
@@ -458,6 +492,15 @@ impl From<keycast_core::repositories::RepositoryError> for AuthError {
 impl From<bcrypt::BcryptError> for AuthError {
     fn from(e: bcrypt::BcryptError) -> Self {
         AuthError::PasswordHash(e)
+    }
+}
+
+impl From<PasswordPolicyError> for AuthError {
+    fn from(error: PasswordPolicyError) -> Self {
+        AuthError::BadRequestWithCode {
+            message: error.message().to_string(),
+            code: error.code(),
+        }
     }
 }
 
@@ -679,6 +722,7 @@ pub async fn register(
     let tenant_id = tenant.0.id;
 
     req.email = req.email.to_lowercase();
+    validate_new_password(&req.password).map_err(AuthError::from)?;
 
     let instance_id = keycast_core::instance::instance_id();
 
@@ -2077,6 +2121,8 @@ pub async fn reset_password(
         }
     }
 
+    validate_new_password(&req.new_password).map_err(AuthError::from)?;
+
     // Hash new password (spawn_blocking to avoid blocking async runtime)
     let new_password = req.new_password.clone();
     let password_hash = tokio::task::spawn_blocking(move || hash(&new_password, DEFAULT_COST))
@@ -3154,13 +3200,6 @@ pub async fn change_password(
     let tenant_id = tenant.0.id;
     let user_pubkey = extract_user_from_token(&headers, tenant_id).await?;
 
-    // Validate new password length
-    if req.new_password.len() < 8 {
-        return Err(AuthError::BadRequest(
-            "New password must be at least 8 characters".to_string(),
-        ));
-    }
-
     // Get user's current password hash
     let user_repo = UserRepository::new(pool.clone());
     let (_email, password_hash) = user_repo
@@ -3179,6 +3218,8 @@ pub async fn change_password(
     if !valid {
         return Err(AuthError::InvalidCredentials);
     }
+
+    validate_new_password(&req.new_password).map_err(AuthError::from)?;
 
     // Hash new password
     let new_password = req.new_password.clone();

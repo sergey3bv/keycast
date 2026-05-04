@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::auth::{generate_secure_token, EMAIL_VERIFICATION_EXPIRY_HOURS};
 use super::oauth::{extract_origin, parse_policy_scope};
+use super::password_policy::{validate_new_password, PasswordPolicyError};
 
 // ============================================================================
 // Headless Registration
@@ -78,6 +79,7 @@ pub async fn headless_register(
     let tenant_id = tenant.0.id;
 
     req.email = req.email.to_lowercase();
+    validate_new_password(&req.password).map_err(HeadlessError::from)?;
 
     tracing::info!(
         event = "headless_registration_attempt",
@@ -619,6 +621,7 @@ pub enum HeadlessError {
     Unauthorized,
     EmailNotVerified,
     InvalidRequest(String),
+    WeakPassword(String),
     Conflict(String),
     Internal(String),
     ServiceUnavailable {
@@ -641,6 +644,7 @@ impl IntoResponse for HeadlessError {
                 "EMAIL_NOT_VERIFIED",
             ),
             HeadlessError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, msg, "INVALID_REQUEST"),
+            HeadlessError::WeakPassword(msg) => (StatusCode::BAD_REQUEST, msg, "WEAK_PASSWORD"),
             HeadlessError::Conflict(msg) => (StatusCode::CONFLICT, msg, "CONFLICT"),
             HeadlessError::Internal(msg) => {
                 tracing::error!("Headless internal error: {}", msg);
@@ -699,5 +703,11 @@ impl From<keycast_core::repositories::RepositoryError> for HeadlessError {
             RepositoryError::NotFound(msg) => HeadlessError::InvalidRequest(msg),
             _ => HeadlessError::Internal(e.to_string()),
         }
+    }
+}
+
+impl From<PasswordPolicyError> for HeadlessError {
+    fn from(error: PasswordPolicyError) -> Self {
+        HeadlessError::WeakPassword(error.message().to_string())
     }
 }

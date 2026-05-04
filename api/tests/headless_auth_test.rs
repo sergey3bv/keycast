@@ -12,11 +12,14 @@ use axum::{
     Json, Router,
 };
 use chrono::{Duration, Utc};
+use http_body_util::BodyExt;
 use keycast_api::{
     api::{
         http::{
             auth_observability::request_id_middleware,
-            headless::{headless_login, HeadlessLoginRequest},
+            headless::{
+                headless_login, headless_register, HeadlessLoginRequest, HeadlessRegisterRequest,
+            },
         },
         tenant::{Tenant, TenantExtractor},
     },
@@ -30,6 +33,7 @@ use keycast_core::{
 };
 use moka::future::Cache;
 use nostr_sdk::Keys;
+use serde_json::Value;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -201,6 +205,64 @@ async fn test_headless_registration_creates_pending_record() {
         .bind(&placeholder_code)
         .execute(&pool)
         .await;
+}
+
+#[tokio::test]
+async fn test_headless_register_rejects_weak_password_with_stable_code() {
+    let pool = setup_pool().await;
+    let auth_state = create_test_auth_state(pool.clone());
+    let email = format!("headless-weak-{}@example.com", Uuid::new_v4());
+
+    let app = {
+        let auth_state = auth_state.clone();
+        Router::new().route(
+            "/headless/register",
+            post(move |Json(req): Json<HeadlessRegisterRequest>| {
+                let auth_state = auth_state.clone();
+                async move {
+                    headless_register(create_test_tenant(), State(auth_state), Json(req)).await
+                }
+            }),
+        )
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/headless/register")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "email": email,
+                        "password": "password123",
+                        "client_id": "TestMobile",
+                        "redirect_uri": "https://app.example.com/callback",
+                        "scope": "policy:social",
+                        "code_challenge": null,
+                        "code_challenge_method": null,
+                        "state": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+            .expect("response should be json");
+    assert_eq!(payload["code"], "WEAK_PASSWORD");
+
+    let pending_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM oauth_codes WHERE pending_email = $1")
+            .bind(&email)
+            .fetch_one(&pool)
+            .await
+            .expect("query should succeed");
+    assert_eq!(pending_count, 0);
 }
 
 // ============================================================================

@@ -276,3 +276,71 @@ async fn test_oauth_login_records_auth_event_for_unverified_user() {
 
     cleanup_by_email(&pool, &email).await;
 }
+
+#[tokio::test]
+async fn test_login_allows_existing_weak_legacy_password_hash() {
+    let pool = setup_pool().await;
+    let auth_state = create_test_auth_state(pool.clone());
+    let email = format!("legacy-weak-login-{}@example.com", Uuid::new_v4());
+    let user_keys = Keys::generate();
+    let pubkey = user_keys.public_key().to_hex();
+    let legacy_weak_password = "password123";
+    let password_hash = hash(legacy_weak_password, 4).unwrap();
+
+    cleanup_by_email(&pool, &email).await;
+
+    sqlx::query(
+        "INSERT INTO users (pubkey, tenant_id, email, password_hash, email_verified, created_at, updated_at)
+         VALUES ($1, 1, $2, $3, true, NOW(), NOW())",
+    )
+    .bind(&pubkey)
+    .bind(&email)
+    .bind(&password_hash)
+    .execute(&pool)
+    .await
+    .expect("Should create user");
+
+    sqlx::query(
+        "INSERT INTO personal_keys (user_pubkey, encrypted_secret_key, tenant_id, created_at, updated_at)
+         VALUES ($1, $2, 1, NOW(), NOW())",
+    )
+    .bind(&pubkey)
+    .bind(user_keys.secret_key().secret_bytes().to_vec())
+    .execute(&pool)
+    .await
+    .expect("Should create personal key");
+
+    let app = {
+        let auth_state = auth_state.clone();
+        Router::new().route(
+            "/auth/login",
+            post(move |headers: HeaderMap, body: String| {
+                let auth_state = auth_state.clone();
+                async move { login(create_test_tenant(), State(auth_state), headers, body).await }
+            }),
+        )
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/login")
+                .header("content-type", "application/json")
+                .header("origin", "https://app.divine.video")
+                .body(Body::from(
+                    serde_json::json!({
+                        "email": email,
+                        "password": legacy_weak_password
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    cleanup_by_email(&pool, &email).await;
+}

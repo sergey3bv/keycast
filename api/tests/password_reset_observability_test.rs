@@ -10,6 +10,7 @@ use axum::{
 };
 use bcrypt::{hash, verify};
 use chrono::{Duration, Utc};
+use http_body_util::BodyExt;
 use keycast_api::api::{
     http::{
         auth::{forgot_password, reset_password, ForgotPasswordRequest, ResetPasswordRequest},
@@ -18,6 +19,7 @@ use keycast_api::api::{
     tenant::{Tenant, TenantExtractor},
 };
 use nostr_sdk::Keys;
+use serde_json::Value;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -238,6 +240,86 @@ async fn test_reset_password_records_success_event_and_updates_hash() {
             Some(200),
         ))
     );
+
+    cleanup_by_email(&pool, &email).await;
+}
+
+#[tokio::test]
+async fn test_reset_password_rejects_weak_new_password_with_stable_code() {
+    let pool = setup_pool().await;
+    let email = format!("reset-weak-{}@example.com", Uuid::new_v4());
+    let pubkey = Keys::generate().public_key().to_hex();
+    let reset_token = format!("reset-{}", Uuid::new_v4());
+    let old_password_hash = hash("old-password-123!", 4).unwrap();
+
+    cleanup_by_email(&pool, &email).await;
+
+    sqlx::query(
+        "INSERT INTO users (
+            pubkey, tenant_id, email, password_hash, email_verified,
+            password_reset_token, password_reset_expires_at, created_at, updated_at
+         ) VALUES ($1, 1, $2, $3, false, $4, $5, NOW(), NOW())",
+    )
+    .bind(&pubkey)
+    .bind(&email)
+    .bind(&old_password_hash)
+    .bind(&reset_token)
+    .bind(Utc::now() + Duration::hours(1))
+    .execute(&pool)
+    .await
+    .expect("Should create resettable user");
+
+    let app = {
+        let pool = pool.clone();
+        Router::new().route(
+            "/auth/reset-password",
+            post(
+                move |headers: HeaderMap, Json(req): Json<ResetPasswordRequest>| {
+                    let pool = pool.clone();
+                    async move {
+                        reset_password(create_test_tenant(), State(pool), headers, Json(req)).await
+                    }
+                },
+            ),
+        )
+    };
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/reset-password")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "token": reset_token,
+                        "new_password": "password123"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: Value =
+        serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+            .expect("response should be json");
+    assert_eq!(payload["code"], "WEAK_PASSWORD");
+
+    let user_row: (String, Option<String>) = sqlx::query_as(
+        "SELECT password_hash, password_reset_token
+         FROM users
+         WHERE pubkey = $1 AND tenant_id = 1",
+    )
+    .bind(&pubkey)
+    .fetch_one(&pool)
+    .await
+    .expect("user row should exist");
+
+    assert!(verify("old-password-123!", &user_row.0).unwrap());
+    assert!(user_row.1.is_some());
 
     cleanup_by_email(&pool, &email).await;
 }
