@@ -2888,6 +2888,35 @@ pub async fn get_authorization_for_origin(
     }
 }
 
+async fn load_policy_permissions_or_deny(
+    pool: &PgPool,
+    policy_id: i32,
+    user_pubkey: &str,
+    tenant_id: i64,
+) -> Result<Vec<keycast_core::types::permission::Permission>, AuthError> {
+    let policy_repo = PolicyRepository::new(pool.clone());
+    match policy_repo.find(policy_id).await {
+        Ok(_) => {}
+        Err(keycast_core::repositories::RepositoryError::NotFound(_)) => {
+            tracing::warn!(
+                "Denying OAuth request for user {} in tenant {} due to dangling policy_id {}",
+                user_pubkey,
+                tenant_id,
+                policy_id
+            );
+            return Err(AuthError::Forbidden(
+                "Authorization policy is missing. Re-authorize this app.".to_string(),
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    policy_repo
+        .get_permissions(policy_id)
+        .await
+        .map_err(Into::into)
+}
+
 /// Validate that the user has permission to sign this event
 /// Returns () if successful, or an error if unauthorized
 pub async fn validate_signing_permissions(
@@ -2916,9 +2945,8 @@ pub async fn validate_signing_permissions(
         }
     };
 
-    // Load permissions for this policy
-    let policy_repo = PolicyRepository::new(pool.clone());
-    let permissions = policy_repo.get_permissions(policy_id).await?;
+    let permissions =
+        load_policy_permissions_or_deny(pool, policy_id, user_pubkey, tenant_id).await?;
 
     // Convert to custom permissions
     let custom_permissions: Result<Vec<Box<dyn CustomPermission>>, _> = permissions
@@ -2997,9 +3025,8 @@ pub async fn validate_encrypt_permissions(
         }
     };
 
-    // Load permissions for this policy
-    let policy_repo = PolicyRepository::new(pool.clone());
-    let permissions = policy_repo.get_permissions(policy_id).await?;
+    let permissions =
+        load_policy_permissions_or_deny(pool, policy_id, user_pubkey, tenant_id).await?;
 
     let custom_permissions: Result<Vec<Box<dyn CustomPermission>>, _> = permissions
         .iter()
@@ -3078,9 +3105,8 @@ pub async fn validate_decrypt_permissions(
         }
     };
 
-    // Load permissions for this policy
-    let policy_repo = PolicyRepository::new(pool.clone());
-    let permissions = policy_repo.get_permissions(policy_id).await?;
+    let permissions =
+        load_policy_permissions_or_deny(pool, policy_id, user_pubkey, tenant_id).await?;
 
     let custom_permissions: Result<Vec<Box<dyn CustomPermission>>, _> = permissions
         .iter()

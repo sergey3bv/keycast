@@ -9,6 +9,7 @@ use chrono::{Duration, Utc};
 use keycast_api::ucan_auth::{nostr_pubkey_to_did, validate_ucan_token, NostrKeyMaterial};
 use keycast_core::encryption::file_key_manager::FileKeyManager;
 use keycast_core::encryption::KeyManager;
+use keycast_core::repositories::RepositoryError;
 use nostr_sdk::prelude::*;
 use serde_json::json;
 use sqlx::PgPool;
@@ -337,7 +338,150 @@ async fn test_null_policy_grants_full_access() {
 }
 
 // ============================================================================
-// Test 4: Policy Enforces Kind Restrictions
+// Revoked OAuth with NULL policy_id (e.g. dangling-policy migration) must not grant access
+// ============================================================================
+
+#[tokio::test]
+async fn test_revoked_null_policy_row_denied_for_origin_validation() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (keys, pubkey) = create_test_user();
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(&pool, tenant_id, &pubkey, &keys, &key_manager).await;
+
+    let redirect_origin = format!("https://revoked-null-policy-{}.example.com", Uuid::new_v4());
+
+    let auth_id = create_test_authorization(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        None,
+        None,
+        &key_manager,
+    )
+    .await;
+
+    sqlx::query(
+        "UPDATE oauth_authorizations
+         SET revoked_at = NOW(), policy_id = NULL, updated_at = NOW()
+         WHERE id = $1",
+    )
+    .bind(auth_id)
+    .execute(&pool)
+    .await
+    .expect("Failed to revoke oauth row");
+
+    let unsigned_event =
+        EventBuilder::new(Kind::EncryptedDirectMessage, "Secret message").build(keys.public_key());
+
+    let result = keycast_api::api::http::auth::validate_signing_permissions(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        &unsigned_event,
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "Revoked row with NULL policy_id must not grant access: {:?}",
+        result
+    );
+}
+
+// ============================================================================
+// Test 4: Valid policy with zero permissions remains permissive (backward compatibility)
+// ============================================================================
+
+#[tokio::test]
+async fn test_valid_empty_policy_grants_access() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (keys, pubkey) = create_test_user();
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(&pool, tenant_id, &pubkey, &keys, &key_manager).await;
+
+    // Create a real policy row but link no permissions.
+    let policy_id = create_test_policy(&pool, tenant_id, vec![]).await;
+    let redirect_origin = format!("https://empty-policy-{}.example.com", Uuid::new_v4());
+
+    create_test_authorization(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        Some(policy_id),
+        None,
+        &key_manager,
+    )
+    .await;
+
+    let unsigned_event =
+        EventBuilder::new(Kind::EncryptedDirectMessage, "No restrictions").build(keys.public_key());
+
+    let result = keycast_api::api::http::auth::validate_signing_permissions(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        &unsigned_event,
+    )
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "Valid policy with zero linked permissions should stay permissive: {:?}",
+        result
+    );
+}
+
+// ============================================================================
+// Test 5: Referenced OAuth policy cannot be deleted (prevents dangling policy_id)
+// ============================================================================
+
+#[tokio::test]
+async fn test_referenced_oauth_policy_delete_is_restricted() {
+    let pool = setup_db().await;
+    let tenant_id = create_test_tenant(&pool).await;
+    let (keys, pubkey) = create_test_user();
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    insert_user(&pool, tenant_id, &pubkey).await;
+    create_personal_key(&pool, tenant_id, &pubkey, &keys, &key_manager).await;
+
+    let policy_id = create_test_policy(&pool, tenant_id, vec![]).await;
+    let redirect_origin = format!("https://fk-policy-{}.example.com", Uuid::new_v4());
+
+    create_test_authorization(
+        &pool,
+        tenant_id,
+        &pubkey,
+        &redirect_origin,
+        Some(policy_id),
+        None,
+        &key_manager,
+    )
+    .await;
+
+    let delete_result = sqlx::query("DELETE FROM policies WHERE id = $1")
+        .bind(policy_id)
+        .execute(&pool)
+        .await;
+
+    assert!(
+        delete_result.is_err(),
+        "Deleting a policy referenced by oauth_authorizations should be restricted"
+    );
+}
+
+// ============================================================================
+// Test 6: Policy Enforces Kind Restrictions
 // ============================================================================
 
 #[tokio::test]
@@ -402,7 +546,7 @@ async fn test_policy_enforces_kind_restrictions() {
 }
 
 // ============================================================================
-// Test 5: Expired Authorization Rejected
+// Test 7: Expired Authorization Rejected
 // ============================================================================
 
 #[tokio::test]
@@ -454,7 +598,7 @@ async fn test_expired_authorization_rejected() {
 }
 
 // ============================================================================
-// Test 6: Encrypt Requires Authorization
+// Test 8: Encrypt Requires Authorization
 // ============================================================================
 
 #[tokio::test]
@@ -606,5 +750,20 @@ async fn test_ucan_with_bunker_pubkey_returns_some() {
         bunker_pubkey.unwrap(),
         bunker_pubkey_hex,
         "bunker_pubkey should match"
+    );
+}
+
+#[test]
+fn test_repository_database_error_maps_to_internal_not_forbidden() {
+    let auth_err: keycast_api::api::http::auth::AuthError =
+        RepositoryError::Database("temporary db outage".to_string()).into();
+
+    assert!(
+        matches!(
+            auth_err,
+            keycast_api::api::http::auth::AuthError::Internal(msg)
+            if msg.contains("temporary db outage")
+        ),
+        "Repository database errors must not be reclassified as Forbidden"
     );
 }

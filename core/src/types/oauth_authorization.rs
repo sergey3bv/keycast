@@ -59,11 +59,25 @@ impl OAuthAuthorization {
         pool: &PgPool,
         _tenant_id: i64,
     ) -> Result<Vec<crate::types::permission::Permission>, AuthorizationError> {
+        if self.revoked_at.is_some() {
+            return Err(AuthorizationError::Revoked);
+        }
         // If no policy, return empty vec (allow all)
         let policy_id = match self.policy_id {
             Some(id) => id,
             None => return Ok(vec![]),
         };
+
+        // Distinguish "valid policy with no permissions" from "dangling policy_id".
+        let policy_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM policies WHERE id = $1)")
+                .bind(policy_id)
+                .fetch_one(pool)
+                .await
+                .map_err(AuthorizationError::Database)?;
+        if !policy_exists {
+            return Err(AuthorizationError::DanglingPolicy(policy_id));
+        }
 
         // Load permissions from database
         // Tenant isolation is enforced at authorization lookup level

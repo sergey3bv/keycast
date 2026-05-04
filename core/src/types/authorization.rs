@@ -24,6 +24,10 @@ pub enum AuthorizationError {
     InvalidSecret,
     #[error("Unauthorized by permission")]
     Unauthorized,
+    #[error("OAuth authorization references missing policy_id {0}")]
+    DanglingPolicy(i32),
+    #[error("OAuth authorization has been revoked")]
+    Revoked,
     #[error("Unsupported request")]
     UnsupportedRequest,
 }

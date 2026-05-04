@@ -6,7 +6,7 @@
 use chrono::{Duration, Utc};
 use keycast_core::encryption::{file_key_manager::FileKeyManager, KeyManager};
 use keycast_core::signing_handler::SigningHandler;
-use keycast_core::types::authorization::Authorization;
+use keycast_core::types::authorization::{Authorization, AuthorizationError};
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
 use keycast_signer::Nip46Handler;
 use nostr_sdk::prelude::*;
@@ -489,6 +489,42 @@ async fn test_7_oauth_no_policy_allows_all() {
     assert!(
         result.is_ok(),
         "OAuth with no policy should allow all operations"
+    );
+}
+
+#[tokio::test]
+async fn test_7b_oauth_revoked_null_policy_denies_refetched_permissions() {
+    let pool = setup_test_db().await;
+    let key_manager = FileKeyManager::new().expect("Failed to create key manager");
+
+    let (oauth_auth, user_keys) = create_oauth_authorization(&pool, 1, None, &key_manager).await;
+
+    let handler = Nip46Handler::new_for_test(
+        user_keys.clone(),
+        user_keys.clone(),
+        oauth_auth.secret_hash.clone(),
+        oauth_auth.id,
+        1,
+        true,
+        pool.clone(),
+    );
+
+    sqlx::query(
+        "UPDATE oauth_authorizations SET revoked_at = NOW(), policy_id = NULL WHERE id = $1",
+    )
+    .bind(oauth_auth.id)
+    .execute(&pool)
+    .await
+    .expect("Failed to revoke oauth authorization");
+
+    let unsigned = EventBuilder::new(Kind::EncryptedDirectMessage, "Test message")
+        .build(user_keys.public_key());
+
+    let result = handler.sign_event_direct(unsigned).await;
+    assert!(
+        result.is_err(),
+        "Refetched revoked OAuth row must not hit NULL-policy allow-all path: {:?}",
+        result
     );
 }
 
@@ -1173,36 +1209,26 @@ async fn test_19_content_filter_blocks_encrypt_of_blocked_plaintext() {
     );
 }
 
-/// Regression: an OAuth authorization with a dangling `policy_id` (no matching row in
-/// `policies`) currently degrades to "no permissions = allow". This test pins that behavior.
-/// See divinevideo/keycast#141 for the open question of whether this should fail closed.
+/// OAuth authorization permissions must fail closed when `policy_id` does not exist.
 #[tokio::test]
-async fn test_20_oauth_invalid_policy_id_allows_signing() {
+async fn test_20_oauth_invalid_policy_id_is_denied() {
     let pool = setup_test_db().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
-    // OAuth authorizations can reference a non-existent policy_id.
-    // Current behavior treats missing policy permissions as unrestricted access.
+    // Create a valid OAuth authorization first, then simulate a dangling policy reference
+    // in-memory to avoid violating DB-level foreign key constraints.
     let invalid_policy_id = i32::MAX;
-    let (oauth_auth, user_keys) =
-        create_oauth_authorization(&pool, 1, Some(invalid_policy_id), &key_manager).await;
+    let (mut oauth_auth, _user_keys) =
+        create_oauth_authorization(&pool, 1, None, &key_manager).await;
+    oauth_auth.policy_id = Some(invalid_policy_id);
 
-    let handler = Nip46Handler::new_for_test(
-        user_keys.clone(),
-        user_keys.clone(),
-        oauth_auth.secret_hash.clone(),
-        oauth_auth.id,
-        1,
-        true,
-        pool.clone(),
-    );
-
-    let unsigned = EventBuilder::new(Kind::EncryptedDirectMessage, "Test message")
-        .build(user_keys.public_key());
-    let result = handler.sign_event_direct(unsigned).await;
-
+    let result = oauth_auth.permissions(&pool, 1).await;
     assert!(
-        result.is_ok(),
-        "OAuth authorization with invalid policy_id should follow current permissive behavior"
+        matches!(
+            result,
+            Err(AuthorizationError::DanglingPolicy(policy_id)) if policy_id == invalid_policy_id
+        ),
+        "OAuth authorization with dangling policy_id must fail closed, got: {:?}",
+        result
     );
 }

@@ -10,8 +10,9 @@ use keycast_core::encryption::KeyManager;
 use keycast_core::metrics::METRICS;
 use keycast_core::signing_handler::SigningHandler;
 use keycast_core::signing_session::canonicalize_event_author;
-use keycast_core::types::authorization::Authorization;
+use keycast_core::types::authorization::{Authorization, AuthorizationError};
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
+use keycast_core::types::permission::Permission;
 use moka::future::Cache;
 use nostr_sdk::prelude::*;
 use secrecy::{ExposeSecret, SecretString};
@@ -63,6 +64,31 @@ pub struct Nip46Handler {
 }
 
 impl Nip46Handler {
+    async fn load_permissions_for_validation(&self) -> SignerResult<Vec<Permission>> {
+        if self.is_oauth {
+            let oauth_auth =
+                OAuthAuthorization::find(&self.pool, self.tenant_id, self.authorization_id).await?;
+            return match oauth_auth.permissions(&self.pool, self.tenant_id).await {
+                Ok(permissions) => Ok(permissions),
+                Err(AuthorizationError::DanglingPolicy(policy_id)) => {
+                    Err(SignerError::permission_denied(format!(
+                        "OAuth authorization {} references missing policy_id {}",
+                        self.authorization_id, policy_id
+                    )))
+                }
+                Err(AuthorizationError::Revoked) => Err(SignerError::permission_denied(
+                    "OAuth authorization has been revoked",
+                )),
+                Err(e) => Err(e.into()),
+            };
+        }
+
+        let auth = Authorization::find(&self.pool, self.tenant_id, self.authorization_id).await?;
+        auth.permissions(&self.pool, self.tenant_id)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Constructor for testing only - do not use in production code
     #[doc(hidden)]
     pub fn new_for_test(
@@ -150,16 +176,7 @@ impl Nip46Handler {
         &self,
         unsigned_event: &UnsignedEvent,
     ) -> SignerResult<()> {
-        // Load permissions based on authorization type
-        let permissions = if self.is_oauth {
-            let oauth_auth =
-                OAuthAuthorization::find(&self.pool, self.tenant_id, self.authorization_id).await?;
-            oauth_auth.permissions(&self.pool, self.tenant_id).await?
-        } else {
-            let auth =
-                Authorization::find(&self.pool, self.tenant_id, self.authorization_id).await?;
-            auth.permissions(&self.pool, self.tenant_id).await?
-        };
+        let permissions = self.load_permissions_for_validation().await?;
 
         // If no permissions configured, allow all (backward compatibility)
         if permissions.is_empty() {
@@ -195,16 +212,7 @@ impl Nip46Handler {
         recipient_pubkey: &PublicKey,
     ) -> SignerResult<()> {
         self.check_user_active().await?;
-        // Load permissions based on authorization type
-        let permissions = if self.is_oauth {
-            let oauth_auth =
-                OAuthAuthorization::find(&self.pool, self.tenant_id, self.authorization_id).await?;
-            oauth_auth.permissions(&self.pool, self.tenant_id).await?
-        } else {
-            let auth =
-                Authorization::find(&self.pool, self.tenant_id, self.authorization_id).await?;
-            auth.permissions(&self.pool, self.tenant_id).await?
-        };
+        let permissions = self.load_permissions_for_validation().await?;
 
         // If no permissions configured, allow all (backward compatibility)
         if permissions.is_empty() {
@@ -242,16 +250,7 @@ impl Nip46Handler {
         sender_pubkey: &PublicKey,
     ) -> SignerResult<()> {
         self.check_user_active().await?;
-        // Load permissions based on authorization type
-        let permissions = if self.is_oauth {
-            let oauth_auth =
-                OAuthAuthorization::find(&self.pool, self.tenant_id, self.authorization_id).await?;
-            oauth_auth.permissions(&self.pool, self.tenant_id).await?
-        } else {
-            let auth =
-                Authorization::find(&self.pool, self.tenant_id, self.authorization_id).await?;
-            auth.permissions(&self.pool, self.tenant_id).await?
-        };
+        let permissions = self.load_permissions_for_validation().await?;
 
         // If no permissions configured, allow all (backward compatibility)
         if permissions.is_empty() {
