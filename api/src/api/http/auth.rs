@@ -75,26 +75,28 @@ fn normalize_nip05_username(raw_username: &str) -> Result<String, AuthError> {
     let username = raw_username.trim().to_lowercase();
 
     if username.is_empty() {
-        return Err(AuthError::Internal("Username cannot be empty".to_string()));
+        return Err(AuthError::BadRequest(
+            "Username cannot be empty".to_string(),
+        ));
     }
 
     if !username
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_' || c == '.')
     {
-        return Err(AuthError::Internal(
+        return Err(AuthError::BadRequest(
             "Username can only contain a-z, 0-9, hyphens, underscores, and dots".to_string(),
         ));
     }
 
     if username.starts_with('-') || username.ends_with('-') {
-        return Err(AuthError::Internal(
+        return Err(AuthError::BadRequest(
             "Username cannot start or end with a hyphen".to_string(),
         ));
     }
 
     if username.len() > MAX_NIP05_USERNAME_LENGTH {
-        return Err(AuthError::Internal(format!(
+        return Err(AuthError::BadRequest(format!(
             "Username must be at most {} characters",
             MAX_NIP05_USERNAME_LENGTH
         )));
@@ -320,6 +322,7 @@ pub enum AuthError {
     TokenExpired,
     EmailSendFailed(String),
     DuplicateKey, // Nostr pubkey already registered (BYOK case)
+    Conflict(String),
     BadRequest(String),
     Forbidden(String),   // User has no authorization for this origin
     RegistrationExpired, // Async bcrypt timed out (instance died)
@@ -400,6 +403,10 @@ impl IntoResponse for AuthError {
             AuthError::DuplicateKey => (
                 StatusCode::CONFLICT,
                 "This Nostr key is already registered. Please log in instead or use a different key.".to_string(),
+            ),
+            AuthError::Conflict(message) => (
+                StatusCode::CONFLICT,
+                message,
             ),
             AuthError::TokenExpired => (
                 StatusCode::UNAUTHORIZED,
@@ -2232,7 +2239,7 @@ pub async fn update_profile(
                             username,
                             error_msg
                         );
-                        return Err(AuthError::Internal(error_msg));
+                        return Err(AuthError::Conflict(error_msg));
                     }
                 }
                 Err(e) => {
@@ -2253,7 +2260,7 @@ pub async fn update_profile(
             .check_username_available(&username, &user_pubkey, tenant_id)
             .await?
         {
-            return Err(AuthError::Internal("Username already taken".to_string()));
+            return Err(AuthError::Conflict("Username already taken".to_string()));
         }
 
         // Sync to divine-name-server (if enabled)
@@ -2296,7 +2303,13 @@ pub async fn update_profile(
         // Update username in users table (always do local update)
         user_repo
             .update_username(&user_pubkey, &username, tenant_id)
-            .await?;
+            .await
+            .map_err(|error| match error {
+                keycast_core::repositories::RepositoryError::Duplicate => {
+                    AuthError::Conflict("Username already taken".to_string())
+                }
+                other => AuthError::from(other),
+            })?;
 
         tracing::info!(
             "Username updated to '{}' for user: {}",
@@ -3572,9 +3585,11 @@ mod tests {
     #[cfg(feature = "integration-tests")]
     use crate::state::KeycastState;
     #[cfg(feature = "integration-tests")]
+    use axum::body::to_bytes;
+    #[cfg(feature = "integration-tests")]
     use axum::{
         extract::State,
-        http::{HeaderMap, StatusCode},
+        http::{HeaderMap, HeaderValue, StatusCode},
         response::IntoResponse,
         Json,
     };
@@ -3585,12 +3600,14 @@ mod tests {
     #[cfg(feature = "integration-tests")]
     use keycast_core::encryption::{KeyManager, KeyManagerError};
     #[cfg(feature = "integration-tests")]
+    use keycast_core::repositories::UserRepository;
+    #[cfg(feature = "integration-tests")]
     use keycast_core::secret_pool::SecretPool;
     #[cfg(feature = "integration-tests")]
     use keycast_core::signing_handler::SigningHandler;
     #[cfg(feature = "integration-tests")]
     use moka::future::Cache;
-    use nostr_sdk::{Keys, Kind, Timestamp, UnsignedEvent};
+    use nostr_sdk::{Keys, Kind, PublicKey, Timestamp, UnsignedEvent};
     #[cfg(feature = "integration-tests")]
     use sqlx::PgPool;
     #[cfg(feature = "integration-tests")]
@@ -3697,6 +3714,115 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }))
+    }
+
+    #[cfg(feature = "integration-tests")]
+    #[tokio::test]
+    async fn test_update_profile_username_taken_returns_conflict() {
+        let pool = create_test_db().await;
+        let auth_state = create_test_auth_state(pool.clone());
+        let user_repo = UserRepository::new(pool.clone());
+
+        let first_user_pubkey = Keys::generate().public_key().to_hex();
+        let second_user_pubkey = Keys::generate().public_key().to_hex();
+        let username = format!("conflict-{}", &first_user_pubkey[..8]);
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, NOW(), NOW())",
+        )
+        .bind(&first_user_pubkey)
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO users (pubkey, tenant_id, created_at, updated_at)
+             VALUES ($1, $2, NOW(), NOW())",
+        )
+        .bind(&second_user_pubkey)
+        .bind(1_i64)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        user_repo
+            .update_username(&first_user_pubkey, &username, 1_i64)
+            .await
+            .unwrap();
+
+        let second_pubkey = PublicKey::from_hex(&second_user_pubkey).unwrap();
+        let token = super::generate_server_signed_ucan(
+            &second_pubkey,
+            1_i64,
+            "conflict-test@example.com",
+            "https://app.example.com",
+            None,
+            &auth_state.state.server_keys,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        let auth_header = format!("Bearer {}", token);
+        headers.insert(
+            "Authorization",
+            HeaderValue::from_str(&auth_header).unwrap(),
+        );
+
+        let response = match super::update_profile(
+            create_test_tenant(),
+            State(auth_state),
+            headers,
+            Json(super::ProfileData {
+                username: Some(username.clone()),
+                name: None,
+                about: None,
+                picture: None,
+                banner: None,
+                nip05: None,
+                website: None,
+                lud16: None,
+            }),
+        )
+        .await
+        {
+            Ok(response) => response.into_response(),
+            Err(err) => err.into_response(),
+        };
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"], "Username already taken");
+
+        let owner = user_repo
+            .find_pubkey_by_username(&username, 1_i64)
+            .await
+            .unwrap();
+        assert_eq!(owner.as_deref(), Some(first_user_pubkey.as_str()));
+
+        let second_username: Option<String> =
+            sqlx::query_scalar("SELECT username FROM users WHERE pubkey = $1 AND tenant_id = $2")
+                .bind(&second_user_pubkey)
+                .bind(1_i64)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(second_username, None);
+
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&first_user_pubkey)
+            .execute(&pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM users WHERE pubkey = $1")
+            .bind(&second_user_pubkey)
+            .execute(&pool)
+            .await;
     }
 
     #[cfg(feature = "integration-tests")]
