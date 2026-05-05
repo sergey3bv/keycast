@@ -32,6 +32,7 @@
 </script>
 
 <svelte:head>
+	<meta name="referrer" content="no-referrer" />
 	<title>Forgot Password - {BRAND.name}</title>
 </svelte:head>
 

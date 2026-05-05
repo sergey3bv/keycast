@@ -18,6 +18,7 @@ Keycast is a hosted NIP-46 (Nostr remote signer) bunker service. We take securit
 - ✅ **HTTPS/TLS 1.3** for all API communication
 - ✅ **NIP-44 encryption** for bunker communication over Nostr relays
 - ✅ **gRPC with mTLS** for KMS API calls
+- ✅ **Web SPA (sensitive routes):** Document responses for `/reset-password`, `/forgot-password`, `/login`, `/register`, and `/verify-email` include **`Referrer-Policy: no-referrer`** (set by the unified server’s static middleware and mirrored in SvelteKit dev via `web/src/hooks.server.ts`). Recovery and verification links may carry tokens or email hints in the query string; this policy avoids leaking those URLs to third parties via the `Referer` header (including when the shared shell loads stylesheets such as Google Fonts from `app.html`). New first-party auth-like routes with URL secrets should be added to **`auth_routes_use_no_referrer` in `keycast/src/main.rs`** and the **`noReferrerAuthPaths` set in `web/src/hooks.server.ts`** together. Auth route components also set `<meta name="referrer" content="no-referrer">` so client-side navigations tighten policy after the initial load.
 
 ### In Memory (During Signing)
 - ✅ **Immediate zeroization**: Keys zeroed from memory after each signing operation using `zeroize` crate

@@ -342,11 +342,36 @@ async fn assetlinks_json(
     }
 }
 
+static REFERRER_POLICY_HEADER: header::HeaderName =
+    header::HeaderName::from_static("referrer-policy");
+
+/// Returns true when the document response for this URL path should include
+/// `Referrer-Policy: no-referrer`.
+///
+/// Covers first-party routes that may carry recovery or verification tokens in
+/// the query string (or handle credentials). The list must stay in sync with
+/// `web/src/hooks.server.ts`.
+fn auth_routes_use_no_referrer(path: &str) -> bool {
+    matches!(
+        path,
+        "/reset-password" | "/forgot-password" | "/login" | "/register" | "/verify-email"
+    )
+}
+
 /// Middleware to set Cache-Control headers for static assets
 /// Browser caching reduces load and improves performance
 async fn cache_control_middleware(request: Request<Body>, next: Next) -> Response {
     let path = request.uri().path().to_string();
     let mut response = next.run(request).await;
+
+    if auth_routes_use_no_referrer(&path)
+        && !response.headers().contains_key(&REFERRER_POLICY_HEADER)
+    {
+        response.headers_mut().insert(
+            REFERRER_POLICY_HEADER.clone(),
+            header::HeaderValue::from_static("no-referrer"),
+        );
+    }
 
     // Don't overwrite if route already set Cache-Control
     if response.headers().contains_key(header::CACHE_CONTROL) {
@@ -1313,6 +1338,60 @@ mod tests {
             "https://evil.pages.dev",
             "https://login.divine.video,https://*.openvine-app.pages.dev"
         ));
+    }
+
+    #[test]
+    fn test_auth_routes_use_no_referrer_exact_paths_only() {
+        for path in [
+            "/reset-password",
+            "/forgot-password",
+            "/login",
+            "/register",
+            "/verify-email",
+        ] {
+            assert!(
+                auth_routes_use_no_referrer(path),
+                "expected strict referrer for {path}"
+            );
+        }
+        assert!(!auth_routes_use_no_referrer("/"));
+        assert!(!auth_routes_use_no_referrer("/teams"));
+        assert!(!auth_routes_use_no_referrer("/reset-password/extra"));
+        assert!(!auth_routes_use_no_referrer("/login/"));
+    }
+
+    #[tokio::test]
+    async fn test_cache_control_middleware_sets_referrer_policy_on_auth_paths() {
+        let app = Router::new()
+            .route(
+                "/reset-password",
+                get(|| async { "html" }).layer(middleware::from_fn(cache_control_middleware)),
+            )
+            .route(
+                "/",
+                get(|| async { "html" }).layer(middleware::from_fn(cache_control_middleware)),
+            );
+
+        let reset = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/reset-password")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reset.headers().get(&super::REFERRER_POLICY_HEADER).unwrap(),
+            "no-referrer"
+        );
+
+        let home = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert!(home.headers().get(&super::REFERRER_POLICY_HEADER).is_none());
     }
 
     #[tokio::test]

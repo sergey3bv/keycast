@@ -49,6 +49,7 @@
 </script>
 
 <svelte:head>
+	<meta name="referrer" content="no-referrer" />
 	<title>Reset Password - {BRAND.name}</title>
 </svelte:head>
 

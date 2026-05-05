@@ -142,6 +142,7 @@
 </script>
 
 <svelte:head>
+	<meta name="referrer" content="no-referrer" />
 	<title>Verify Email - {BRAND.name}</title>
 </svelte:head>
 

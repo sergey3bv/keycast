@@ -150,6 +150,7 @@
 </script>
 
 <svelte:head>
+	<meta name="referrer" content="no-referrer" />
 	<title>Login - {BRAND.name}</title>
 </svelte:head>
 

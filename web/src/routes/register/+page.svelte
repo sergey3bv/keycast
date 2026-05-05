@@ -76,6 +76,7 @@
 </script>
 
 <svelte:head>
+	<meta name="referrer" content="no-referrer" />
 	<title>Register - {BRAND.name}</title>
 </svelte:head>
 
