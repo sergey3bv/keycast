@@ -11,6 +11,7 @@ use serde_json::Value;
 use super::routes::AuthState;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::extractors::UcanAuth;
+use keycast_core::metrics::METRICS;
 use keycast_core::repositories::{
     test_redirect_pattern, AdminAuditEventRecord, AdminAuditEventRepository, AuthEventRepository,
     ClaimTokenRepository, OAuthAuthorizationRepository, RegisteredClient,
@@ -1566,6 +1567,7 @@ async fn record_registered_client_audit(
         })
         .await
     {
+        METRICS.inc_admin_audit_write_failure(action);
         tracing::error!(
             action = action,
             client_id = %client.client_id,
@@ -1609,6 +1611,7 @@ async fn record_registered_client_update_audit(
         })
         .await
     {
+        METRICS.inc_admin_audit_write_failure("registered_client.update");
         tracing::error!(
             action = "registered_client.update",
             client_id = %after.client_id,

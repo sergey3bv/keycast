@@ -89,6 +89,7 @@ pub struct Metrics {
     auth_requests_total: Mutex<BTreeMap<AuthRequestKey, u64>>,
     auth_request_durations: Mutex<BTreeMap<AuthDurationKey, AuthDurationMetric>>,
     auth_audit_write_failures_total: Mutex<BTreeMap<String, u64>>,
+    admin_audit_write_failures_total: Mutex<BTreeMap<String, u64>>,
     auth_email_send_failures_total: Mutex<BTreeMap<String, u64>>,
 }
 
@@ -124,6 +125,7 @@ impl Metrics {
             auth_requests_total: Mutex::new(BTreeMap::new()),
             auth_request_durations: Mutex::new(BTreeMap::new()),
             auth_audit_write_failures_total: Mutex::new(BTreeMap::new()),
+            admin_audit_write_failures_total: Mutex::new(BTreeMap::new()),
             auth_email_send_failures_total: Mutex::new(BTreeMap::new()),
         }
     }
@@ -273,6 +275,15 @@ impl Metrics {
             .lock()
             .expect("auth audit failures lock poisoned");
         *failures.entry(endpoint).or_insert(0) += 1;
+    }
+
+    pub fn inc_admin_audit_write_failure(&self, action: &str) {
+        let action = normalize_admin_audit_action(action).to_string();
+        let mut failures = self
+            .admin_audit_write_failures_total
+            .lock()
+            .expect("admin audit failures lock poisoned");
+        *failures.entry(action).or_insert(0) += 1;
     }
 
     pub fn inc_auth_email_send_failure(&self, template: &str) {
@@ -521,6 +532,22 @@ impl Metrics {
         }
 
         output.push_str(
+            "\n# HELP keycast_admin_audit_write_failures_total Admin audit writes that failed but did not fail the admin request\n",
+        );
+        output.push_str("# TYPE keycast_admin_audit_write_failures_total counter\n");
+        for (action, count) in self
+            .admin_audit_write_failures_total
+            .lock()
+            .expect("admin audit failures lock poisoned")
+            .iter()
+        {
+            output.push_str(&format!(
+                "keycast_admin_audit_write_failures_total{{action=\"{}\"}} {}\n",
+                action, count
+            ));
+        }
+
+        output.push_str(
             "\n# HELP keycast_auth_email_send_failures_total Auth email send failures by template\n",
         );
         output.push_str("# TYPE keycast_auth_email_send_failures_total counter\n");
@@ -604,6 +631,15 @@ fn normalize_email_template(template: &str) -> &'static str {
     }
 }
 
+fn normalize_admin_audit_action(action: &str) -> &'static str {
+    match action {
+        "registered_client.create" => "registered_client.create",
+        "registered_client.update" => "registered_client.update",
+        "registered_client.delete" => "registered_client.delete",
+        _ => "other",
+    }
+}
+
 /// Global metrics instance
 pub static METRICS: Lazy<Metrics> = Lazy::new(Metrics::new);
 
@@ -623,6 +659,7 @@ mod tests {
             Duration::from_millis(120),
         );
         metrics.inc_auth_audit_write_failure("/api/headless/login");
+        metrics.inc_admin_audit_write_failure("registered_client.update");
         metrics.inc_auth_email_send_failure("password_reset");
 
         let output = metrics.to_prometheus();
@@ -639,7 +676,19 @@ mod tests {
         assert!(output.contains(
             "keycast_auth_audit_write_failures_total{endpoint=\"/api/headless/login\"} 1"
         ));
+        assert!(output.contains(
+            "keycast_admin_audit_write_failures_total{action=\"registered_client.update\"} 1"
+        ));
         assert!(output
             .contains("keycast_auth_email_send_failures_total{template=\"password_reset\"} 1"));
+    }
+
+    #[test]
+    fn test_admin_audit_failure_metric_normalizes_unknown_actions() {
+        let metrics = Metrics::new();
+        metrics.inc_admin_audit_write_failure("some.future.action");
+
+        let output = metrics.to_prometheus();
+        assert!(output.contains("keycast_admin_audit_write_failures_total{action=\"other\"} 1"));
     }
 }
