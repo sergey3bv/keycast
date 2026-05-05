@@ -40,6 +40,20 @@ export class KeycastApi {
         });
 
         if (!response.ok) {
+            if (response.status === 401) {
+                if (typeof window !== "undefined") {
+                    const currentPath = `${window.location.pathname}${window.location.search}`;
+                    const safeRedirect = currentPath.startsWith("/") ? currentPath : "/";
+                    const loginUrl = `/login?redirect=${encodeURIComponent(safeRedirect)}`;
+
+                    if (!window.location.pathname.startsWith("/login")) {
+                        window.location.assign(loginUrl);
+                    }
+                }
+
+                throw new ApiError("Authentication required", response.status);
+            }
+
             // Try to get the error message from the response body
             let errorMessage: string;
             try {
