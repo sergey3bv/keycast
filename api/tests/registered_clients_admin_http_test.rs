@@ -34,7 +34,7 @@ use keycast_api::{
 };
 use keycast_core::{
     encryption::{KeyManager, KeyManagerError},
-    repositories::RegisteredClientRepository,
+    repositories::{RegisteredClient, RegisteredClientRepository},
     secret_pool::SecretPool,
 };
 use moka::future::Cache;
@@ -281,6 +281,19 @@ fn test_pattern_body() -> serde_json::Value {
     })
 }
 
+async fn insert_registered_client_for_gate_tests(pool: &PgPool) -> RegisteredClient {
+    let client_id = format!("gate-test-{}", Uuid::new_v4());
+    RegisteredClientRepository::new(pool.clone())
+        .create(
+            TENANT_ID,
+            &client_id,
+            "Gate Test Original",
+            &["https://example.com/cb".to_string()],
+        )
+        .await
+        .unwrap()
+}
+
 // -----------------------------------------------------------------------------
 // Negative tests: support-admin is rejected on every endpoint
 // -----------------------------------------------------------------------------
@@ -336,31 +349,57 @@ async fn create_rejects_support_admin() {
 #[tokio::test]
 async fn update_rejects_support_admin() {
     let pool = common::setup_test_db().await;
-    let app = build_app(create_test_auth_state(pool), AuthConfig::support_admin());
+    let created = insert_registered_client_for_gate_tests(&pool).await;
+    let snapshot = created.clone();
 
+    let app = build_app(
+        create_test_auth_state(pool.clone()),
+        AuthConfig::support_admin(),
+    );
+
+    let uri = format!("/admin/registered-clients/{}", created.id);
     let response = app
-        .oneshot(request(
-            "PATCH",
-            "/admin/registered-clients/1",
-            Some(update_body()),
-        ))
+        .oneshot(request("PATCH", &uri, Some(update_body())))
         .await
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let repo = RegisteredClientRepository::new(pool);
+    let row = repo.get(created.id, TENANT_ID).await.unwrap();
+    assert_ne!(
+        row.name, "Forbidden Renamed",
+        "forbidden PATCH must not have persisted the requested name"
+    );
+    assert_eq!(row.name, snapshot.name);
+    assert_eq!(row.allowed_redirect_uris, snapshot.allowed_redirect_uris);
+    assert_eq!(row.updated_at, snapshot.updated_at);
+    assert_eq!(row.created_at, snapshot.created_at);
 }
 
 #[tokio::test]
 async fn delete_rejects_support_admin() {
     let pool = common::setup_test_db().await;
-    let app = build_app(create_test_auth_state(pool), AuthConfig::support_admin());
+    let created = insert_registered_client_for_gate_tests(&pool).await;
+    let snapshot = created.clone();
 
-    let response = app
-        .oneshot(request("DELETE", "/admin/registered-clients/1", None))
-        .await
-        .unwrap();
+    let app = build_app(
+        create_test_auth_state(pool.clone()),
+        AuthConfig::support_admin(),
+    );
+
+    let uri = format!("/admin/registered-clients/{}", created.id);
+    let response = app.oneshot(request("DELETE", &uri, None)).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let repo = RegisteredClientRepository::new(pool);
+    let row = repo.get(created.id, TENANT_ID).await.unwrap();
+    assert_eq!(row.client_id, snapshot.client_id);
+    assert_eq!(row.name, snapshot.name);
+    assert_eq!(row.allowed_redirect_uris, snapshot.allowed_redirect_uris);
+    assert_eq!(row.updated_at, snapshot.updated_at);
+    assert_eq!(row.created_at, snapshot.created_at);
 }
 
 #[tokio::test]
@@ -428,31 +467,57 @@ async fn create_rejects_non_admin() {
 #[tokio::test]
 async fn update_rejects_non_admin() {
     let pool = common::setup_test_db().await;
-    let app = build_app(create_test_auth_state(pool), AuthConfig::non_admin());
+    let created = insert_registered_client_for_gate_tests(&pool).await;
+    let snapshot = created.clone();
 
+    let app = build_app(
+        create_test_auth_state(pool.clone()),
+        AuthConfig::non_admin(),
+    );
+
+    let uri = format!("/admin/registered-clients/{}", created.id);
     let response = app
-        .oneshot(request(
-            "PATCH",
-            "/admin/registered-clients/1",
-            Some(update_body()),
-        ))
+        .oneshot(request("PATCH", &uri, Some(update_body())))
         .await
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let repo = RegisteredClientRepository::new(pool);
+    let row = repo.get(created.id, TENANT_ID).await.unwrap();
+    assert_ne!(
+        row.name, "Forbidden Renamed",
+        "forbidden PATCH must not have persisted the requested name"
+    );
+    assert_eq!(row.name, snapshot.name);
+    assert_eq!(row.allowed_redirect_uris, snapshot.allowed_redirect_uris);
+    assert_eq!(row.updated_at, snapshot.updated_at);
+    assert_eq!(row.created_at, snapshot.created_at);
 }
 
 #[tokio::test]
 async fn delete_rejects_non_admin() {
     let pool = common::setup_test_db().await;
-    let app = build_app(create_test_auth_state(pool), AuthConfig::non_admin());
+    let created = insert_registered_client_for_gate_tests(&pool).await;
+    let snapshot = created.clone();
 
-    let response = app
-        .oneshot(request("DELETE", "/admin/registered-clients/1", None))
-        .await
-        .unwrap();
+    let app = build_app(
+        create_test_auth_state(pool.clone()),
+        AuthConfig::non_admin(),
+    );
+
+    let uri = format!("/admin/registered-clients/{}", created.id);
+    let response = app.oneshot(request("DELETE", &uri, None)).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let repo = RegisteredClientRepository::new(pool);
+    let row = repo.get(created.id, TENANT_ID).await.unwrap();
+    assert_eq!(row.client_id, snapshot.client_id);
+    assert_eq!(row.name, snapshot.name);
+    assert_eq!(row.allowed_redirect_uris, snapshot.allowed_redirect_uris);
+    assert_eq!(row.updated_at, snapshot.updated_at);
+    assert_eq!(row.created_at, snapshot.created_at);
 }
 
 #[tokio::test]
