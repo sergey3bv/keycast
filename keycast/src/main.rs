@@ -235,6 +235,26 @@ fn parse_origin(origin: &str) -> Option<(&str, &str)> {
     Some((scheme, host))
 }
 
+fn is_production_environment() -> bool {
+    env::var("NODE_ENV")
+        .map(|value| value.eq_ignore_ascii_case("production"))
+        .unwrap_or(false)
+}
+
+fn validate_atproto_control_plane_environment(is_production: bool) -> Result<(), String> {
+    if !is_production {
+        return Ok(());
+    }
+
+    match env::var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL") {
+        Ok(value) if !value.trim().is_empty() => Ok(()),
+        _ => Err(
+            "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL must be set in production (ATProto control-plane base URL)"
+                .to_string(),
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KmsProvider {
     File,
@@ -387,46 +407,56 @@ async fn cache_control_middleware(request: Request<Body>, next: Next) -> Respons
 
 /// Validate required environment variables at startup
 fn validate_environment() -> Result<(), String> {
-    let mut errors = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
 
     // Required variables
     if env::var("DATABASE_URL").is_err() {
-        errors.push("DATABASE_URL must be set (PostgreSQL connection string)");
+        errors.push("DATABASE_URL must be set (PostgreSQL connection string)".to_string());
     }
 
     if env::var("ALLOWED_ORIGINS").is_err() {
-        errors.push("ALLOWED_ORIGINS must be set (comma-separated CORS origins)");
+        errors.push("ALLOWED_ORIGINS must be set (comma-separated CORS origins)".to_string());
     }
 
     if env::var("SERVER_NSEC").is_err() {
-        errors.push("SERVER_NSEC must be set (server's Nostr secret key for signing UCANs)");
+        errors.push(
+            "SERVER_NSEC must be set (server's Nostr secret key for signing UCANs)".to_string(),
+        );
     }
 
     if env::var("REDIS_URL").is_err() {
-        errors.push("REDIS_URL must be set (Redis/Memorystore URL for cluster coordination)");
+        errors.push(
+            "REDIS_URL must be set (Redis/Memorystore URL for cluster coordination)".to_string(),
+        );
     }
 
     let kms_provider = resolve_kms_provider()?;
     match kms_provider {
         KmsProvider::File => {
             if env::var("MASTER_KEY_PATH").is_err() {
-                errors.push("MASTER_KEY_PATH must be set when KMS_PROVIDER=file");
+                errors.push("MASTER_KEY_PATH must be set when KMS_PROVIDER=file".to_string());
             }
         }
         KmsProvider::Gcp => {
             if env::var("GCP_PROJECT_ID").is_err() {
-                errors.push("GCP_PROJECT_ID must be set when KMS_PROVIDER=gcp");
+                errors.push("GCP_PROJECT_ID must be set when KMS_PROVIDER=gcp".to_string());
             }
         }
         KmsProvider::Aws => {
             if env::var("AWS_KMS_KEY_ID").is_err() {
-                errors.push("AWS_KMS_KEY_ID must be set when KMS_PROVIDER=aws");
+                errors.push("AWS_KMS_KEY_ID must be set when KMS_PROVIDER=aws".to_string());
             }
             #[cfg(not(feature = "aws"))]
             {
-                errors.push("KMS_PROVIDER=aws requires building keycast with --features aws");
+                errors.push(
+                    "KMS_PROVIDER=aws requires building keycast with --features aws".to_string(),
+                );
             }
         }
+    }
+
+    if let Err(error) = validate_atproto_control_plane_environment(is_production_environment()) {
+        errors.push(error);
     }
 
     // Tenant isolation configuration
@@ -458,7 +488,7 @@ fn validate_environment() -> Result<(), String> {
 
     // Validate email configuration (fail-closed in production)
     if let Err(e) = keycast_api::email_service::create_email_sender() {
-        errors.push(Box::leak(e.into_boxed_str()));
+        errors.push(e);
     }
 
     if !errors.is_empty() {
@@ -539,7 +569,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     }
 
     // Initialize tracing with JSON format in production for GCP Cloud Logging
-    let is_production = std::env::var("NODE_ENV").unwrap_or_default() == "production";
+    let is_production = is_production_environment();
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     if is_production {
@@ -1179,6 +1209,40 @@ mod tests {
         let result = resolve_kms_provider();
         assert!(result.is_err());
         std::env::remove_var("KMS_PROVIDER");
+    }
+
+    #[test]
+    #[serial]
+    fn test_validate_atproto_control_plane_requires_url_in_production() {
+        std::env::remove_var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL");
+
+        let result = validate_atproto_control_plane_environment(true);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_validate_atproto_control_plane_accepts_url_in_production() {
+        std::env::set_var(
+            "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL",
+            "https://atproto-control-plane.example",
+        );
+
+        let result = validate_atproto_control_plane_environment(true);
+
+        assert!(result.is_ok());
+        std::env::remove_var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL");
+    }
+
+    #[test]
+    #[serial]
+    fn test_validate_atproto_control_plane_not_required_outside_production() {
+        std::env::remove_var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL");
+
+        let result = validate_atproto_control_plane_environment(false);
+
+        assert!(result.is_ok());
     }
 
     #[test]

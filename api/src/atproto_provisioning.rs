@@ -3,6 +3,9 @@ use serde::Serialize;
 
 const DEFAULT_ATPROTO_CONTROL_PLANE_URL: &str = "http://127.0.0.1:3201";
 const DEFAULT_HANDLE_DOMAIN: &str = "divine.video";
+const CONTROL_PLANE_URL_ENV: &str = "DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL";
+const NODE_ENV_VAR: &str = "NODE_ENV";
+const PRODUCTION_ENV: &str = "production";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AtprotoProvisioningError {
@@ -13,6 +16,8 @@ pub enum AtprotoProvisioningError {
         status: reqwest::StatusCode,
         body: String,
     },
+    #[error("invalid ATProto provisioning configuration: {0}")]
+    Configuration(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -22,9 +27,41 @@ struct EnableProvisioningRequest {
     crosspost_enabled: bool,
 }
 
-fn control_plane_base_url() -> String {
-    std::env::var("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL")
-        .unwrap_or_else(|_| DEFAULT_ATPROTO_CONTROL_PLANE_URL.to_string())
+fn is_production_environment() -> bool {
+    std::env::var(NODE_ENV_VAR)
+        .map(|value| value.eq_ignore_ascii_case(PRODUCTION_ENV))
+        .unwrap_or(false)
+}
+
+fn validate_control_plane_base_url(url: &str) -> Result<(), AtprotoProvisioningError> {
+    reqwest::Url::parse(url).map_err(|error| {
+        AtprotoProvisioningError::Configuration(format!(
+            "{CONTROL_PLANE_URL_ENV} must be a valid URL: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn control_plane_base_url() -> Result<String, AtprotoProvisioningError> {
+    if let Ok(base_url) = std::env::var(CONTROL_PLANE_URL_ENV) {
+        let trimmed = base_url.trim();
+        if trimmed.is_empty() {
+            return Err(AtprotoProvisioningError::Configuration(format!(
+                "{CONTROL_PLANE_URL_ENV} is set but empty"
+            )));
+        }
+
+        validate_control_plane_base_url(trimmed)?;
+        return Ok(trimmed.to_string());
+    }
+
+    if is_production_environment() {
+        return Err(AtprotoProvisioningError::Configuration(format!(
+            "{CONTROL_PLANE_URL_ENV} must be configured in production"
+        )));
+    }
+
+    Ok(DEFAULT_ATPROTO_CONTROL_PLANE_URL.to_string())
 }
 
 fn handle_domain() -> String {
@@ -46,7 +83,7 @@ pub async fn request_enable(
     username: &str,
     crosspost_enabled: bool,
 ) -> Result<(), AtprotoProvisioningError> {
-    let base = control_plane_base_url();
+    let base = control_plane_base_url()?;
     let domain = handle_domain();
     let url = format!("{}/api/account-links/opt-in", base.trim_end_matches('/'));
     let handle = format!("{}.{}", username.trim().to_ascii_lowercase(), domain);
@@ -72,7 +109,7 @@ pub async fn request_enable(
 }
 
 pub async fn request_reenable(nostr_pubkey: &str) -> Result<(), AtprotoProvisioningError> {
-    let base = control_plane_base_url();
+    let base = control_plane_base_url()?;
     let encoded_pubkey = urlencoding::encode(nostr_pubkey);
     let url = format!(
         "{}/api/account-links/{}/enable",
@@ -93,7 +130,7 @@ pub async fn request_reenable(nostr_pubkey: &str) -> Result<(), AtprotoProvision
 }
 
 pub async fn request_disable(nostr_pubkey: &str) -> Result<(), AtprotoProvisioningError> {
-    let base = control_plane_base_url();
+    let base = control_plane_base_url()?;
     let encoded_pubkey = urlencoding::encode(nostr_pubkey);
     let url = format!(
         "{}/api/account-links/{}/disable",

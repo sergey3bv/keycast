@@ -414,8 +414,9 @@ fn map_control_error(error: AtprotoControlError) -> AuthError {
         AtprotoControlError::ProvisioningTrigger(err) => {
             tracing::warn!("ATProto provisioning trigger failed: {}", err);
             AuthError::ServiceUnavailable {
-                message: "ATProto setup is temporarily unavailable. Please try again shortly."
-                    .to_string(),
+                message:
+                    "ATProto provisioning is temporarily unavailable. Please try again shortly."
+                        .to_string(),
                 retry_after: Some(30),
             }
         }
@@ -577,10 +578,15 @@ mod tests {
             "request failed: connection refused".to_string(),
         ));
 
-        assert!(
-            matches!(error, AuthError::ServiceUnavailable { .. }),
-            "provisioning dependency failures should not be classified as internal errors"
-        );
+        match error {
+            AuthError::ServiceUnavailable { message, .. } => {
+                assert!(
+                    message.contains("ATProto provisioning"),
+                    "service-unavailable message should identify the dependency"
+                );
+            }
+            _ => panic!("provisioning dependency failures must map to service unavailable"),
+        }
     }
 
     #[test]

@@ -118,6 +118,7 @@ This allows 5x higher concurrency without blocking request threads on bcrypt.
 | `keycast-ucan-secret` | `SERVER_NSEC` | Server nsec for token signing |
 | `keycast-sendgrid-api-key` | `SENDGRID_API_KEY` | Email (disabled: `DISABLE_EMAILS=true`) |
 | `keycast-redis-url` | `REDIS_URL` | Redis connection |
+| `keycast-atproto-token` | `KEYCAST_ATPROTO_TOKEN` | Optional bearer token for ATProto control-plane requests |
 
 ### Plain Variables (cloudbuild.yaml)
 
@@ -129,6 +130,7 @@ This allows 5x higher concurrency without blocking request threads on bcrypt.
 | `AWS_KMS_KEY_ID` | unset (only for `KMS_PROVIDER=aws`) |
 | `AWS_REGION` | `us-east-1` (only for `KMS_PROVIDER=aws`) |
 | `ALLOWED_ORIGINS` | `https://login.divine.video,https://divine.video,https://*.openvine-app.pages.dev` |
+| `DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL` | `https://<atproto-control-plane-host>` |
 | `RUST_LOG` | `info` |
 | `SQLX_POOL_SIZE` | `50` |
 | `SQLX_STATEMENT_CACHE` | `100` |

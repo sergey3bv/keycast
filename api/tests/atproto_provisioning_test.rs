@@ -33,6 +33,12 @@ impl EnvGuard {
         std::env::set_var(key, value);
         Self { key, previous }
     }
+
+    fn unset(key: &'static str) -> Self {
+        let previous = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self { key, previous }
+    }
 }
 
 impl Drop for EnvGuard {
@@ -145,4 +151,23 @@ async fn request_reenable_posts_enable_endpoint() {
             body: None,
         }
     );
+}
+
+#[tokio::test]
+#[serial]
+async fn request_enable_fails_closed_when_control_plane_url_missing_in_production() {
+    let _node_env = EnvGuard::set("NODE_ENV", "production");
+    let _base = EnvGuard::unset("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL");
+
+    let error = keycast_api::atproto_provisioning::request_enable("npub1prod", "Alice", true)
+        .await
+        .expect_err("production should fail closed without explicit control-plane URL");
+
+    assert!(matches!(
+        error,
+        keycast_api::atproto_provisioning::AtprotoProvisioningError::Configuration(_)
+    ));
+    assert!(error
+        .to_string()
+        .contains("DIVINE_SKY_ATPROTO_CONTROL_PLANE_URL"));
 }
