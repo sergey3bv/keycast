@@ -8,7 +8,7 @@ mod common;
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     routing::{get, patch, post},
     Json, Router,
 };
@@ -174,19 +174,22 @@ fn build_app(auth_state: AuthState, config: AuthConfig) -> Router {
                         .await
                 }
             })
-            .post(move |Json(body): Json<CreateRegisteredClientRequest>| {
-                let state = create_state.clone();
-                let cfg = create_cfg.clone();
-                async move {
-                    create_registered_client(
-                        create_test_tenant(),
-                        State(state),
-                        cfg.into_auth(),
-                        Json(body),
-                    )
-                    .await
-                }
-            }),
+            .post(
+                move |headers: HeaderMap, Json(body): Json<CreateRegisteredClientRequest>| {
+                    let state = create_state.clone();
+                    let cfg = create_cfg.clone();
+                    async move {
+                        create_registered_client(
+                            create_test_tenant(),
+                            State(state),
+                            cfg.into_auth(),
+                            headers,
+                            Json(body),
+                        )
+                        .await
+                    }
+                },
+            ),
         )
         .route(
             "/admin/registered-clients/test",
@@ -205,7 +208,9 @@ fn build_app(auth_state: AuthState, config: AuthConfig) -> Router {
         .route(
             "/admin/registered-clients/:id",
             patch(
-                move |Path(id): Path<i32>, Json(body): Json<UpdateRegisteredClientRequest>| {
+                move |headers: HeaderMap,
+                      Path(id): Path<i32>,
+                      Json(body): Json<UpdateRegisteredClientRequest>| {
                     let state = update_state.clone();
                     let cfg = update_cfg.clone();
                     async move {
@@ -213,6 +218,7 @@ fn build_app(auth_state: AuthState, config: AuthConfig) -> Router {
                             create_test_tenant(),
                             State(state),
                             cfg.into_auth(),
+                            headers,
                             Path(id),
                             Json(body),
                         )
@@ -220,7 +226,7 @@ fn build_app(auth_state: AuthState, config: AuthConfig) -> Router {
                     }
                 },
             )
-            .delete(move |Path(id): Path<i32>| {
+            .delete(move |headers: HeaderMap, Path(id): Path<i32>| {
                 let state = delete_state.clone();
                 let cfg = delete_cfg.clone();
                 async move {
@@ -228,6 +234,7 @@ fn build_app(auth_state: AuthState, config: AuthConfig) -> Router {
                         create_test_tenant(),
                         State(state),
                         cfg.into_auth(),
+                        headers,
                         Path(id),
                     )
                     .await

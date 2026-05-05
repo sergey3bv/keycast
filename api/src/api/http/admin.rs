@@ -2,12 +2,14 @@
 // ABOUTME: Used for Vine import and support workflows
 
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::Json;
 use chrono::{Duration, Utc};
 use nostr_sdk::{FromBech32, Keys};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::auth_observability::request_id_from_headers;
 use super::routes::AuthState;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::extractors::UcanAuth;
@@ -1548,6 +1550,7 @@ async fn record_registered_client_audit(
     actor_pubkey: &str,
     action: &'static str,
     client: &RegisteredClient,
+    request_id: Option<String>,
 ) {
     let metadata = serde_json::json!({
         "name": client.name,
@@ -1562,6 +1565,7 @@ async fn record_registered_client_audit(
             target_resource_type: "registered_client".to_string(),
             target_resource_id: Some(client.id.to_string()),
             target_client_id: Some(client.client_id.clone()),
+            request_id,
             metadata_json: metadata,
         })
         .await
@@ -1585,6 +1589,7 @@ async fn record_registered_client_update_audit(
     actor_pubkey: &str,
     before: &RegisteredClient,
     after: &RegisteredClient,
+    request_id: Option<String>,
 ) {
     let metadata = serde_json::json!({
         "before": {
@@ -1605,6 +1610,7 @@ async fn record_registered_client_update_audit(
             target_resource_type: "registered_client".to_string(),
             target_resource_id: Some(after.id.to_string()),
             target_client_id: Some(after.client_id.clone()),
+            request_id,
             metadata_json: metadata,
         })
         .await
@@ -1650,11 +1656,14 @@ pub async fn create_registered_client(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
     auth: UcanAuth,
+    headers: HeaderMap,
     Json(req): Json<CreateRegisteredClientRequest>,
 ) -> ApiResult<Json<RegisteredClientView>> {
     if !is_full_admin(&auth) {
         return Err(ApiError::forbidden("Full admin access required"));
     }
+
+    let request_id = request_id_from_headers(&headers);
 
     let repo = RegisteredClientRepository::new(auth_state.state.db.clone());
     let created = repo
@@ -1672,6 +1681,7 @@ pub async fn create_registered_client(
         &auth.pubkey,
         "registered_client.create",
         &created,
+        request_id,
     )
     .await;
 
@@ -1698,12 +1708,15 @@ pub async fn update_registered_client(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
     auth: UcanAuth,
+    headers: HeaderMap,
     Path(id): Path<i32>,
     Json(req): Json<UpdateRegisteredClientRequest>,
 ) -> ApiResult<Json<RegisteredClientView>> {
     if !is_full_admin(&auth) {
         return Err(ApiError::forbidden("Full admin access required"));
     }
+
+    let request_id = request_id_from_headers(&headers);
 
     if req.name.is_none() && req.allowed_redirect_uris.is_none() {
         return Err(ApiError::bad_request(
@@ -1727,6 +1740,7 @@ pub async fn update_registered_client(
         &auth.pubkey,
         &update.before,
         &update.after,
+        request_id,
     )
     .await;
 
@@ -1744,11 +1758,14 @@ pub async fn delete_registered_client(
     tenant: crate::api::tenant::TenantExtractor,
     State(auth_state): State<AuthState>,
     auth: UcanAuth,
+    headers: HeaderMap,
     Path(id): Path<i32>,
 ) -> ApiResult<Json<serde_json::Value>> {
     if !is_full_admin(&auth) {
         return Err(ApiError::forbidden("Full admin access required"));
     }
+
+    let request_id = request_id_from_headers(&headers);
 
     let repo = RegisteredClientRepository::new(auth_state.state.db.clone());
     let deleted = repo.delete(id, tenant.0.id).await.map_err(map_repo_error)?;
@@ -1758,6 +1775,7 @@ pub async fn delete_registered_client(
         &auth.pubkey,
         "registered_client.delete",
         &deleted,
+        request_id,
     )
     .await;
 

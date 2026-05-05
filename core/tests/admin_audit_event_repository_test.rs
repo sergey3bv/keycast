@@ -48,6 +48,7 @@ async fn records_and_lists_admin_audit_event() {
             target_resource_type: "registered_client".to_string(),
             target_resource_id: Some("123".to_string()),
             target_client_id: Some(target_client_id.clone()),
+            request_id: Some("req-audit-1".to_string()),
             metadata_json: json!({
                 "name": "Audit Test",
                 "allowed_redirect_uris": ["https://example.com/cb"]
@@ -66,6 +67,7 @@ async fn records_and_lists_admin_audit_event() {
         inserted.target_client_id.as_deref(),
         Some(target_client_id.as_str())
     );
+    assert_eq!(inserted.request_id.as_deref(), Some("req-audit-1"));
     assert_eq!(inserted.metadata_json["name"], "Audit Test");
 
     let listed = repo
@@ -80,6 +82,7 @@ async fn records_and_lists_admin_audit_event() {
         listed[0].target_client_id.as_deref(),
         Some(target_client_id.as_str())
     );
+    assert_eq!(listed[0].request_id.as_deref(), Some("req-audit-1"));
 }
 
 #[tokio::test]
@@ -100,6 +103,7 @@ async fn list_recent_returns_newest_first_and_respects_tenant_scope() {
             target_resource_type: "registered_client".to_string(),
             target_resource_id: Some("1".to_string()),
             target_client_id: Some("client-a".to_string()),
+            request_id: None,
             metadata_json: json!({}),
         })
         .await
@@ -112,6 +116,7 @@ async fn list_recent_returns_newest_first_and_respects_tenant_scope() {
         target_resource_type: "registered_client".to_string(),
         target_resource_id: Some("9".to_string()),
         target_client_id: Some("client-b".to_string()),
+        request_id: Some("req-b".to_string()),
         metadata_json: json!({}),
     })
     .await
@@ -128,4 +133,5 @@ async fn list_recent_returns_newest_first_and_respects_tenant_scope() {
     let b_list = repo.list_recent(tenant_b, 10).await.unwrap();
     assert_eq!(b_list.len(), 1);
     assert_eq!(b_list[0].target_client_id.as_deref(), Some("client-b"));
+    assert_eq!(b_list[0].request_id.as_deref(), Some("req-b"));
 }

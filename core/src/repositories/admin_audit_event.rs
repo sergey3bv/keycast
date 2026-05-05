@@ -15,6 +15,7 @@ pub struct AdminAuditEventRecord {
     pub target_resource_type: String,
     pub target_resource_id: Option<String>,
     pub target_client_id: Option<String>,
+    pub request_id: Option<String>,
     pub metadata_json: Value,
 }
 
@@ -28,6 +29,7 @@ pub struct AdminAuditEventRow {
     pub target_resource_type: String,
     pub target_resource_id: Option<String>,
     pub target_client_id: Option<String>,
+    pub request_id: Option<String>,
     pub metadata_json: Value,
 }
 
@@ -53,8 +55,9 @@ impl AdminAuditEventRepository {
                 target_resource_type,
                 target_resource_id,
                 target_client_id,
+                request_id,
                 metadata_json
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              RETURNING
                 id,
                 occurred_at,
@@ -64,6 +67,7 @@ impl AdminAuditEventRepository {
                 target_resource_type,
                 target_resource_id,
                 target_client_id,
+                request_id,
                 metadata_json",
         )
         .bind(record.tenant_id)
@@ -72,6 +76,7 @@ impl AdminAuditEventRepository {
         .bind(record.target_resource_type)
         .bind(record.target_resource_id)
         .bind(record.target_client_id)
+        .bind(record.request_id)
         .bind(record.metadata_json)
         .fetch_one(&self.pool)
         .await
@@ -93,6 +98,7 @@ impl AdminAuditEventRepository {
                 target_resource_type,
                 target_resource_id,
                 target_client_id,
+                request_id,
                 metadata_json
              FROM admin_audit_events
              WHERE tenant_id = $1

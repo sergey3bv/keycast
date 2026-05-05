@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
+use axum::http::{HeaderMap, HeaderValue};
 use axum::Json;
 use chrono::Utc;
 use keycast_api::{
@@ -127,13 +128,14 @@ struct AuditRow {
     target_resource_type: String,
     target_resource_id: Option<String>,
     target_client_id: Option<String>,
+    request_id: Option<String>,
     metadata_json: serde_json::Value,
 }
 
 async fn read_audit_rows(pool: &PgPool, tenant_id: i64, actor_pubkey: &str) -> Vec<AuditRow> {
     sqlx::query_as::<_, AuditRow>(
         "SELECT actor_pubkey, action, target_resource_type, target_resource_id,
-                target_client_id, metadata_json
+                target_client_id, request_id, metadata_json
          FROM admin_audit_events
          WHERE tenant_id = $1 AND actor_pubkey = $2
          ORDER BY occurred_at ASC, id ASC",
@@ -159,11 +161,19 @@ async fn create_update_delete_each_writes_admin_audit_event() {
 
     let state = make_auth_state(pool.clone());
 
+    let expected_request_id = format!("audit-req-{}", Uuid::new_v4());
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-request-id",
+        HeaderValue::from_str(&expected_request_id).expect("ascii request id"),
+    );
+
     // CREATE
     let created = create_registered_client(
         make_tenant(tenant_id),
         State(state.clone()),
         make_admin_auth(&actor_pubkey),
+        headers.clone(),
         Json(CreateRegisteredClientRequest {
             client_id: client_id.clone(),
             name: "Audit HTTP".to_string(),
@@ -179,6 +189,7 @@ async fn create_update_delete_each_writes_admin_audit_event() {
         make_tenant(tenant_id),
         State(state.clone()),
         make_admin_auth(&actor_pubkey),
+        headers.clone(),
         Path(created.id),
         Json(UpdateRegisteredClientRequest {
             name: Some("Audit HTTP renamed".to_string()),
@@ -193,6 +204,7 @@ async fn create_update_delete_each_writes_admin_audit_event() {
         make_tenant(tenant_id),
         State(state),
         make_admin_auth(&actor_pubkey),
+        headers,
         Path(created.id),
     )
     .await
@@ -219,6 +231,10 @@ async fn create_update_delete_each_writes_admin_audit_event() {
             Some(created.id.to_string()).as_deref()
         );
         assert_eq!(row.target_client_id.as_deref(), Some(client_id.as_str()));
+        assert_eq!(
+            row.request_id.as_deref(),
+            Some(expected_request_id.as_str())
+        );
     }
 
     // Spot-check metadata payloads carry the state we expect.
