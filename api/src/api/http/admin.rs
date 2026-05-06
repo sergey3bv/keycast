@@ -247,6 +247,23 @@ pub async fn preload_user(
             &existing_pubkey[..8]
         );
 
+        record_admin_audit_best_effort(
+            pool,
+            AdminAuditEventRecord {
+                tenant_id,
+                actor_pubkey: auth.pubkey.clone(),
+                action: "preload_user.token_issued".to_string(),
+                target_resource_type: "preloaded_user".to_string(),
+                target_resource_id: Some(existing_pubkey.clone()),
+                target_client_id: None,
+                metadata_json: serde_json::json!({
+                    "vine_id": req.vine_id,
+                    "idempotent": true,
+                }),
+            },
+        )
+        .await;
+
         return Ok(Json(PreloadUserResponse {
             pubkey: existing_pubkey,
             token,
@@ -317,6 +334,24 @@ pub async fn preload_user(
         &pubkey_hex[..8]
     );
 
+    record_admin_audit_best_effort(
+        pool,
+        AdminAuditEventRecord {
+            tenant_id,
+            actor_pubkey: auth.pubkey.clone(),
+            action: "preload_user.create".to_string(),
+            target_resource_type: "preloaded_user".to_string(),
+            target_resource_id: Some(pubkey_hex.clone()),
+            target_client_id: None,
+            metadata_json: serde_json::json!({
+                "vine_id": req.vine_id,
+                "username": req.username,
+                "display_name": req.display_name,
+            }),
+        },
+    )
+    .await;
+
     Ok(Json(PreloadUserResponse {
         pubkey: pubkey_hex,
         token,
@@ -386,6 +421,22 @@ pub async fn get_user_token(
         &req.pubkey[..8],
         &auth.pubkey[..8]
     );
+
+    record_admin_audit_best_effort(
+        pool,
+        AdminAuditEventRecord {
+            tenant_id,
+            actor_pubkey: auth.pubkey.clone(),
+            action: "preload_user.user_token".to_string(),
+            target_resource_type: "preloaded_user".to_string(),
+            target_resource_id: Some(req.pubkey.clone()),
+            target_client_id: None,
+            metadata_json: serde_json::json!({
+                "unclaimed": true,
+            }),
+        },
+    )
+    .await;
 
     Ok(Json(UserTokenResponse { token }))
 }
@@ -559,6 +610,25 @@ pub async fn create_claim_token(
         req.vine_id,
         &auth.pubkey[..8]
     );
+
+    record_admin_audit_best_effort(
+        pool,
+        AdminAuditEventRecord {
+            tenant_id,
+            actor_pubkey: auth.pubkey.clone(),
+            action: "claim_token.create".to_string(),
+            target_resource_type: "claim_token".to_string(),
+            target_resource_id: Some(claim_token.id.to_string()),
+            target_client_id: None,
+            metadata_json: serde_json::json!({
+                "vine_id": req.vine_id,
+                "user_pubkey": user_pubkey,
+                "invalidated_prior": invalidated_prior,
+                "expires_at": claim_token.expires_at.to_rfc3339(),
+            }),
+        },
+    )
+    .await;
 
     Ok(Json(CreateClaimTokenResponse {
         claim_url,
@@ -754,6 +824,25 @@ pub async fn batch_create_claim_tokens(
             errors.push(format!("vine_id {}: email service unavailable", vine_id));
         }
 
+        record_admin_audit_best_effort(
+            pool,
+            AdminAuditEventRecord {
+                tenant_id,
+                actor_pubkey: auth.pubkey.clone(),
+                action: "claim_token.create".to_string(),
+                target_resource_type: "claim_token".to_string(),
+                target_resource_id: Some(claim_token.id.to_string()),
+                target_client_id: None,
+                metadata_json: serde_json::json!({
+                    "vine_id": vine_id,
+                    "user_pubkey": user_pubkey,
+                    "invalidated_prior": 0u64,
+                    "expires_at": claim_token.expires_at.to_rfc3339(),
+                }),
+            },
+        )
+        .await;
+
         tokens.push(BatchClaimTokenEntry {
             vine_id: vine_id.clone(),
             claim_url,
@@ -828,6 +917,24 @@ pub async fn invalidate_claim_token(
         count,
         req.reason,
     );
+
+    record_admin_audit_best_effort(
+        pool,
+        AdminAuditEventRecord {
+            tenant_id,
+            actor_pubkey: auth.pubkey.clone(),
+            action: "claim_token.invalidate".to_string(),
+            target_resource_type: "preloaded_user".to_string(),
+            target_resource_id: Some(user_pubkey.clone()),
+            target_client_id: None,
+            metadata_json: serde_json::json!({
+                "vine_id": req.vine_id,
+                "invalidated_count": count,
+                "reason": req.reason,
+            }),
+        },
+    )
+    .await;
 
     Ok(Json(InvalidateClaimTokenResponse {
         invalidated_count: count,
@@ -1410,6 +1517,22 @@ pub async fn add_support_admin(
         &auth.pubkey[..8]
     );
 
+    record_admin_audit_best_effort(
+        &auth_state.state.db,
+        AdminAuditEventRecord {
+            tenant_id: tenant.0.id,
+            actor_pubkey: auth.pubkey.clone(),
+            action: "support_admin.add".to_string(),
+            target_resource_type: "support_admin".to_string(),
+            target_resource_id: Some(pubkey_hex.clone()),
+            target_client_id: None,
+            metadata_json: serde_json::json!({
+                "added": added > 0,
+            }),
+        },
+    )
+    .await;
+
     Ok(Json(AddSupportAdminResponse {
         pubkey: pubkey_hex,
         added: added > 0,
@@ -1418,7 +1541,7 @@ pub async fn add_support_admin(
 
 /// Remove a support admin by pubkey. Full admin only.
 pub async fn remove_support_admin(
-    _tenant: crate::api::tenant::TenantExtractor,
+    tenant: crate::api::tenant::TenantExtractor,
     auth: UcanAuth,
     Path(pubkey): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -1444,6 +1567,22 @@ pub async fn remove_support_admin(
         &pubkey[..std::cmp::min(8, pubkey.len())],
         &auth.pubkey[..8]
     );
+
+    record_admin_audit_best_effort(
+        &state.db,
+        AdminAuditEventRecord {
+            tenant_id: tenant.0.id,
+            actor_pubkey: auth.pubkey.clone(),
+            action: "support_admin.remove".to_string(),
+            target_resource_type: "support_admin".to_string(),
+            target_resource_id: Some(pubkey.clone()),
+            target_client_id: None,
+            metadata_json: serde_json::json!({
+                "removed": removed > 0,
+            }),
+        },
+    )
+    .await;
 
     Ok(Json(serde_json::json!({
         "removed": removed > 0,
@@ -1538,6 +1677,22 @@ fn map_repo_error(err: RepositoryError) -> ApiError {
     }
 }
 
+async fn record_admin_audit_best_effort(pool: &sqlx::PgPool, record: AdminAuditEventRecord) {
+    let tenant_id = record.tenant_id;
+    let action = record.action.clone();
+    let target_client_id = record.target_client_id.clone();
+    let repo = AdminAuditEventRepository::new(pool.clone());
+    if let Err(error) = repo.record(record).await {
+        tracing::error!(
+            action = %action,
+            tenant_id = tenant_id,
+            target_client_id = ?target_client_id,
+            error = %error,
+            "Failed to write admin_audit_events row"
+        );
+    }
+}
+
 /// Best-effort audit-trail write for a registered_client create/delete.
 /// A failed insert logs an error and returns; it never fails the admin action.
 ///
@@ -1553,9 +1708,9 @@ async fn record_registered_client_audit(
         "name": client.name,
         "allowed_redirect_uris": client.allowed_redirect_uris,
     });
-    let repo = AdminAuditEventRepository::new(pool.clone());
-    if let Err(error) = repo
-        .record(AdminAuditEventRecord {
+    record_admin_audit_best_effort(
+        pool,
+        AdminAuditEventRecord {
             tenant_id: client.tenant_id,
             actor_pubkey: actor_pubkey.to_string(),
             action: action.to_string(),
@@ -1563,17 +1718,9 @@ async fn record_registered_client_audit(
             target_resource_id: Some(client.id.to_string()),
             target_client_id: Some(client.client_id.clone()),
             metadata_json: metadata,
-        })
-        .await
-    {
-        tracing::error!(
-            action = action,
-            client_id = %client.client_id,
-            tenant_id = client.tenant_id,
-            error = %error,
-            "Failed to write admin_audit_events row for registered_client"
-        );
-    }
+        },
+    )
+    .await;
 }
 
 /// Best-effort audit-trail write for a registered_client update, recording
@@ -1596,9 +1743,9 @@ async fn record_registered_client_update_audit(
             "allowed_redirect_uris": after.allowed_redirect_uris,
         },
     });
-    let repo = AdminAuditEventRepository::new(pool.clone());
-    if let Err(error) = repo
-        .record(AdminAuditEventRecord {
+    record_admin_audit_best_effort(
+        pool,
+        AdminAuditEventRecord {
             tenant_id: after.tenant_id,
             actor_pubkey: actor_pubkey.to_string(),
             action: "registered_client.update".to_string(),
@@ -1606,17 +1753,9 @@ async fn record_registered_client_update_audit(
             target_resource_id: Some(after.id.to_string()),
             target_client_id: Some(after.client_id.clone()),
             metadata_json: metadata,
-        })
-        .await
-    {
-        tracing::error!(
-            action = "registered_client.update",
-            client_id = %after.client_id,
-            tenant_id = after.tenant_id,
-            error = %error,
-            "Failed to write admin_audit_events row for registered_client"
-        );
-    }
+        },
+    )
+    .await;
 }
 
 /// GET /api/admin/registered-clients
