@@ -58,6 +58,9 @@ struct ReadinessState {
     shutting_down: Arc<AtomicBool>,
 }
 
+/// Maps probe state to HTTP status. Shutdown is checked before DB readiness so
+/// during graceful shutdown we skip the DB query in [`readyz`] yet still return
+/// 503 with body `"Shutting down"` (not `"Database unavailable"`).
 fn readiness_response(is_shutting_down: bool, database_ready: bool) -> (StatusCode, &'static str) {
     if is_shutting_down {
         (StatusCode::SERVICE_UNAVAILABLE, "Shutting down")
@@ -86,6 +89,10 @@ async fn livez(state: Arc<LivenessState>) -> impl IntoResponse {
     }
 }
 
+/// Startup probe: always 200 when reachable. Safe because the listener binds only
+/// after `Database::new().await` in startup succeeds; this handler does not
+/// re-check the DB. Schema must already be migrated for the revision (e.g. `--migrate`
+/// / deploy job—migrations are not run inside `Database::new`).
 async fn startupz() -> impl IntoResponse {
     (StatusCode::OK, "OK")
 }
@@ -93,6 +100,8 @@ async fn startupz() -> impl IntoResponse {
 async fn readyz(state: Arc<ReadinessState>) -> impl IntoResponse {
     let is_shutting_down = state.shutting_down.load(Ordering::Relaxed);
     let database_ready = if is_shutting_down {
+        // Intentionally skip DB work while shutting down; [`readiness_response`]
+        // still reports 503 `"Shutting down"` via the shutdown branch first.
         false
     } else {
         // Bound the DB check so a stalled connection or exhausted pool fails
@@ -832,6 +841,8 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         .route("/health", get(health_check))
         .route("/livez", get(move || livez(livez_state.clone())))
         .route("/healthz/startup", get(startupz))
+        // Cloud Run does not use K8s-style readiness to stop routing to an instance;
+        // this endpoint is mainly for smoke tests (e.g. Cloud Build) and Kubernetes.
         .route("/healthz/ready", get(move || readyz(readyz_state.clone())))
         // NIP-05 discovery at root level
         .route(
