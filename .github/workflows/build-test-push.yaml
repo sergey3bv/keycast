@@ -80,6 +80,7 @@ jobs:
       - name: Run tests
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/keycast_test
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/keycast_test
           REDIS_URL: redis://localhost:16379
           TEST_REDIS_URL: redis://localhost:16379
         run: |

@@ -8,23 +8,11 @@
 use keycast_core::encryption::{file_key_manager::FileKeyManager, KeyManager};
 use keycast_core::signing_handler::SigningHandler;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
-use keycast_signer::Nip46Handler;
+use keycast_signer::{integration_test_db, Nip46Handler};
 use nostr_sdk::prelude::*;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
-
-/// Helper to create test database with schema
-async fn setup_test_db() -> PgPool {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast".to_string());
-
-    let pool = PgPool::connect(&database_url)
-        .await
-        .expect("Failed to connect to database. Make sure PostgreSQL is running.");
-
-    pool
-}
 
 /// Helper to create OAuth authorization for testing client pubkey tracking
 async fn create_oauth_authorization_for_client_test(
@@ -102,7 +90,7 @@ async fn create_oauth_authorization_for_client_test(
 // ============================================================================
 #[tokio::test]
 async fn test_connect_stores_client_pubkey() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
     let tenant_id = 1;
 
@@ -155,7 +143,7 @@ async fn test_connect_stores_client_pubkey() {
 // ============================================================================
 #[tokio::test]
 async fn test_connect_rejects_reused_secret() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
     let tenant_id = 1;
 
@@ -204,7 +192,7 @@ async fn test_connect_rejects_reused_secret() {
 // ============================================================================
 #[tokio::test]
 async fn test_same_client_can_reconnect() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
     let tenant_id = 1;
 
@@ -238,7 +226,7 @@ async fn test_same_client_can_reconnect() {
 // ============================================================================
 #[tokio::test]
 async fn test_request_from_connected_client_succeeds() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
     let tenant_id = 1;
 
@@ -283,7 +271,7 @@ async fn test_request_from_connected_client_succeeds() {
 // ============================================================================
 #[tokio::test]
 async fn test_request_from_unknown_client_rejected() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
     let tenant_id = 1;
 
@@ -330,7 +318,7 @@ async fn test_request_from_unknown_client_rejected() {
 // ============================================================================
 #[tokio::test]
 async fn test_first_request_without_connect_allowed() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
     let tenant_id = 1;
 
@@ -391,7 +379,7 @@ async fn test_first_request_without_connect_allowed() {
 // ============================================================================
 #[tokio::test]
 async fn test_revocation_clears_client_pubkey() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
     let tenant_id = 1;
 
@@ -450,7 +438,7 @@ async fn test_revocation_clears_client_pubkey() {
 // ============================================================================
 #[tokio::test]
 async fn test_connected_at_timestamp_set() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
     let tenant_id = 1;
 

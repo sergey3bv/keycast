@@ -48,6 +48,20 @@ cargo test --workspace                    # Unit tests
 ./tests/e2e/test-frontend.sh              # E2E frontend tests
 ```
 
+### Signer and database integration tests (`keycast_signer`)
+
+`cargo test -p keycast_signer --features integration-tests` needs Postgres with migrations applied to a **dedicated** database (not your normal app DB). Start dependencies with `bun run deps:up`, then use `bun run test` or `bun run test:ci` for the full Rust integration flow, or migrate manually (see below).
+
+- **`TEST_DATABASE_URL`** (recommended): connection string for that database, e.g. `postgres://postgres:password@localhost/keycast_test`.
+- If you only set **`DATABASE_URL`**, the database name must end with `_test` (so `.../keycast` is rejected).
+- If neither is set, tests default to `postgres://postgres:password@localhost/keycast_test`.
+
+Run migrations against the same URL before tests, for example:
+
+```bash
+sqlx migrate run --database-url "$TEST_DATABASE_URL" --source database/migrations
+```
+
 **Production testing:**
 ```bash
 API_URL=https://login.divine.video ./tests/integration/test-api.sh

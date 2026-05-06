@@ -5,6 +5,9 @@ pub mod error;
 pub mod signer_daemon;
 pub mod work_queue;
 
+#[cfg(feature = "integration-tests")]
+pub mod integration_test_db;
+
 // Re-export main types for convenience
 pub use error::{SignerError, SignerResult};
 pub use signer_daemon::{Nip46Handler, UnifiedSigner};

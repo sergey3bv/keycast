@@ -1866,16 +1866,6 @@ impl UnifiedSigner {
 mod tests {
     use super::*;
 
-    /// Helper to create test database connection
-    /// Note: Requires DATABASE_URL env var or running postgres at localhost
-    /// CI runs migrations automatically, so we just need to connect
-    async fn create_test_db() -> PgPool {
-        let database_url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://postgres:password@localhost/keycast_test".to_string());
-        PgPool::connect(&database_url).await.unwrap()
-    }
-
-    /// Helper to create test keys
     fn create_test_keys() -> Keys {
         Keys::generate()
     }
@@ -1950,7 +1940,7 @@ mod tests {
     #[tokio::test]
     async fn test_sign_event_direct_creates_valid_signature() {
         // Arrange
-        let pool = create_test_db().await;
+        let pool = crate::integration_test_db::connect_pool().await;
         let handler = create_test_handler_with_db(pool).await;
 
         let unsigned_event = UnsignedEvent::new(
@@ -1977,7 +1967,7 @@ mod tests {
     #[tokio::test]
     async fn test_sign_event_direct_preserves_tags() {
         // Arrange
-        let pool = create_test_db().await;
+        let pool = crate::integration_test_db::connect_pool().await;
         let handler = create_test_handler_with_db(pool).await;
 
         let tag1 = Tag::parse(vec!["e", "event_id_123"]).unwrap();
@@ -2012,7 +2002,7 @@ mod tests {
     // "Invalid signature" failure mode.
     #[tokio::test]
     async fn test_sign_event_direct_canonicalizes_mismatched_pubkey() {
-        let pool = create_test_db().await;
+        let pool = crate::integration_test_db::connect_pool().await;
         let handler = create_test_handler_with_db(pool).await;
 
         let stale_keys = Keys::generate();
@@ -2049,7 +2039,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_handler_for_user_returns_none_when_not_cached() {
         // Arrange
-        let pool = create_test_db().await;
+        let pool = crate::integration_test_db::connect_pool().await;
         let key_manager: Box<dyn KeyManager> =
             Box::new(keycast_core::encryption::file_key_manager::FileKeyManager::new().unwrap());
         let (_tx, rx) = tokio::sync::mpsc::channel(100);
@@ -2078,7 +2068,7 @@ mod tests {
     #[tokio::test]
     async fn test_handlers_clone_shares_cache() {
         // Arrange
-        let pool = create_test_db().await;
+        let pool = crate::integration_test_db::connect_pool().await;
         let key_manager: Box<dyn KeyManager> =
             Box::new(keycast_core::encryption::file_key_manager::FileKeyManager::new().unwrap());
         let (_tx, rx) = tokio::sync::mpsc::channel(100);

@@ -8,25 +8,11 @@ use keycast_core::encryption::{file_key_manager::FileKeyManager, KeyManager};
 use keycast_core::signing_handler::SigningHandler;
 use keycast_core::types::authorization::Authorization;
 use keycast_core::types::oauth_authorization::OAuthAuthorization;
-use keycast_signer::Nip46Handler;
+use keycast_signer::{integration_test_db, Nip46Handler};
 use nostr_sdk::prelude::*;
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
-
-/// Helper to create test database with schema
-async fn setup_test_db() -> PgPool {
-    // Use development database for tests
-    // TODO: Use test-specific database with isolation
-    let database_url =
-        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set to run database tests");
-
-    let pool = PgPool::connect(&database_url).await.expect(
-        "Failed to connect to database. Make sure PostgreSQL is running and DATABASE_URL is set.",
-    );
-
-    pool
-}
 
 /// Helper to create policy with specified permissions
 /// Returns (policy_id, team_id).
@@ -228,7 +214,7 @@ async fn create_oauth_authorization(
 
 #[tokio::test]
 async fn test_1_no_policy_allows_all() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // Create empty policy (no permissions)
@@ -261,7 +247,7 @@ async fn test_1_no_policy_allows_all() {
 
 #[tokio::test]
 async fn test_2_allowed_kinds_permits_matching_kind() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // Create policy allowing only kind 1
@@ -296,7 +282,7 @@ async fn test_2_allowed_kinds_permits_matching_kind() {
 
 #[tokio::test]
 async fn test_3_allowed_kinds_denies_non_matching_kind() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // Create policy allowing only kind 1
@@ -337,7 +323,7 @@ async fn test_3_allowed_kinds_denies_non_matching_kind() {
 
 #[tokio::test]
 async fn test_4_content_filter_allows_clean_content() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // Block words containing "spam"
@@ -370,7 +356,7 @@ async fn test_4_content_filter_allows_clean_content() {
 
 #[tokio::test]
 async fn test_5_content_filter_denies_blocked_words() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // Block words containing "spam"
@@ -406,7 +392,7 @@ async fn test_5_content_filter_denies_blocked_words() {
 
 #[tokio::test]
 async fn test_6_multiple_permissions_all_must_pass() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // Policy with TWO permissions (AND logic):
@@ -463,7 +449,7 @@ async fn test_6_multiple_permissions_all_must_pass() {
 
 #[tokio::test]
 async fn test_7_oauth_no_policy_allows_all() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // OAuth auth with NULL policy_id
@@ -494,7 +480,7 @@ async fn test_7_oauth_no_policy_allows_all() {
 
 #[tokio::test]
 async fn test_8_oauth_with_policy_enforces_restrictions() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // Create policy only allowing kind 1
@@ -530,7 +516,7 @@ async fn test_8_oauth_with_policy_enforces_restrictions() {
 
 #[tokio::test]
 async fn test_8b_permission_loading_failure_returns_error() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // Start with a valid policy, then attach a malformed permission config row.
@@ -669,7 +655,7 @@ async fn create_oauth_authorization_with_expiry(
 
 #[tokio::test]
 async fn test_9_expired_oauth_authorization_not_loaded() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // Create OAuth authorization that expired 1 hour ago
@@ -700,7 +686,7 @@ async fn test_9_expired_oauth_authorization_not_loaded() {
 
 #[tokio::test]
 async fn test_10_non_expired_oauth_authorization_loads() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // Create OAuth authorization that expires in 1 hour (still valid)
@@ -731,7 +717,7 @@ async fn test_10_non_expired_oauth_authorization_loads() {
 
 #[tokio::test]
 async fn test_11_null_expiry_oauth_authorization_loads() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // Create OAuth authorization with NULL expires_at (never expires)
@@ -761,7 +747,7 @@ async fn test_11_null_expiry_oauth_authorization_loads() {
 
 #[tokio::test]
 async fn test_12_revoked_oauth_authorization_not_loaded() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // Create OAuth authorization (not expired)
@@ -872,7 +858,7 @@ async fn create_team_authorization_with_expiry(
 
 #[tokio::test]
 async fn test_13_expired_team_authorization_not_loaded() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // Create team authorization that expired 1 hour ago
@@ -901,7 +887,7 @@ async fn test_13_expired_team_authorization_not_loaded() {
 
 #[tokio::test]
 async fn test_14_non_expired_team_authorization_loads() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // Create team authorization that expires in 1 hour (still valid)
@@ -930,7 +916,7 @@ async fn test_14_non_expired_team_authorization_loads() {
 
 #[tokio::test]
 async fn test_15_null_expiry_team_authorization_loads() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // Create team authorization with NULL expires_at (never expires)
@@ -958,7 +944,7 @@ async fn test_15_null_expiry_team_authorization_loads() {
 
 #[tokio::test]
 async fn test_16_decrypt_only_policy_denies_encrypt_allows_decrypt() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // decrypt_only: can_decrypt=true, can_encrypt=false
@@ -1004,7 +990,7 @@ async fn test_16_decrypt_only_policy_denies_encrypt_allows_decrypt() {
 /// Mirrors test_16 but exercises the `is_oauth=true` path that loads via OAuthAuthorization::find.
 #[tokio::test]
 async fn test_16b_oauth_decrypt_only_policy_denies_encrypt_allows_decrypt() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     let (policy_id, _team_id) =
@@ -1047,7 +1033,7 @@ async fn test_16b_oauth_decrypt_only_policy_denies_encrypt_allows_decrypt() {
 
 #[tokio::test]
 async fn test_17_encrypt_to_self_policy_denies_decrypt_from_others() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // encrypt_to_self requires sender_pubkey == recipient_pubkey
@@ -1084,7 +1070,7 @@ async fn test_17_encrypt_to_self_policy_denies_decrypt_from_others() {
 /// allow the operation. Locks in the `permissions.is_empty() → Ok(())` fallback branch.
 #[tokio::test]
 async fn test_18_no_permissions_allows_encrypt_and_decrypt() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // Policy with zero linked permissions.
@@ -1125,7 +1111,7 @@ async fn test_18_no_permissions_allows_encrypt_and_decrypt() {
 /// containing blocked words denied. This test pins the behavior.
 #[tokio::test]
 async fn test_19_content_filter_blocks_encrypt_of_blocked_plaintext() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     let (policy_id, team_id) = create_policy_with_permissions(
@@ -1178,7 +1164,7 @@ async fn test_19_content_filter_blocks_encrypt_of_blocked_plaintext() {
 /// See divinevideo/keycast#141 for the open question of whether this should fail closed.
 #[tokio::test]
 async fn test_20_oauth_invalid_policy_id_allows_signing() {
-    let pool = setup_test_db().await;
+    let pool = integration_test_db::connect_pool().await;
     let key_manager = FileKeyManager::new().expect("Failed to create key manager");
 
     // OAuth authorizations can reference a non-existent policy_id.
