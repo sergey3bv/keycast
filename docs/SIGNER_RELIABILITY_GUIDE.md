@@ -1,11 +1,13 @@
 # Keycast Signer Daemon Reliability Guide
 
 **Version:** 1.0
-**Last Updated:** 2025-10-18
+**Last Updated:** 2026-05-06
 
 ## Overview
 
 This guide ensures the Keycast signer daemon runs reliably in all environments with automatic restart, monitoring, and alerting.
+
+Today the API and NIP-46 signer run in one **unified** `keycast` process; HTTP probes use `PORT` (default **3000**) on the same server as the REST API. Paths are shared with [DEPLOYMENT.md](DEPLOYMENT.md): **`/livez`** (liveness), **`/healthz/startup`** (startup), **`/healthz/ready`** (readiness, includes DB check).
 
 ---
 
@@ -20,16 +22,18 @@ rm database/.signer.pid
 # 2. Start signer daemon
 cargo run --bin keycast_signer
 
-# 3. Verify it's running
-curl http://localhost:8080/health
+# 3. Verify it's running (liveness)
+curl http://localhost:3000/livez
 ```
 
 ### Verify Daemon is Working
 
 ```bash
-# Check health endpoint
-curl -v http://localhost:8080/health
-# Should return: OK
+# Liveness (cheap; body is plain text "OK")
+curl -v http://localhost:3000/livez
+
+# Readiness (PostgreSQL must respond)
+curl -v http://localhost:3000/healthz/ready
 
 # Check logs for successful startup
 # You should see:
@@ -64,8 +68,8 @@ nohup ./target/release/keycast_signer > /var/log/keycast/signer.log 2>&1 &
 # Check if running
 ps aux | grep keycast_signer
 
-# Check health
-curl http://localhost:8080/health
+# Check liveness
+curl http://localhost:3000/livez
 
 # View logs
 tail -f /var/log/keycast/signer.log
@@ -94,36 +98,36 @@ kill -TERM $(cat database/.signer.pid)
 
 **Start:**
 ```bash
-docker-compose up -d keycast-signer
+docker-compose up -d keycast
 ```
 
 **Monitor:**
 ```bash
 # Check status
-docker-compose ps keycast-signer
+docker-compose ps keycast
 
 # View logs
-docker-compose logs -f keycast-signer
+docker-compose logs -f keycast
 
-# Check health
-docker-compose exec keycast-signer /usr/local/bin/healthcheck.sh signer
+# Check liveness (from host; service maps 3000:3000)
+curl -f http://localhost:3000/livez
 ```
 
 **Restart:**
 ```bash
 # Graceful restart
-docker-compose restart keycast-signer
+docker-compose restart keycast
 
 # Force restart
-docker-compose stop keycast-signer && docker-compose up -d keycast-signer
+docker-compose stop keycast && docker-compose up -d keycast
 ```
 
 **Health Check Details:**
 - Interval: 10 seconds
 - Timeout: 5 seconds
 - Retries: 3 failures before marking unhealthy
-- Start period: 10 seconds (grace period during startup)
-- Test: `curl -f http://localhost:8080/health`
+- Start period: 20 seconds (grace period during startup)
+- Test: `healthcheck.sh unified` (or `curl -f http://localhost:3000/livez` on the host)
 
 ---
 
@@ -166,8 +170,8 @@ sudo systemctl status keycast-signer
 # View logs
 sudo journalctl -u keycast-signer -f
 
-# Check if healthy
-curl http://localhost:8080/health
+# Check if healthy (liveness)
+curl http://localhost:3000/livez
 ```
 
 **Management:**
@@ -242,7 +246,7 @@ sudo supervisorctl restart keycast-signer
 
 **Features:**
 - ✅ Auto-scaling (down to 0, up based on load)
-- ✅ Health checks (startup probe on /health)
+- ✅ Health checks (startup `/healthz/startup`, liveness `/livez`; see `cloudbuild.yaml`)
 - ✅ Automatic rollback on failed deployment
 - ✅ Cloud Logging integration
 - ✅ Litestream for database backup
@@ -278,12 +282,14 @@ gcloud run services describe keycast \
 ```
 
 **Health Check:**
-- Path: `/health`
-- Port: 8080
-- Failure threshold: 30 retries
-- Period: 3 seconds
-- Timeout: 2 seconds
-- Total wait time: 90 seconds (for DB restore + startup)
+- Startup probe path: `/healthz/startup`
+- Liveness probe path: `/livez`
+- Readiness (manual / smoke): `/healthz/ready`
+- Port: `PORT` (default **3000** in Cloud Run and locally)
+- Failure threshold: 30 retries (startup)
+- Period: 3 seconds (startup)
+- Timeout: 2 seconds (startup)
+- Total wait time: ~90 seconds (for DB restore + startup)
 
 ---
 
@@ -291,15 +297,14 @@ gcloud run services describe keycast \
 
 ### Health Check Monitoring
 
-**What the Health Check Tests:**
-- HTTP endpoint is responding (/health returns "OK")
-- HTTP server is running (axum on port 8080)
-- Process is alive and accepting connections
+**What a basic liveness check tests (`GET /livez`):**
+- HTTP server responds with `200` and plain-text `OK` while the process is running
 
-**What It DOESN'T Test (but should be monitored separately):**
+**Use `GET /healthz/ready` when you need readiness** (database reachable within the probe timeout).
+
+**What probes still do not guarantee:**
 - Relay connection status
-- Database connectivity
-- Authorization loading
+- Authorization loading correctness beyond DB connectivity
 - NIP-46 request handling
 
 ### Enhanced Monitoring Script
@@ -310,9 +315,9 @@ Create `/opt/keycast/scripts/check-signer.sh`:
 #!/bin/bash
 set -e
 
-# Check HTTP health endpoint
-if ! curl -sf http://localhost:8080/health > /dev/null; then
-    echo "ERROR: Health endpoint not responding"
+# Check HTTP liveness (see DEPLOYMENT.md for `/healthz/ready`)
+if ! curl -sf http://localhost:3000/livez > /dev/null; then
+    echo "ERROR: Liveness endpoint not responding"
     exit 1
 fi
 
@@ -353,7 +358,7 @@ exit 0
 gcloud monitoring uptime create \
   --display-name="Keycast Signer Health" \
   --resource-type=uptime-url \
-  --monitored-resource=https://your-signer-url/health \
+  --monitored-resource=https://your-signer-url/livez \
   --period=60s \
   --project=openvine-co
 
@@ -375,8 +380,8 @@ gcloud alpha monitoring policies create \
 #### Option 3: External Monitoring (UptimeRobot, Pingdom, etc.)
 
 Configure external service to check:
-- URL: `https://your-domain.com/health` (if publicly accessible)
-- OR: Install agent to check local `http://localhost:8080/health`
+- URL: `https://your-domain.com/livez` (liveness) or `https://your-domain.com/healthz/ready` (readiness / DB)
+- OR: Install agent to check local `http://localhost:3000/livez`
 - Interval: 1-5 minutes
 - Alert on: 2-3 consecutive failures
 
@@ -417,7 +422,7 @@ journalctl -u keycast-signer -f
 **Common startup errors:**
 - `Database error`: Check DATABASE_PATH and migrations
 - `KMS error`: Check GCP credentials and permissions
-- `Port already in use`: Another process on port 8080
+- `Port already in use`: Another process on port 3000 (or whatever `PORT` is set to)
 
 ---
 
@@ -559,11 +564,11 @@ chown root:root keycast_signer
 
 **Firewall rules:**
 - Outbound: Allow wss:// (port 443) to relay.damus.io, nos.lol, relay.nsec.app
-- Inbound: Only allow port 8080 from localhost (health checks)
+- Inbound: Only allow `PORT` (default 3000) from localhost (health checks)
 
 ```bash
 # Example ufw rules
-sudo ufw allow from 127.0.0.1 to any port 8080
+sudo ufw allow from 127.0.0.1 to any port 3000
 sudo ufw allow out 443/tcp
 ```
 
@@ -666,7 +671,7 @@ sudo systemctl restart keycast-signer
 ### Daily
 
 - [ ] Check daemon is running: `systemctl status keycast-signer`
-- [ ] Check health endpoint: `curl http://localhost:8080/health`
+- [ ] Check liveness: `curl http://localhost:3000/livez`
 - [ ] Review error logs: `journalctl -u keycast-signer --since today | grep ERROR`
 
 ### Weekly
@@ -759,7 +764,7 @@ sudo systemctl restart keycast-signer
 ✅ **What's Already Reliable:**
 1. Cloud Run deployment with auto-restart
 2. Docker Compose with restart policy
-3. Health check endpoint exists
+3. Liveness/readiness HTTP probes (`/livez`, `/healthz/ready`, etc.)
 4. Logging infrastructure
 
 ✅ **What We Just Added:**

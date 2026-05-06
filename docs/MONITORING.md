@@ -73,13 +73,19 @@ gcloud error-reporting events list --project=openvine-co
 
 ## Health Checks
 
-### API Health Endpoint
-```bash
-# Production
-curl https://login.divine.video/health
+Probes are split by role (see `docs/DEPLOYMENT.md`). **`/health`** returns JSON for quick smoke checks but does **not** verify PostgreSQL—use **`/healthz/ready`** when you need DB-backed readiness.
 
-# Local
-curl http://localhost:3000/health
+```bash
+# Readiness (returns 200 only if DB is reachable; primary signal for "can serve traffic")
+curl -f https://login.divine.video/healthz/ready
+curl -f http://localhost:3000/healthz/ready
+
+# Liveness (process is up; cheap check for uptime monitors)
+curl -f https://login.divine.video/livez
+curl -f http://localhost:3000/livez
+
+# Legacy JSON status (not a readiness probe)
+curl https://login.divine.video/health
 ```
 
 ### Integration Tests
@@ -106,10 +112,12 @@ gcloud alpha monitoring policies create \
 
 2. **Service Unavailable**
 ```bash
+# Use /livez to detect a dead process without hitting the DB each interval.
+# Use /healthz/ready instead if you want alerts when the instance cannot reach PostgreSQL.
 gcloud alpha monitoring uptime create \
   --display-name="Keycast API Health" \
   --resource-type=uptime-url \
-  --monitored-resource=https://login.divine.video/health \
+  --monitored-resource=https://login.divine.video/livez \
   --period=60s \
   --project=openvine-co
 ```

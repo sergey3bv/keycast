@@ -468,10 +468,16 @@ Cache hits are typically an order of magnitude faster than cache misses.
 The current GCP Cloud Run deployment satisfies these requirements through native configuration. If migrating to another provider or orchestrator, these architectural constraints must be manually replicated.
 
 ### Health Checks & Probes
-The application exposes standard endpoints suitable for Liveness and Readiness probes:
 
-- **Startup/Liveness:** `/health` or `/healthz/startup` (Returns 200 OK)
-- **Readiness:** `/healthz/ready` (Returns 200 OK)
+HTTP listens on `PORT` (default **3000**). Use these paths for orchestrator probes (Cloud Run flags are set in `cloudbuild.yaml`):
+
+| Probe | Path | Purpose |
+|-------|------|---------|
+| Startup | `/healthz/startup` | Returns `200` once the server handles routes; lightweight (no DB check). |
+| Liveness | `/livez` | Returns `200` while the process is running (same path as `--liveness-probe` in Cloud Run). |
+| Readiness | `/healthz/ready` | Returns `200` only when not draining **and** PostgreSQL responds to `SELECT 1` within ~800ms; otherwise `503`. |
+
+**Legacy / smoke:** `GET /health` returns JSON `{"status":"ok","service":"keycast"}`. Do **not** use it as a readiness probe—it does not verify the database.
 
 ### Graceful Shutdown
 The application handles `SIGTERM` and `SIGINT` signals to ensure zero-downtime deployments:
