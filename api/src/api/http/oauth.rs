@@ -2,7 +2,7 @@
 // ABOUTME: Implements authorization code flow that issues bunker URLs for NIP-46 remote signing
 
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     Form, Json,
@@ -3496,11 +3496,16 @@ fn parse_nostrconnect_uri(uri: &str) -> Result<(String, NostrConnectParams), OAu
 /// GET /connect/*nostrconnect
 /// Entry point from nostr-login popup - shows authorization page
 pub async fn connect_get(
-    State(_auth_state): State<super::routes::AuthState>,
-    axum::extract::Path(nostrconnect_uri): axum::extract::Path<String>,
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<super::routes::AuthState>,
+    headers: HeaderMap,
+    Path(nostrconnect_uri): Path<String>,
 ) -> Result<Response, OAuthError> {
     // Parse the nostrconnect:// URI
     let (client_pubkey, params) = parse_nostrconnect_uri(&nostrconnect_uri)?;
+
+    let tenant_id = tenant.0.id;
+    let pool = &auth_state.state.db;
 
     tracing::info!(
         "nostr-login connect request - client: {}..., app: {}, relay: {}",
@@ -3509,8 +3514,61 @@ pub async fn connect_get(
         params.relay
     );
 
-    // TODO: Check if user is logged in via session/UCAN
-    // For now, show a simple auth form
+    let user_pubkey = if let Some(token) = super::auth::extract_ucan_from_cookie(&headers) {
+        crate::ucan_auth::validate_ucan_token(&format!("Bearer {}", token), tenant_id)
+            .await
+            .ok()
+            .map(|(pubkey, _redirect_origin, _bunker_pubkey, _ucan)| pubkey)
+    } else {
+        None
+    };
+
+    let (session_pubkey, clear_cookie, account_email) = if let Some(ref pubkey) = user_pubkey {
+        let user_repo = UserRepository::new(pool.clone());
+        let account_status = user_repo.get_account_status(pubkey, tenant_id).await?;
+
+        match account_status {
+            None => {
+                tracing::warn!(
+                    "UCAN cookie has pubkey {} but user doesn't exist in tenant {}, clearing stale cookie",
+                    pubkey,
+                    tenant_id
+                );
+                (None, true, None)
+            }
+            Some((email, _verified)) => (Some(pubkey.clone()), false, email),
+        }
+    } else {
+        (None, false, None)
+    };
+
+    let session_body_attr = if session_pubkey.is_some() {
+        r#" data-keycast-session="signed-in""#
+    } else {
+        ""
+    };
+
+    let session_strip_html = if let Some(ref pk) = session_pubkey {
+        let identity_label = account_email
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_else(|| {
+                let n = pk.len().min(16);
+                format!("{}…", &pk[..n])
+            });
+        format!(
+            r#"
+        <div class="session_strip">
+            <div class="account-label">Signed in as</div>
+            <div class="account-value">{}</div>
+        </div>
+"#,
+            escape_html(&identity_label)
+        )
+    } else {
+        String::new()
+    };
 
     let app_name = params.name.as_deref().unwrap_or("Unknown App");
     let permissions_raw = params.perms.as_deref().unwrap_or("sign_event");
@@ -3711,6 +3769,23 @@ pub async fn connect_get(
             border-radius: 0.75rem;
             line-height: 1.5;
         }}
+        .session_strip {{
+            border: 1px solid var(--border);
+            border-radius: 0.75rem;
+            padding: 1rem;
+            margin-bottom: 1rem;
+            background: var(--surface);
+        }}
+        .session_strip .account-label {{
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-bottom: 0.35rem;
+        }}
+        .session_strip .account-value {{
+            font-size: 1rem;
+            font-weight: 600;
+            word-break: break-word;
+        }}
         /* Mobile: reduce padding for more working area */
         @media (max-width: 480px) {{
             body {{
@@ -3740,7 +3815,7 @@ pub async fn connect_get(
         }}
     </style>
 </head>
-<body>
+<body{session_body_attr}>
     <div class="container">
         <div class="header">
             <div class="logo">
@@ -3750,7 +3825,7 @@ pub async fn connect_get(
             <h1>Authorize Connection</h1>
             <p class="subtitle">An app wants to connect to your account</p>
         </div>
-
+{session_strip_html}
         <div class="card">
             <div class="app_header">
                 <div class="app_icon" id="app_icon">{app_icon_html}</div>
@@ -3866,9 +3941,21 @@ pub async fn connect_get(
         perms_attr = escape_attr(params.perms.as_deref().unwrap_or("")),
         permissions_raw_js = js_string_literal(&permissions_raw),
         brand = BRAND_NAME,
+        session_body_attr = session_body_attr,
+        session_strip_html = session_strip_html,
     );
 
-    Ok(Html(html).into_response())
+    if clear_cookie {
+        let clear_cookie_header =
+            "keycast_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0";
+        Ok((
+            [(axum::http::header::SET_COOKIE, clear_cookie_header)],
+            Html(html),
+        )
+            .into_response())
+    } else {
+        Ok(Html(html).into_response())
+    }
 }
 
 /// POST /oauth/connect
