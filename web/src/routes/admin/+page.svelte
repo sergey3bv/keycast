@@ -239,6 +239,10 @@
 					<ArrowSquareOut size={16} />
 					Registered OAuth Clients
 				</a>
+				<a href="/support-admin/audit-events" class="header-link">
+					<ArrowSquareOut size={16} />
+					Admin audit log
+				</a>
 				<a href="/support-admin" class="header-link">
 					<ArrowSquareOut size={16} />
 					Support Tools
@@ -374,10 +378,16 @@
 				</div>
 			</div>
 
-			<a href="/admin/registered-clients" class="btn-primary" style="text-decoration: none; display: inline-flex; align-items: center; gap: 0.5rem;">
-				<ArrowSquareOut size={16} />
-				Open Registered Clients
-			</a>
+			<div class="section-actions">
+				<a href="/admin/registered-clients" class="btn-primary" style="text-decoration: none; display: inline-flex; align-items: center; gap: 0.5rem;">
+					<ArrowSquareOut size={16} />
+					Open Registered Clients
+				</a>
+				<a href="/support-admin/audit-events" class="btn-secondary" style="text-decoration: none; display: inline-flex; align-items: center; gap: 0.5rem;">
+					<ArrowSquareOut size={16} />
+					Admin audit log
+				</a>
+			</div>
 		</div>
 
 		<!-- Documentation Section -->
@@ -728,6 +738,31 @@
 	.btn-primary:disabled {
 		opacity: 0.5;
 		cursor: not-allowed;
+	}
+
+	.section-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.75rem;
+		align-items: center;
+	}
+
+	.btn-secondary {
+		padding: 0.75rem 1.5rem;
+		background: transparent;
+		color: var(--color-divine-text);
+		border: 1px solid var(--color-divine-border);
+		border-radius: 9999px;
+		font-size: 0.875rem;
+		font-weight: 600;
+		cursor: pointer;
+		transition: all 0.2s;
+		align-self: flex-start;
+	}
+
+	.btn-secondary:hover {
+		border-color: var(--color-divine-green);
+		color: var(--color-divine-green);
 	}
 
 	/* Documentation styles */

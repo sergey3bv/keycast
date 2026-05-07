@@ -204,6 +204,7 @@ pub fn api_routes(
         )
         .route("/admin/auth-debug", get(admin::get_auth_debug))
         .route("/admin/user-lookup", get(admin::get_user_lookup))
+        .route("/admin/audit-events", get(admin::list_admin_audit_events))
         .route(
             "/admin/support-admins",
             get(admin::list_support_admins).post(admin::add_support_admin),

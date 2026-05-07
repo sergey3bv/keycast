@@ -3,7 +3,7 @@
 
 use axum::extract::{Path, Query, State};
 use axum::Json;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use nostr_sdk::{FromBech32, Keys};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,9 +12,10 @@ use super::routes::AuthState;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::extractors::UcanAuth;
 use keycast_core::repositories::{
-    test_redirect_pattern, AdminAuditEventRecord, AdminAuditEventRepository, AuthEventRepository,
-    ClaimTokenRepository, OAuthAuthorizationRepository, RegisteredClient,
-    RegisteredClientRepository, RepositoryError, UserRepository,
+    test_redirect_pattern, AdminAuditEventListFilters, AdminAuditEventRecord,
+    AdminAuditEventRepository, AdminAuditEventRow, AuthEventRepository, ClaimTokenRepository,
+    OAuthAuthorizationRepository, RegisteredClient, RegisteredClientRepository, RepositoryError,
+    UserRepository,
 };
 use keycast_core::types::claim_token::generate_claim_token;
 
@@ -971,6 +972,99 @@ pub async fn get_user_lookup(
     }
 
     Ok(Json(UserLookupResponse { results, total }))
+}
+
+// ============================================================================
+// GET /api/admin/audit-events — read-only forensic log (support + full admin)
+// ============================================================================
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ListAdminAuditEventsQuery {
+    pub action: Option<String>,
+    pub target_client_id: Option<String>,
+    pub occurred_after: Option<String>,
+    pub occurred_before: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminAuditEventView {
+    pub id: i64,
+    pub occurred_at: String,
+    pub tenant_id: i64,
+    pub actor_pubkey: String,
+    pub action: String,
+    pub target_resource_type: String,
+    pub target_resource_id: Option<String>,
+    pub target_client_id: Option<String>,
+    pub metadata_json: Value,
+}
+
+impl From<AdminAuditEventRow> for AdminAuditEventView {
+    fn from(row: AdminAuditEventRow) -> Self {
+        Self {
+            id: row.id,
+            occurred_at: row.occurred_at.to_rfc3339(),
+            tenant_id: row.tenant_id,
+            actor_pubkey: row.actor_pubkey,
+            action: row.action,
+            target_resource_type: row.target_resource_type,
+            target_resource_id: row.target_resource_id,
+            target_client_id: row.target_client_id,
+            metadata_json: row.metadata_json,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct AdminAuditEventsResponse {
+    pub events: Vec<AdminAuditEventView>,
+}
+
+fn parse_occurred_bound(s: &str, label: &str) -> Result<DateTime<Utc>, ApiError> {
+    DateTime::parse_from_rfc3339(s.trim())
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|_| ApiError::bad_request(format!("Invalid {}: expected RFC3339", label)))
+}
+
+/// List admin audit events for the current tenant with optional filters.
+pub async fn list_admin_audit_events(
+    tenant: crate::api::tenant::TenantExtractor,
+    State(auth_state): State<AuthState>,
+    auth: UcanAuth,
+    Query(query): Query<ListAdminAuditEventsQuery>,
+) -> ApiResult<Json<AdminAuditEventsResponse>> {
+    if !is_support_admin(&auth).await {
+        return Err(ApiError::forbidden("Admin access required"));
+    }
+
+    let tenant_id = tenant.0.id;
+    let occurred_after = match query.occurred_after.as_deref() {
+        None | Some("") => None,
+        Some(s) => Some(parse_occurred_bound(s, "occurred_after")?),
+    };
+    let occurred_before = match query.occurred_before.as_deref() {
+        None | Some("") => None,
+        Some(s) => Some(parse_occurred_bound(s, "occurred_before")?),
+    };
+
+    let filters = AdminAuditEventListFilters {
+        action: query.action,
+        target_client_id: query.target_client_id,
+        occurred_after,
+        occurred_before,
+        limit: query.limit,
+    };
+
+    let repo = AdminAuditEventRepository::new(auth_state.state.db.clone());
+    let rows = repo
+        .list_filtered(tenant_id, filters)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    Ok(Json(AdminAuditEventsResponse {
+        events: rows.into_iter().map(Into::into).collect(),
+    }))
 }
 
 #[derive(Debug, Deserialize)]

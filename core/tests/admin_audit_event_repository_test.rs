@@ -1,4 +1,7 @@
-use keycast_core::repositories::{AdminAuditEventRecord, AdminAuditEventRepository};
+use chrono::{TimeZone, Utc};
+use keycast_core::repositories::{
+    AdminAuditEventListFilters, AdminAuditEventRecord, AdminAuditEventRepository,
+};
 use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -128,4 +131,101 @@ async fn list_recent_returns_newest_first_and_respects_tenant_scope() {
     let b_list = repo.list_recent(tenant_b, 10).await.unwrap();
     assert_eq!(b_list.len(), 1);
     assert_eq!(b_list[0].target_client_id.as_deref(), Some("client-b"));
+}
+
+#[tokio::test]
+async fn list_filtered_by_action_client_and_occurred_range() {
+    let pool = setup_pool().await;
+    let repo = AdminAuditEventRepository::new(pool.clone());
+
+    let tenant_id: i64 = 9_300_000 + (Uuid::new_v4().as_u128() as i64).rem_euclid(1_000_000);
+    let actor = format!("{:0>64}", Uuid::new_v4().simple());
+
+    let t_early = Utc.with_ymd_and_hms(2024, 1, 10, 12, 0, 0).unwrap();
+    let t_mid = Utc.with_ymd_and_hms(2024, 6, 15, 12, 0, 0).unwrap();
+    let t_late = Utc.with_ymd_and_hms(2024, 12, 1, 12, 0, 0).unwrap();
+
+    for (occurred_at, action, client) in [
+        (t_early, "registered_client.create", "client-early"),
+        (t_mid, "registered_client.update", "client-mid"),
+        (t_late, "registered_client.delete", "client-mid"),
+    ] {
+        sqlx::query(
+            r#"INSERT INTO admin_audit_events (
+                occurred_at, tenant_id, actor_pubkey, action,
+                target_resource_type, target_resource_id, target_client_id, metadata_json
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
+        )
+        .bind(occurred_at)
+        .bind(tenant_id)
+        .bind(&actor)
+        .bind(action)
+        .bind("registered_client")
+        .bind::<Option<String>>(None)
+        .bind(client)
+        .bind(json!({}))
+        .execute(&pool)
+        .await
+        .expect("insert audit row");
+    }
+
+    let by_action = repo
+        .list_filtered(
+            tenant_id,
+            AdminAuditEventListFilters {
+                action: Some("registered_client.update".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_action.len(), 1);
+    assert_eq!(by_action[0].action, "registered_client.update");
+
+    let by_client = repo
+        .list_filtered(
+            tenant_id,
+            AdminAuditEventListFilters {
+                target_client_id: Some("client-mid".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_client.len(), 2);
+    assert!(by_client
+        .iter()
+        .all(|r| r.target_client_id.as_deref() == Some("client-mid")));
+
+    let t_window_start = Utc.with_ymd_and_hms(2024, 6, 14, 0, 0, 0).unwrap();
+    let t_window_end = Utc.with_ymd_and_hms(2024, 6, 16, 23, 59, 59).unwrap();
+
+    let by_window = repo
+        .list_filtered(
+            tenant_id,
+            AdminAuditEventListFilters {
+                occurred_after: Some(t_window_start),
+                occurred_before: Some(t_window_end),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_window.len(), 1);
+    assert_eq!(by_window[0].action, "registered_client.update");
+
+    let combined = repo
+        .list_filtered(
+            tenant_id,
+            AdminAuditEventListFilters {
+                action: Some("registered_client.delete".to_string()),
+                target_client_id: Some("client-mid".to_string()),
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(combined.len(), 1);
+    assert_eq!(combined[0].action, "registered_client.delete");
 }

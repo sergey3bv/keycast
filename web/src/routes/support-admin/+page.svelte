@@ -5,7 +5,7 @@
 	import { goto } from '$app/navigation';
 	import Loader from '$lib/components/Loader.svelte';
 	import InvalidateClaimTokenModal from '$lib/components/InvalidateClaimTokenModal.svelte';
-	import { ShieldCheck, Warning, MagnifyingGlass, User, Key, Calendar, Globe, Copy, Check, CheckCircle, XCircle, Link, CaretDown, CaretRight } from 'phosphor-svelte';
+	import { ShieldCheck, Warning, MagnifyingGlass, User, Key, Calendar, Globe, Copy, Check, CheckCircle, XCircle, Link, CaretDown, CaretRight, List } from 'phosphor-svelte';
 	import { nip19 } from 'nostr-tools';
 	import { toast } from 'svelte-hot-french-toast';
 
@@ -244,6 +244,10 @@
 				<span class="admin-label">Support Admin</span>
 				<span class="admin-badge">{adminRole === 'full' ? 'Full Admin' : 'Support'}</span>
 			</div>
+			<a href="/support-admin/audit-events" class="audit-nav-link">
+				<List size={18} weight="duotone" />
+				Audit log
+			</a>
 		</div>
 
 		<div class="tools-section">
@@ -540,6 +544,25 @@
 		border-radius: 9999px;
 		background: color-mix(in srgb, var(--color-divine-purple, #8b5cf6) 20%, transparent);
 		color: var(--color-divine-purple, #8b5cf6);
+	}
+
+	.audit-nav-link {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+		font-size: 0.9rem;
+		font-weight: 500;
+		color: var(--color-divine-green, #22c55e);
+		text-decoration: none;
+		padding: 0.4rem 0.75rem;
+		border-radius: 8px;
+		border: 1px solid var(--color-divine-border);
+		transition: background 0.15s, border-color 0.15s;
+	}
+
+	.audit-nav-link:hover {
+		background: color-mix(in srgb, var(--color-divine-green, #22c55e) 12%, transparent);
+		border-color: color-mix(in srgb, var(--color-divine-green, #22c55e) 35%, var(--color-divine-border));
 	}
 
 	.tools-section {
