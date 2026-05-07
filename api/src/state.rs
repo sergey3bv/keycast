@@ -1,5 +1,6 @@
 use crate::api::tenant::Tenant;
 use crate::bcrypt_queue::BcryptSender;
+use crate::email_service::EmailSender;
 use crate::handlers::http_rpc_handler::HttpHandlerCache;
 use crate::redis::PrefixedRedis;
 use keycast_core::encryption::KeyManager;
@@ -46,6 +47,8 @@ pub struct KeycastState {
     /// Pre-computed secret pool for instant authorization creation
     /// Background producer generates (secret, bcrypt_hash) pairs ahead of time
     pub secret_pool: SecretPoolReceiver,
+    /// Shared email sender (SendGrid in production, dev logger in development)
+    pub email_sender: Arc<dyn EmailSender>,
 }
 
 pub static KEYCAST_STATE: OnceCell<Arc<KeycastState>> = OnceCell::new();

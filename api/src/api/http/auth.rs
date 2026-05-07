@@ -905,24 +905,15 @@ pub async fn register(
     METRICS.inc_registration();
 
     // Send verification email (required - user must verify before login)
-    match crate::email_service::EmailService::new() {
-        Ok(email_service) => {
-            if let Err(e) = email_service
-                .send_verification_email(&req.email, &verification_token)
-                .await
-            {
-                tracing::error!("Failed to send verification email to {}: {}", req.email, e);
-                // Continue even if email fails - user can resend later
-            } else {
-                tracing::info!("Sent verification email to {}", req.email);
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Email service unavailable, skipping verification email: {}",
-                e
-            );
-        }
+    let email_sender = auth_state.state.email_sender.clone();
+    if let Err(e) = email_sender
+        .send_verification_email(&req.email, &verification_token)
+        .await
+    {
+        tracing::error!("Failed to send verification email to {}: {}", req.email, e);
+        // Continue even if email fails - user can resend later
+    } else {
+        tracing::info!("Sent verification email to {}", req.email);
     }
 
     tracing::info!(
@@ -1875,10 +1866,11 @@ pub struct ResendVerificationResponse {
 /// Always returns success to prevent email enumeration attacks.
 pub async fn resend_verification(
     tenant: crate::api::tenant::TenantExtractor,
-    State(pool): State<PgPool>,
+    State(auth_state): State<super::routes::AuthState>,
     headers: HeaderMap,
     Json(mut req): Json<ResendVerificationRequest>,
 ) -> Json<ResendVerificationResponse> {
+    let pool = auth_state.state.db.clone();
     let tenant_id = tenant.0.id;
     if let Some(ref mut email) = req.email {
         *email = email.to_lowercase();
@@ -1966,27 +1958,21 @@ pub async fn resend_verification(
     }
 
     // Send verification email (don't await to prevent timing attacks)
+    let email_sender = auth_state.state.email_sender.clone();
     let email_clone = email.clone();
     let token_clone = verification_token.clone();
     tokio::spawn(async move {
-        match crate::email_service::EmailService::new() {
-            Ok(email_service) => {
-                if let Err(e) = email_service
-                    .send_verification_email(&email_clone, &token_clone)
-                    .await
-                {
-                    tracing::error!(
-                        "Failed to send verification email to {}: {}",
-                        email_clone,
-                        e
-                    );
-                } else {
-                    tracing::info!("Sent verification email to {}", email_clone);
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Email service unavailable: {}", e);
-            }
+        if let Err(e) = email_sender
+            .send_verification_email(&email_clone, &token_clone)
+            .await
+        {
+            tracing::error!(
+                "Failed to send verification email to {}: {}",
+                email_clone,
+                e
+            );
+        } else {
+            tracing::info!("Sent verification email to {}", email_clone);
         }
     });
 
@@ -1996,10 +1982,11 @@ pub async fn resend_verification(
 /// Request password reset email
 pub async fn forgot_password(
     tenant: crate::api::tenant::TenantExtractor,
-    State(pool): State<PgPool>,
+    State(auth_state): State<super::routes::AuthState>,
     headers: HeaderMap,
     Json(mut req): Json<ForgotPasswordRequest>,
 ) -> Result<Json<ForgotPasswordResponse>, AuthError> {
+    let pool = auth_state.state.db.clone();
     let tenant_id = tenant.0.id;
     let endpoint = "/api/auth/forgot-password";
     req.email = req.email.to_lowercase();
@@ -2062,32 +2049,20 @@ pub async fn forgot_password(
         .set_password_reset_token(&public_key, tenant_id, &reset_token, reset_expires)
         .await?;
 
-    // Send password reset email (optional - don't fail if email service unavailable)
-    match crate::email_service::EmailService::new() {
-        Ok(email_service) => {
-            if let Err(e) = email_service
-                .send_password_reset_email(&req.email, &reset_token)
-                .await
-            {
-                METRICS.inc_auth_email_send_failure("password_reset");
-                reason_code = Some("email_send_failed");
-                tracing::error!(
-                    "Failed to send password reset email to {}: {}",
-                    req.email,
-                    e
-                );
-            } else {
-                tracing::info!("Sent password reset email to {}", req.email);
-            }
-        }
-        Err(e) => {
-            METRICS.inc_auth_email_send_failure("password_reset");
-            reason_code = Some("email_send_failed");
-            tracing::warn!(
-                "Email service unavailable, skipping password reset email: {}",
-                e
-            );
-        }
+    let email_sender = auth_state.state.email_sender.clone();
+    if let Err(e) = email_sender
+        .send_password_reset_email(&req.email, &reset_token)
+        .await
+    {
+        METRICS.inc_auth_email_send_failure("password_reset");
+        reason_code = Some("email_send_failed");
+        tracing::error!(
+            "Failed to send password reset email to {}: {}",
+            req.email,
+            e
+        );
+    } else {
+        tracing::info!("Sent password reset email to {}", req.email);
     }
 
     super::auth_observability::record_auth_event_and_log(
@@ -2120,10 +2095,11 @@ pub async fn forgot_password(
 /// Reset password with token
 pub async fn reset_password(
     tenant: crate::api::tenant::TenantExtractor,
-    State(pool): State<PgPool>,
+    State(auth_state): State<super::routes::AuthState>,
     headers: HeaderMap,
     Json(req): Json<ResetPasswordRequest>,
 ) -> Result<Json<ResetPasswordResponse>, AuthError> {
+    let pool = auth_state.state.db.clone();
     let tenant_id = tenant.0.id;
     let endpoint = "/api/auth/reset-password";
     tracing::info!(
@@ -3830,6 +3806,7 @@ mod tests {
                 bcrypt_sender: bcrypt_queue.sender(),
                 redis: None,
                 secret_pool: secret_pool.receiver(),
+                email_sender: std::sync::Arc::new(crate::email_service::DevEmailSender::new()),
             }),
             auth_tx: None,
         }
@@ -3935,6 +3912,7 @@ mod tests {
                 bcrypt_sender: bcrypt_queue.sender(),
                 redis: None,
                 secret_pool: secret_pool.receiver(),
+                email_sender: std::sync::Arc::new(crate::email_service::DevEmailSender::new()),
             }),
             auth_tx: None,
         }

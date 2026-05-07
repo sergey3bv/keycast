@@ -647,17 +647,11 @@ pub async fn batch_create_claim_tokens(
     let user_repo = UserRepository::new(pool.clone());
     let claim_token_repo = ClaimTokenRepository::new(pool.clone());
 
-    // Create email service once outside the loop
-    let email_service =
-        req.delivery_email
-            .as_ref()
-            .and_then(|_| match crate::email_service::EmailService::new() {
-                Ok(svc) => Some(svc),
-                Err(e) => {
-                    tracing::error!("Failed to create email service: {}", e);
-                    None
-                }
-            });
+    // Create email sender reference when batch delivery is requested
+    let email_sender_for_delivery = req
+        .delivery_email
+        .as_ref()
+        .map(|_| auth_state.state.email_sender.clone());
 
     let mut tokens = Vec::new();
     let mut skipped = Vec::new();
@@ -740,8 +734,10 @@ pub async fn batch_create_claim_tokens(
         let claim_url = format!("{}/api/claim?token={}", app_url, token);
 
         // Send email if requested
-        if let (Some(email), Some(svc)) = (&req.delivery_email, &email_service) {
-            if let Err(e) = svc.send_claim_email(email, &claim_url).await {
+        if let (Some(email), Some(sender)) =
+            (&req.delivery_email, email_sender_for_delivery.as_ref())
+        {
+            if let Err(e) = sender.send_claim_email(email, &claim_url).await {
                 tracing::warn!(
                     "Failed to send claim email for vine_id={} to {}: {}",
                     vine_id,
@@ -750,8 +746,6 @@ pub async fn batch_create_claim_tokens(
                 );
                 errors.push(format!("vine_id {}: email delivery failed: {}", vine_id, e));
             }
-        } else if req.delivery_email.is_some() && email_service.is_none() {
-            errors.push(format!("vine_id {}: email service unavailable", vine_id));
         }
 
         tokens.push(BatchClaimTokenEntry {

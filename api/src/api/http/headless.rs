@@ -209,24 +209,15 @@ pub async fn headless_register(
         .await?;
 
     // Send verification email
-    match crate::email_service::EmailService::new() {
-        Ok(email_service) => {
-            if let Err(e) = email_service
-                .send_verification_email(&req.email, &verification_token)
-                .await
-            {
-                tracing::error!("Failed to send verification email to {}: {}", req.email, e);
-                // Continue - user can request resend later
-            } else {
-                tracing::info!("Sent verification email to {}", req.email);
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Email service unavailable, skipping verification email: {}",
-                e
-            );
-        }
+    let email_sender = auth_state.state.email_sender.clone();
+    if let Err(e) = email_sender
+        .send_verification_email(&req.email, &verification_token)
+        .await
+    {
+        tracing::error!("Failed to send verification email to {}: {}", req.email, e);
+        // Continue - user can request resend later
+    } else {
+        tracing::info!("Sent verification email to {}", req.email);
     }
 
     // Track successful registration
@@ -757,6 +748,7 @@ mod tests {
                 bcrypt_sender: bcrypt_queue.sender(),
                 redis: None,
                 secret_pool: secret_pool.receiver(),
+                email_sender: std::sync::Arc::new(crate::email_service::DevEmailSender::new()),
             }),
             auth_tx: None,
         }

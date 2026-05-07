@@ -83,6 +83,7 @@ fn make_auth_state(pool: PgPool) -> AuthState {
             bcrypt_sender: bcrypt_queue.sender(),
             redis: None,
             secret_pool: secret_pool.receiver(),
+            email_sender: Arc::new(keycast_api::email_service::DevEmailSender::new()),
         }),
         auth_tx: None,
     }

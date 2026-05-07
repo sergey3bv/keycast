@@ -10,18 +10,29 @@ use axum::{
 };
 use bcrypt::{hash, verify};
 use chrono::{Duration, Utc};
-use keycast_api::api::{
-    http::{
-        auth::{forgot_password, reset_password, ForgotPasswordRequest, ResetPasswordRequest},
-        auth_observability::request_id_middleware,
+use keycast_api::{
+    api::{
+        http::{
+            auth::{forgot_password, reset_password, ForgotPasswordRequest, ResetPasswordRequest},
+            auth_observability::request_id_middleware,
+        },
+        tenant::{Tenant, TenantExtractor},
     },
-    tenant::{Tenant, TenantExtractor},
+    bcrypt_queue::BcryptQueue,
+    handlers::http_rpc_handler::new_http_handler_cache,
+    state::KeycastState,
 };
+use keycast_core::{
+    encryption::{KeyManager, KeyManagerError},
+    secret_pool::SecretPool,
+};
+use moka::future::Cache;
 use nostr_sdk::Keys;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 mod common;
 
@@ -52,6 +63,45 @@ fn create_test_tenant() -> TenantExtractor {
     }))
 }
 
+struct TestKeyManager;
+
+#[async_trait::async_trait]
+impl KeyManager for TestKeyManager {
+    async fn encrypt(&self, plaintext_bytes: &[u8]) -> Result<Vec<u8>, KeyManagerError> {
+        Ok(plaintext_bytes.to_vec())
+    }
+
+    async fn decrypt(
+        &self,
+        ciphertext_bytes: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>, KeyManagerError> {
+        Ok(Zeroizing::new(ciphertext_bytes.to_vec()))
+    }
+}
+
+fn create_test_auth_state(pool: PgPool) -> keycast_api::api::http::routes::AuthState {
+    let bcrypt_queue = BcryptQueue::new();
+    let secret_pool = SecretPool::new(1);
+    let tenant_cache = Cache::builder().max_capacity(10).build();
+    let key_manager: Arc<Box<dyn KeyManager>> = Arc::new(Box::new(TestKeyManager));
+
+    keycast_api::api::http::routes::AuthState {
+        state: Arc::new(KeycastState {
+            db: pool,
+            key_manager,
+            signer_handlers: None,
+            http_handler_cache: new_http_handler_cache(),
+            server_keys: Keys::generate(),
+            tenant_cache,
+            bcrypt_sender: bcrypt_queue.sender(),
+            redis: None,
+            secret_pool: secret_pool.receiver(),
+            email_sender: Arc::new(keycast_api::email_service::DevEmailSender::new()),
+        }),
+        auth_tx: None,
+    }
+}
+
 async fn cleanup_by_email(pool: &PgPool, email: &str) {
     let _ = sqlx::query("DELETE FROM auth_events WHERE email = $1")
         .bind(email)
@@ -72,16 +122,21 @@ async fn test_forgot_password_records_accepted_event_for_missing_email() {
     cleanup_by_email(&pool, &email).await;
 
     let app = {
-        let pool = pool.clone();
+        let auth_state = create_test_auth_state(pool.clone());
         Router::new()
             .route(
                 "/auth/forgot-password",
                 post(
                     move |headers: HeaderMap, Json(req): Json<ForgotPasswordRequest>| {
-                        let pool = pool.clone();
+                        let auth_state = auth_state.clone();
                         async move {
-                            forgot_password(create_test_tenant(), State(pool), headers, Json(req))
-                                .await
+                            forgot_password(
+                                create_test_tenant(),
+                                State(auth_state),
+                                headers,
+                                Json(req),
+                            )
+                            .await
                         }
                     },
                 ),
@@ -162,16 +217,21 @@ async fn test_reset_password_records_success_event_and_updates_hash() {
     .expect("Should create resettable user");
 
     let app = {
-        let pool = pool.clone();
+        let auth_state = create_test_auth_state(pool.clone());
         Router::new()
             .route(
                 "/auth/reset-password",
                 post(
                     move |headers: HeaderMap, Json(req): Json<ResetPasswordRequest>| {
-                        let pool = pool.clone();
+                        let auth_state = auth_state.clone();
                         async move {
-                            reset_password(create_test_tenant(), State(pool), headers, Json(req))
-                                .await
+                            reset_password(
+                                create_test_tenant(),
+                                State(auth_state),
+                                headers,
+                                Json(req),
+                            )
+                            .await
                         }
                     },
                 ),

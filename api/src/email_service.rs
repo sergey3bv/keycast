@@ -521,44 +521,6 @@ pub fn create_email_sender() -> Result<Arc<dyn EmailSender>, String> {
     Ok(Arc::new(DevEmailSender::new()))
 }
 
-/// Legacy EmailService for backward compatibility during migration
-/// TODO: Remove once all usages are migrated to the trait
-pub struct EmailService {
-    inner: Arc<dyn EmailSender>,
-}
-
-impl EmailService {
-    pub fn new() -> Result<Self, String> {
-        Ok(Self {
-            inner: create_email_sender()?,
-        })
-    }
-
-    pub async fn send_verification_email(
-        &self,
-        to_email: &str,
-        verification_token: &str,
-    ) -> Result<(), String> {
-        self.inner
-            .send_verification_email(to_email, verification_token)
-            .await
-    }
-
-    pub async fn send_password_reset_email(
-        &self,
-        to_email: &str,
-        reset_token: &str,
-    ) -> Result<(), String> {
-        self.inner
-            .send_password_reset_email(to_email, reset_token)
-            .await
-    }
-
-    pub async fn send_claim_email(&self, to_email: &str, claim_url: &str) -> Result<(), String> {
-        self.inner.send_claim_email(to_email, claim_url).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

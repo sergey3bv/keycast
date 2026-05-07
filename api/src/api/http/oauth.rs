@@ -2599,27 +2599,18 @@ async fn handle_authorization_code_grant(
         );
 
         // Send verification email (optional - don't fail if email service unavailable)
-        match crate::email_service::EmailService::new() {
-            Ok(email_service) => {
-                if let Err(e) = email_service
-                    .send_verification_email(pending_email_val, &verification_token)
-                    .await
-                {
-                    tracing::error!(
-                        "Failed to send verification email to {}: {}",
-                        pending_email_val,
-                        e
-                    );
-                } else {
-                    tracing::info!("Sent verification email to {}", pending_email_val);
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Email service unavailable, skipping verification email: {}",
-                    e
-                );
-            }
+        let email_sender = auth_state.state.email_sender.clone();
+        if let Err(e) = email_sender
+            .send_verification_email(pending_email_val, &verification_token)
+            .await
+        {
+            tracing::error!(
+                "Failed to send verification email to {}: {}",
+                pending_email_val,
+                e
+            );
+        } else {
+            tracing::info!("Sent verification email to {}", pending_email_val);
         }
 
         pending_email_val.clone()
@@ -3357,24 +3348,15 @@ pub async fn oauth_register(
     );
 
     // Send verification email (required - user must verify before OAuth flow completes)
-    match crate::email_service::EmailService::new() {
-        Ok(email_service) => {
-            if let Err(e) = email_service
-                .send_verification_email(&req.email, &verification_token)
-                .await
-            {
-                tracing::error!("Failed to send verification email to {}: {}", req.email, e);
-                // Continue even if email fails - user can resend later
-            } else {
-                tracing::info!("Sent verification email to {}", req.email);
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                "Email service unavailable, skipping verification email: {}",
-                e
-            );
-        }
+    let email_sender = auth_state.state.email_sender.clone();
+    if let Err(e) = email_sender
+        .send_verification_email(&req.email, &verification_token)
+        .await
+    {
+        tracing::error!("Failed to send verification email to {}: {}", req.email, e);
+        // Continue even if email fails - user can resend later
+    } else {
+        tracing::info!("Sent verification email to {}", req.email);
     }
 
     // DO NOT issue UCAN or set session cookie - user must verify email first
@@ -4169,6 +4151,7 @@ mod tests {
                 bcrypt_sender: bcrypt_queue.sender(),
                 redis: None,
                 secret_pool: secret_pool.receiver(),
+                email_sender: std::sync::Arc::new(crate::email_service::DevEmailSender::new()),
             }),
             auth_tx: None,
         }

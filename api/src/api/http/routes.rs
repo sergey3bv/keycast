@@ -61,7 +61,7 @@ pub fn api_routes(
         .route("/auth/forgot-password", post(auth::forgot_password))
         .route("/auth/reset-password", post(auth::reset_password))
         .route("/auth/resend-verification", post(auth::resend_verification))
-        .with_state(pool.clone());
+        .with_state(auth_state.clone());
 
     // OAuth routes (no authentication required for initial authorize request)
     // Public CORS - third parties use authorization_code grant (never see passwords)

@@ -715,6 +715,10 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
     let _secret_pool_producer = secret_pool.spawn_producer();
     tracing::info!("✔︎ Secret pool initialized (capacity: 100, bcrypt cost: 10)");
 
+    let email_sender = keycast_api::email_service::create_email_sender()
+        .map_err(|e| format!("Email configuration: {}", e))?;
+    tracing::info!("✔︎ Email sender initialized");
+
     // Create API state with http_handler_cache for on-demand loading
     // Note: api no longer depends on signer's handler cache (decoupled)
     let api_state = Arc::new(keycast_api::state::KeycastState {
@@ -727,6 +731,7 @@ async fn async_main(worker_threads: usize) -> Result<(), Box<dyn std::error::Err
         bcrypt_sender,
         redis: Some(prefixed_redis),
         secret_pool: secret_pool_receiver,
+        email_sender,
     });
 
     // Set global state for routes that use it
