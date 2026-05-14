@@ -23,7 +23,10 @@ use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 
 // Import constants and helpers from auth module
-use super::auth::{generate_secure_token, token_expiry_seconds, EMAIL_VERIFICATION_EXPIRY_HOURS};
+use super::auth::{
+    generate_secure_token, normalize_registration_email, token_expiry_seconds,
+    EMAIL_VERIFICATION_EXPIRY_HOURS, INVALID_EMAIL_CODE, INVALID_EMAIL_MESSAGE,
+};
 use super::html_safety::{escape_attr, escape_html, js_string_literal};
 use crate::brand::BRAND_NAME;
 
@@ -47,6 +50,32 @@ pub fn extract_nsec_from_verifier_public(verifier: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn password_visibility_toggle_html(field_id: &str) -> String {
+    format!(
+        r#"<button type="button" class="password_toggle" data-password-target="{}" aria-label="Show password" title="Show password" onclick="togglePasswordVisibility(this)">Show</button>"#,
+        escape_attr(field_id)
+    )
+}
+
+#[cfg(test)]
+fn password_visibility_controls_html(field_ids: &[&str]) -> String {
+    let buttons = field_ids
+        .iter()
+        .map(|field_id| password_visibility_toggle_html(field_id))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        r#"{buttons}
+<script>
+function togglePasswordVisibility(button) {{
+    const input = document.getElementById(button.dataset.passwordTarget);
+    if (!input) return;
+}}
+</script>"#
+    )
 }
 
 /// Extract origin (scheme + host + optional port) from a redirect_uri
@@ -310,6 +339,7 @@ pub struct TokenResponse {
 #[derive(Debug)]
 pub enum OAuthError {
     Unauthorized,
+    InvalidEmail,
     InvalidRequest(String),
     InvalidGrant(String), // RFC 6749 - for invalid/expired refresh tokens or auth codes
     Database(sqlx::Error),
@@ -325,6 +355,16 @@ impl IntoResponse for OAuthError {
                 "Invalid email or password. Please check your credentials and try again."
                     .to_string(),
             ),
+            OAuthError::InvalidEmail => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": INVALID_EMAIL_MESSAGE,
+                        "code": INVALID_EMAIL_CODE,
+                    })),
+                )
+                    .into_response();
+            }
             OAuthError::InvalidRequest(msg) => {
                 (StatusCode::BAD_REQUEST, format!("Invalid request: {}", msg))
             }
@@ -1649,6 +1689,29 @@ pub async fn authorize_get(
             color: var(--text-secondary);
             opacity: 0.6;
         }}
+        .password_input {{
+            position: relative;
+        }}
+        .password_input input {{
+            padding-right: 5.5rem;
+        }}
+        .password_toggle {{
+            position: absolute;
+            right: 0.5rem;
+            top: 50%;
+            transform: translateY(-50%);
+            padding: 0.375rem 0.625rem;
+            border: 1px solid var(--border);
+            border-radius: 9999px;
+            background: transparent;
+            color: var(--divine-green);
+            font-size: 0.75rem;
+            font-weight: 600;
+            cursor: pointer;
+        }}
+        .password_toggle:hover {{
+            background: rgba(39, 197, 139, 0.08);
+        }}
         .btn_primary {{
             width: 100%;
             padding: 0.75rem 1.5rem;
@@ -1844,7 +1907,10 @@ pub async fn authorize_get(
                     </div>
                     <div class="form_group">
                         <label for="login_password">Password</label>
-                        <input type="password" id="login_password" placeholder="Enter your password" autocomplete="current-password" required>
+                        <div class="password_input">
+                            <input type="password" id="login_password" placeholder="Enter your password" autocomplete="current-password" required>
+                            {login_password_toggle}
+                        </div>
                     </div>
                     <button type="submit" class="btn_primary">Sign in</button>
                 </form>
@@ -1864,11 +1930,17 @@ pub async fn authorize_get(
                     </div>
                     <div class="form_group">
                         <label for="register_password">Password</label>
-                        <input type="password" id="register_password" placeholder="Create a password" autocomplete="new-password" required minlength="8">
+                        <div class="password_input">
+                            <input type="password" id="register_password" placeholder="Create a password" autocomplete="new-password" required minlength="8">
+                            {register_password_toggle}
+                        </div>
                     </div>
                     <div class="form_group">
                         <label for="register_password-confirm">Confirm Password</label>
-                        <input type="password" id="register_password-confirm" placeholder="Confirm your password" autocomplete="new-password" required minlength="8">
+                        <div class="password_input">
+                            <input type="password" id="register_password-confirm" placeholder="Confirm your password" autocomplete="new-password" required minlength="8">
+                            {register_confirmation_toggle}
+                        </div>
                     </div>
                     <div class="advanced_section" id="advanced_section">
                         <a class="advanced_toggle" onclick="toggleAdvanced()">
@@ -1878,7 +1950,10 @@ pub async fn authorize_get(
                         <div id="advanced_content" class="advanced_content">
                             <div class="form_group" style="margin-bottom: 0;">
                                 <label for="register_nsec">Nostr Secret Key</label>
-                                <input type="password" id="register_nsec" placeholder="nsec1... or hex format" autocomplete="off">
+                                <div class="password_input">
+                                    <input type="password" id="register_nsec" placeholder="nsec1... or hex format" autocomplete="off">
+                                    {register_nsec_toggle}
+                                </div>
                                 <p class="help_text">
                                     Optional: Import your existing Nostr identity. Leave empty to create a new one.
                                 </p>
@@ -1955,6 +2030,18 @@ pub async fn authorize_get(
 
         function hideError() {{
             document.getElementById('error').style.display = 'none';
+        }}
+
+        function togglePasswordVisibility(button) {{
+            const input = document.getElementById(button.dataset.passwordTarget);
+            if (!input) return;
+
+            const showing = input.type === 'text';
+            input.type = showing ? 'password' : 'text';
+            const label = showing ? 'Show password' : 'Hide password';
+            button.textContent = showing ? 'Show' : 'Hide';
+            button.setAttribute('aria-label', label);
+            button.setAttribute('title', label);
         }}
 
         function showVerificationNotice(email, deviceCode) {{
@@ -2176,6 +2263,11 @@ pub async fn authorize_get(
             code_challenge_js = js_string_literal(&params.code_challenge.as_deref().unwrap_or("")),
             code_challenge_method_js =
                 js_string_literal(&params.code_challenge_method.as_deref().unwrap_or("")),
+            login_password_toggle = password_visibility_toggle_html("login_password"),
+            register_password_toggle = password_visibility_toggle_html("register_password"),
+            register_confirmation_toggle =
+                password_visibility_toggle_html("register_password-confirm"),
+            register_nsec_toggle = password_visibility_toggle_html("register_nsec"),
             brand = BRAND_NAME,
         )
     };
@@ -3182,7 +3274,7 @@ pub async fn oauth_register(
     let pool = &auth_state.state.db;
     let tenant_id = tenant.0.id;
 
-    req.email = req.email.to_lowercase();
+    req.email = normalize_registration_email(&req.email).map_err(|_| OAuthError::InvalidEmail)?;
 
     tracing::info!(
         "OAuth popup registration for email: {} in tenant: {}, nsec: {}, pubkey: {}, client_id: {}",
@@ -4113,6 +4205,124 @@ pub async fn poll(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct LazyTestKeyManager;
+
+    #[async_trait::async_trait]
+    impl keycast_core::encryption::KeyManager for LazyTestKeyManager {
+        async fn encrypt(
+            &self,
+            plaintext_bytes: &[u8],
+        ) -> Result<Vec<u8>, keycast_core::encryption::KeyManagerError> {
+            Ok(plaintext_bytes.to_vec())
+        }
+
+        async fn decrypt(
+            &self,
+            ciphertext_bytes: &[u8],
+        ) -> Result<zeroize::Zeroizing<Vec<u8>>, keycast_core::encryption::KeyManagerError>
+        {
+            Ok(zeroize::Zeroizing::new(ciphertext_bytes.to_vec()))
+        }
+    }
+
+    fn create_lazy_auth_state() -> crate::api::http::routes::AuthState {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:password@localhost/keycast_test")
+            .expect("lazy pool should be created");
+        let bcrypt_queue = crate::bcrypt_queue::BcryptQueue::new();
+        let secret_pool = keycast_core::secret_pool::SecretPool::new(1);
+        let tenant_cache = moka::future::Cache::builder().max_capacity(10).build();
+        let key_manager: std::sync::Arc<Box<dyn keycast_core::encryption::KeyManager>> =
+            std::sync::Arc::new(Box::new(LazyTestKeyManager));
+
+        crate::api::http::routes::AuthState {
+            state: std::sync::Arc::new(crate::state::KeycastState {
+                db: pool,
+                key_manager,
+                signer_handlers: None,
+                http_handler_cache: crate::handlers::http_rpc_handler::new_http_handler_cache(),
+                server_keys: Keys::generate(),
+                tenant_cache,
+                bcrypt_sender: bcrypt_queue.sender(),
+                redis: None,
+                secret_pool: secret_pool.receiver(),
+            }),
+            auth_tx: None,
+        }
+    }
+
+    fn create_unit_test_tenant() -> crate::api::tenant::TenantExtractor {
+        crate::api::tenant::TenantExtractor(std::sync::Arc::new(crate::api::tenant::Tenant {
+            id: 1,
+            domain: "example.test".to_string(),
+            name: "Test Tenant".to_string(),
+            settings: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }))
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        serde_json::from_slice(&body).expect("response body should be JSON")
+    }
+
+    #[tokio::test]
+    async fn test_oauth_register_rejects_malformed_email_with_stable_error() {
+        let response = match oauth_register(
+            create_unit_test_tenant(),
+            axum::extract::State(create_lazy_auth_state()),
+            axum::Json(OAuthRegisterRequest {
+                email: "person@-example.com".to_string(),
+                password: "testpassword123".to_string(),
+                client_id: "TestClient".to_string(),
+                redirect_uri: "https://client.example/callback".to_string(),
+                scope: None,
+                code_challenge: None,
+                code_challenge_method: None,
+                pubkey: None,
+                nsec: None,
+                relays: None,
+                state: None,
+            }),
+        )
+        .await
+        {
+            Ok(response) => axum::response::IntoResponse::into_response(response),
+            Err(error) => axum::response::IntoResponse::into_response(error),
+        };
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["code"], crate::api::http::auth::INVALID_EMAIL_CODE);
+        assert_eq!(body["error"], crate::api::http::auth::INVALID_EMAIL_MESSAGE);
+    }
+
+    #[test]
+    fn password_visibility_controls_target_oauth_login_and_registration_fields() {
+        let markup = password_visibility_controls_html(&[
+            "login_password",
+            "register_password",
+            "register_password-confirm",
+            "register_nsec",
+        ]);
+
+        for field_id in [
+            "login_password",
+            "register_password",
+            "register_password-confirm",
+            "register_nsec",
+        ] {
+            assert!(markup.contains(&format!("data-password-target=\"{}\"", field_id)));
+        }
+
+        assert!(markup.contains("aria-label=\"Show password\""));
+        assert!(markup.contains("type=\"button\""));
+        assert!(markup.contains("function togglePasswordVisibility"));
+    }
 
     #[test]
     fn test_extract_origin_https() {

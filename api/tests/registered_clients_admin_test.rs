@@ -237,9 +237,9 @@ async fn update_renames_and_replaces_uris() {
         .await
         .unwrap();
 
-    assert_eq!(updated.name, "Renamed");
-    assert_eq!(updated.allowed_redirect_uris.len(), 2);
-    assert!(updated.updated_at >= created.updated_at);
+    assert_eq!(updated.after.name, "Renamed");
+    assert_eq!(updated.after.allowed_redirect_uris.len(), 2);
+    assert!(updated.after.updated_at >= created.updated_at);
 }
 
 #[tokio::test]
@@ -398,9 +398,87 @@ async fn update_trims_redirect_uri_whitespace() {
         .await
         .unwrap();
 
-    assert_eq!(updated.allowed_redirect_uris.len(), 1);
+    assert_eq!(updated.after.allowed_redirect_uris.len(), 1);
     assert_eq!(
-        updated.allowed_redirect_uris[0], "https://new.example.com/cb",
+        updated.after.allowed_redirect_uris[0], "https://new.example.com/cb",
         "redirect URIs should be trimmed on update"
     );
+}
+
+#[tokio::test]
+async fn update_returns_before_and_after_snapshots() {
+    let repo = fresh_repo(&["test-update-before-after"]).await;
+
+    let created = repo
+        .create(
+            TENANT_A,
+            "test-update-before-after",
+            "Original",
+            &["https://before.example.com/cb".to_string()],
+        )
+        .await
+        .unwrap();
+
+    let update = repo
+        .update(
+            created.id,
+            TENANT_A,
+            Some("Renamed"),
+            Some(&["https://after.example.com/cb".to_string()]),
+        )
+        .await
+        .unwrap();
+
+    // Pre-image carries the original state captured before the UPDATE applied.
+    assert_eq!(update.before.id, created.id);
+    assert_eq!(update.before.tenant_id, TENANT_A);
+    assert_eq!(update.before.client_id, "test-update-before-after");
+    assert_eq!(update.before.name, "Original");
+    assert_eq!(
+        update.before.allowed_redirect_uris,
+        vec!["https://before.example.com/cb".to_string()]
+    );
+
+    // Post-image carries the new state.
+    assert_eq!(update.after.id, created.id);
+    assert_eq!(update.after.tenant_id, TENANT_A);
+    assert_eq!(update.after.client_id, "test-update-before-after");
+    assert_eq!(update.after.name, "Renamed");
+    assert_eq!(
+        update.after.allowed_redirect_uris,
+        vec!["https://after.example.com/cb".to_string()]
+    );
+
+    // The CTE uses NOW() in the UPDATE so updated_at must advance.
+    assert!(update.after.updated_at >= update.before.updated_at);
+}
+
+#[tokio::test]
+async fn delete_returns_deleted_row_for_audit() {
+    let repo = fresh_repo(&["test-delete-returning"]).await;
+
+    let created = repo
+        .create(
+            TENANT_A,
+            "test-delete-returning",
+            "Returning Test",
+            &["https://example.com/cb".to_string()],
+        )
+        .await
+        .unwrap();
+
+    let deleted = repo.delete(created.id, TENANT_A).await.unwrap();
+
+    assert_eq!(deleted.id, created.id);
+    assert_eq!(deleted.tenant_id, TENANT_A);
+    assert_eq!(deleted.client_id, "test-delete-returning");
+    assert_eq!(deleted.name, "Returning Test");
+    assert_eq!(
+        deleted.allowed_redirect_uris,
+        vec!["https://example.com/cb".to_string()]
+    );
+
+    // And the row really is gone.
+    let listed = repo.list(TENANT_A).await.unwrap();
+    assert!(!listed.iter().any(|c| c.id == created.id));
 }

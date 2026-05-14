@@ -19,6 +19,21 @@ pub struct RegisteredClient {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Pre- and post-update snapshots returned by `RegisteredClientRepository::update`.
+///
+/// Captured by holding a row-level lock for the duration of the update
+/// transaction: the repository runs `SELECT ... FOR UPDATE` on the target row,
+/// then `UPDATE` within the same transaction. Under READ COMMITTED (the
+/// default), `FOR UPDATE` waits for any concurrent updater and then re-anchors
+/// on the latest committed version of the row, so `before` reflects the actual
+/// immediately-prior state and `after` reflects the row after this admin's
+/// update — even when other admins are updating concurrently.
+#[derive(Debug, Clone)]
+pub struct RegisteredClientUpdate {
+    pub before: RegisteredClient,
+    pub after: RegisteredClient,
+}
+
 /// Repository for registered OAuth client operations.
 /// When a client_id is registered, only its allowed redirect URIs are accepted.
 /// Unregistered client_ids fall back to accepting any HTTPS redirect_uri.
@@ -159,13 +174,20 @@ impl RegisteredClientRepository {
 
     /// Update name and/or allowed_redirect_uris for a registered client.
     /// Tenant-scoped: returns NotFound when (id, tenant_id) does not match.
+    ///
+    /// Returns both the pre-update and post-update snapshots so callers (e.g.
+    /// the admin audit log) can record a single before/after entry. The
+    /// repository takes a row lock via `SELECT ... FOR UPDATE`, then performs
+    /// the `UPDATE` in the same transaction, so `before` and `after` describe
+    /// the actual transition this caller produced — concurrent updaters are
+    /// serialized through the row lock.
     pub async fn update(
         &self,
         id: i32,
         tenant_id: i64,
         name: Option<&str>,
         allowed_redirect_uris: Option<&[String]>,
-    ) -> Result<RegisteredClient, RepositoryError> {
+    ) -> Result<RegisteredClientUpdate, RepositoryError> {
         if let Some(uris) = allowed_redirect_uris {
             validate_redirect_uri_list(uris)?;
         }
@@ -177,8 +199,32 @@ impl RegisteredClientRepository {
         let trimmed_uris: Option<Vec<String>> =
             allowed_redirect_uris.map(|uris| uris.iter().map(|s| s.trim().to_string()).collect());
 
-        // COALESCE pattern lets us patch either field without separate queries.
-        let row = sqlx::query_as::<_, RegisteredClient>(
+        // Hold a row lock for the entire transaction so `before` and `after`
+        // describe the actual transition this caller produced. Under READ
+        // COMMITTED, SELECT FOR UPDATE waits for any concurrent updater and
+        // then re-reads against the latest committed version; the subsequent
+        // UPDATE then runs on top of that locked row with no interleaving.
+        let mut tx = self.pool.begin().await?;
+
+        let before = sqlx::query_as::<_, RegisteredClient>(
+            "SELECT id, tenant_id, client_id, name,
+                    allowed_redirect_uris, created_at, updated_at
+             FROM registered_clients
+             WHERE id = $1 AND tenant_id = $2
+             FOR UPDATE",
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            RepositoryError::NotFound(format!(
+                "registered_client id={} for tenant {}",
+                id, tenant_id
+            ))
+        })?;
+
+        let after = sqlx::query_as::<_, RegisteredClient>(
             "UPDATE registered_clients
              SET name = COALESCE($3, name),
                  allowed_redirect_uris = COALESCE($4, allowed_redirect_uris),
@@ -191,6 +237,30 @@ impl RegisteredClientRepository {
         .bind(tenant_id)
         .bind(name.map(str::trim))
         .bind(trimmed_uris.as_deref())
+        .fetch_one(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(RegisteredClientUpdate { before, after })
+    }
+
+    /// Delete a registered client. Tenant-scoped.
+    /// Returns the deleted row so callers can audit-log the removed state.
+    /// Returns NotFound if no row matches (id, tenant_id).
+    pub async fn delete(
+        &self,
+        id: i32,
+        tenant_id: i64,
+    ) -> Result<RegisteredClient, RepositoryError> {
+        let row = sqlx::query_as::<_, RegisteredClient>(
+            "DELETE FROM registered_clients
+             WHERE id = $1 AND tenant_id = $2
+             RETURNING id, tenant_id, client_id, name,
+                       allowed_redirect_uris, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(tenant_id)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -200,24 +270,6 @@ impl RegisteredClientRepository {
                 id, tenant_id
             ))
         })
-    }
-
-    /// Delete a registered client. Tenant-scoped.
-    /// Returns NotFound if no row matches (id, tenant_id).
-    pub async fn delete(&self, id: i32, tenant_id: i64) -> Result<(), RepositoryError> {
-        let result = sqlx::query("DELETE FROM registered_clients WHERE id = $1 AND tenant_id = $2")
-            .bind(id)
-            .bind(tenant_id)
-            .execute(&self.pool)
-            .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(RepositoryError::NotFound(format!(
-                "registered_client id={} for tenant {}",
-                id, tenant_id
-            )));
-        }
-        Ok(())
     }
 }
 
