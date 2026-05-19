@@ -16,13 +16,13 @@
 //! let factory = ValkeyConnectionFactory::new("redis://10.0.0.5:6379", true).await?;
 //!
 //! // Get connections
-//! let conn = factory.get_multiplexed_connection().await?;
+//! let conn = factory.get_connection_manager().await?;
 //! let pubsub = factory.get_pubsub_connection().await?;
 //! ```
 
 use crate::Error;
 use gcp_auth::TokenProvider;
-use redis::aio::{MultiplexedConnection, PubSub};
+use redis::aio::{ConnectionManager, PubSub};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -290,17 +290,19 @@ impl ValkeyConnectionFactory {
         redis::Client::open(url).map_err(Error::Redis)
     }
 
-    /// Get a multiplexed connection for general Redis operations.
+    /// Get a connection manager for general Redis operations.
+    ///
+    /// The manager will reconnect dropped sockets automatically, but those
+    /// reconnects reuse the credentials baked into the client created here.
+    /// IAM token rotation still requires rebuilding the manager via this
+    /// factory so reconnect attempts use a fresh token.
     ///
     /// # Errors
     ///
     /// Returns an error if connection fails or token refresh fails.
-    pub async fn get_multiplexed_connection(&self) -> Result<MultiplexedConnection, Error> {
+    pub async fn get_connection_manager(&self) -> Result<ConnectionManager, Error> {
         let client = self.create_client().await?;
-        client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(Error::Redis)
+        ConnectionManager::new(client).await.map_err(Error::Redis)
     }
 
     /// Get a Pub/Sub connection.
